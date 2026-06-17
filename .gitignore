@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Build output
+frontend/dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local
+backend/.env
+
+# Database (local data)
+backend/data/*.db
+
+# Claude Code workspace
+.claude/
+
+# Nested repos / migration scratch
+migrationtostateofart/
