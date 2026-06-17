@@ -1,0 +1,22 @@
+{
+  "name": "pcs7-backend",
+  "version": "1.0.0",
+  "description": "PCS7 CM Generator — Express + SQLite backend",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "exceljs": "^4.4.0",
+    "express": "^4.18.2",
+    "multer": "^2.0.0",
+    "sql.js": "^1.12.0",
+    "xml2js": "^0.6.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}

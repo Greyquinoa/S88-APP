@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run *)",
+      "Bash(npm install *)",
+      "Bash(node -e ' *)",
+      "Bash(node -e \"require\\('./src/services/hierarchyBuilder'\\); console.log\\('OK'\\)\")",
+      "Bash(node -e \"require\\('./src/routes/unitTypes.js'\\); require\\('./src/db.js'\\); console.log\\('backend OK'\\)\")",
+      "Bash(npx esbuild *)",
+      "Bash(node -e \"require\\('./src/routes/unitTypes.js'\\); require\\('./src/routes/generate.js'\\); require\\('./src/routes/compositeCmTypes.js'\\); require\\('./src/db.js'\\); console.log\\('backend OK'\\)\")",
+      "Bash(Get-ChildItem -Path \"g:\\\\Python\\\\MatrixGeneratorv2\\\\pcs7-app\" -Recurse -Directory)",
+      "Bash(Select-Object -First 50)",
+      "Bash(npx acorn *)",
+      "Bash(npx vite *)",
+      "Bash(node -e \"require\\('./src/routes/generate'\\)\")",
+      "Bash(Get-ChildItem -Path \"g:\\\\Python\\\\MatrixGeneratorv2\\\\pcs7-app\" -Recurse -Directory -ErrorAction SilentlyContinue)",
+      "Bash(Select-Object -ExpandProperty FullName)"
+    ]
+  }
+}
