@@ -12,8 +12,9 @@ import {
   getValveCommands, saveValveCommands,
 } from "./api.js";
 import StepIOImport from "./StepIOImport.jsx";
+import StepHWConfig from "./StepHWConfig.jsx";
 
-const STEPS = ["Projects", "IO Import", "Library", "Unit Types", "Hierarchy", "Instances", "Generate"];
+const STEPS = ["Projects", "IO Import", "Library", "Unit Types", "Hierarchy", "Instances", "HW Config", "Generate"];
 const DEFAULT_ON_OPTIONAL = ["MV_Rate"];
 const S88_TYPES = ["", "ProcessCell", "Unit", "EMOD"];
 
@@ -459,7 +460,7 @@ export default function App() {
       });
       setResult(r);
       setLoading("");
-      setStep(6);
+      setStep(7);
     } catch (e) {
       setError(e.message);
       setLoading("");
@@ -467,7 +468,7 @@ export default function App() {
   }
 
   function goTo(i) {
-    if (i >= 6) return; // Generate output is not a direct nav target
+    if (i === 7) return; // Generate output is not a direct nav target
     if (i > 0 && !savedProjectName.trim()) {
       setError("Select or create a project first.");
       setStep(0);
@@ -484,7 +485,7 @@ export default function App() {
         {STEPS.map((s, i) => (
           <button key={i} onClick={() => goTo(i)}
             style={{ padding: "8px 16px", border: "none", background: "transparent",
-              cursor: i < 6 ? "pointer" : "default",
+              cursor: "pointer",
               fontWeight: i === step ? 500 : 400, fontSize: 13,
               color: i === step ? "var(--color-text-primary)" : "var(--color-text-secondary)",
               borderBottom: i === step ? "2px solid var(--color-text-primary)" : "2px solid transparent",
@@ -603,7 +604,10 @@ export default function App() {
           ensureLoaded={ensureBlocksLoaded} loading={loading}
           onGenerate={handleGenerate} />
       )}
-      {step === 6 && result && (
+      {step === 6 && (
+        <StepHWConfig projectId={savedProjectId} />
+      )}
+      {step === 7 && result && (
         <StepOutput result={result} onBack={() => setStep(5)} />
       )}
     </div>
@@ -2035,126 +2039,255 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                   }));
                 }
 
+                // Shared styles for the header row background
+                const hdrBg = "var(--color-background-secondary)";
+                const borderH = "0.5px solid var(--color-border-tertiary)";
+
+                function exportCsv() {
+                  const SEP = ",";
+                  const esc = v => {
+                    const s = String(v);
+                    return /[,"\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+                  };
+                  // "sep=," as first line tells Excel which delimiter to use regardless of locale.
+                  // Mode headers formatted as "Nr. Name" — plain text, no colon, easy to read in Excel.
+                  const hdr = [esc("CM \\ Mode"), ...modes.map(m => esc(`${m.mode_nr ?? m.mode_nr}. ${m.mode_name ?? ""}`))];
+                  const dataRows = columns.map(colName => [
+                    esc(colName),
+                    ...modes.map(m => esc((m.cells || {})[colName] ?? 0)),
+                  ]);
+                  // UTF-8 BOM (﻿) makes Excel open without the encoding/import dialog
+                  const csv = "﻿" + [`sep=${SEP}`, hdr, ...dataRows].map(r =>
+                    Array.isArray(r) ? r.join(SEP) : r
+                  ).join("\r\n");
+                  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement("a");
+                  a.href = url; a.download = `${editing.name || "matrix"}.csv`;
+                  a.click();
+                  URL.revokeObjectURL(url);
+                }
+
+                function importCsv(file) {
+                  const reader = new FileReader();
+                  reader.onload = e => {
+                    // Strip BOM if present, normalise line endings
+                    let text = e.target.result.replace(/^﻿/, "");
+                    text = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
+                    // Auto-detect separator from the first line (handles locales that save with ;)
+                    const firstLine = text.split("\n")[0] || "";
+                    const SEP = firstLine.includes(";") && !firstLine.includes(",") ? ";" : ",";
+
+                    const parseRow = line => {
+                      const cells = []; let cur = ""; let inQ = false;
+                      for (let i = 0; i < line.length; i++) {
+                        const ch = line[i];
+                        if (inQ) {
+                          if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+                          else if (ch === '"') { inQ = false; }
+                          else cur += ch;
+                        } else {
+                          if (ch === '"') { inQ = true; }
+                          else if (ch === SEP) { cells.push(cur.trim()); cur = ""; }
+                          else cur += ch;
+                        }
+                      }
+                      cells.push(cur.trim());
+                      return cells;
+                    };
+
+                    let lines = text.split("\n").filter(l => l.trim());
+                    // Skip "sep=X" hint line if present
+                    if (lines.length && /^sep=/i.test(lines[0])) lines = lines.slice(1);
+                    if (lines.length < 2) return;
+
+                    const headerCells = parseRow(lines[0]);
+                    // headerCells[0] = corner cell (ignored). Rest = mode headers "Nr. Name"
+                    // Accepts: "1. Auto", "1:Auto", "1 - Auto", or bare "Auto"
+                    const newModes = headerCells.slice(1).map((h, i) => {
+                      const m = h.match(/^(\d+)[.\-: ]+(.*)$/);
+                      const nr = m ? (parseInt(m[1]) || i + 1) : i + 1;
+                      const name = m ? m[2].trim() : h.trim();
+                      return { mode_nr: nr, mode_name: name, cells: {} };
+                    });
+
+                    const newColumns = [];
+                    for (let ri = 1; ri < lines.length; ri++) {
+                      const cells = parseRow(lines[ri]);
+                      const cmName = cells[0] || "";
+                      if (!cmName) continue;
+                      newColumns.push(cmName);
+                      newModes.forEach((m, mi) => {
+                        const raw = cells[mi + 1] ?? "";
+                        const v = parseInt(raw);
+                        m.cells[cmName] = isNaN(v) ? 0 : v;
+                      });
+                    }
+                    setEditing(p => ({ ...p, matrixColumns: newColumns, matrixModes: newModes }));
+                  };
+                  reader.readAsText(file, "UTF-8");
+                }
+
                 return (
                   <div style={{ marginBottom: "1.25rem" }}>
-                    {/* Columns */}
-                    <div style={{ marginBottom: "1rem" }}>
-                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
-                        <SLabel text="CM Columns (XV001, XV002 …)" />
-                        <Btn onClick={addColumn} style={{ fontSize: 11 }}>
-                          <i className="ti ti-plus" /> Add column
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 2 }}>
+                      <SLabel text="Mode × CM Matrix" />
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <Btn onClick={exportCsv} style={{ fontSize: 11 }}
+                          title="Export matrix to CSV (open in Excel, edit, then re-import)">
+                          <i className="ti ti-download" /> Export CSV
                         </Btn>
+                        <label style={{ display: "inline-flex", alignItems: "center", gap: 4,
+                            cursor: "pointer", fontSize: 11,
+                            padding: "4px 10px", borderRadius: "var(--border-radius-md)",
+                            border: "0.5px solid var(--color-border-secondary)",
+                            background: "var(--color-background-primary)",
+                            color: "var(--color-text-primary)", userSelect: "none" }}
+                          title="Import a previously exported CSV (replaces current matrix)">
+                          <i className="ti ti-upload" /> Import CSV
+                          <input type="file" accept=".csv" style={{ display: "none" }}
+                            onChange={e => { const f = e.target.files[0]; if (f) { importCsv(f); e.target.value = ""; } }} />
+                        </label>
                       </div>
-                      {columns.length === 0 ? (
-                        <div style={{ border: "1.5px dashed var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)",
-                            padding: "1rem", textAlign: "center", fontSize: 12, color: "var(--color-text-secondary)" }}>
-                          No CM columns — click 'Add column'
-                        </div>
-                      ) : (
-                        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                          {columns.map((col, ci) => (
-                            <div key={ci} style={{ display: "flex", alignItems: "center", gap: 3,
-                                border: "0.5px solid var(--color-border-secondary)", borderRadius: "var(--border-radius-md)",
-                                padding: "2px 6px", background: "var(--color-background-secondary)" }}>
-                              <input value={col} onChange={e => updateColumn(ci, e.target.value)}
-                                placeholder={`RCM${String(ci+1).padStart(2,"0")}`}
-                                style={{ ...cellSx, width: 80, fontFamily: "var(--font-mono)" }} />
-                              <button onClick={() => removeColumn(ci)}
-                                style={{ border: "none", background: "transparent", cursor: "pointer",
-                                  color: "#DC2626", fontSize: 13, padding: "0 2px", lineHeight: 1 }}>
-                                <i className="ti ti-x" />
-                              </button>
-                            </div>
-                          ))}
-                        </div>
-                      )}
                     </div>
 
-                    {/* Mode grid */}
-                    <div>
-                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
-                        <SLabel text="Modes" />
-                        <Btn onClick={addMode} style={{ fontSize: 11 }}>
-                          <i className="ti ti-plus" /> Add mode
-                        </Btn>
+                    {columns.length === 0 && modes.length === 0 ? (
+                      <div style={{ border: "1.5px dashed var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)",
+                          padding: "1rem", textAlign: "center", fontSize: 12, color: "var(--color-text-secondary)", marginTop: 8 }}>
+                        No CMs or modes yet — use the buttons inside the table to start
                       </div>
+                    ) : null}
 
-                      {modes.length === 0 ? (
-                        <div style={{ border: "1.5px dashed var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)",
-                            padding: "1rem", textAlign: "center", fontSize: 12, color: "var(--color-text-secondary)" }}>
-                          No modes — click "Add mode"
-                        </div>
-                      ) : (
-                        <div style={{ overflowX: "auto" }}>
-                          <table style={{ borderCollapse: "collapse", fontSize: 11, width: "100%" }}>
-                            <thead>
-                              <tr style={{ background: "var(--color-background-secondary)" }}>
-                                <th style={{ padding: "4px 6px", borderBottom: "0.5px solid var(--color-border-tertiary)",
-                                    textAlign: "left", fontWeight: 600, minWidth: 52 }}>Nr</th>
-                                <th style={{ padding: "4px 6px", borderBottom: "0.5px solid var(--color-border-tertiary)",
-                                    textAlign: "left", fontWeight: 600, minWidth: 100 }}>Mode Name</th>
-                                {columns.map((col, ci) => (
-                                  <th key={ci} style={{ padding: "4px 6px", borderBottom: "0.5px solid var(--color-border-tertiary)",
-                                      textAlign: "center", fontWeight: 600, fontFamily: "var(--font-mono)",
-                                      minWidth: 130 }}>
-                                    {col || `col${ci+1}`}
-                                  </th>
-                                ))}
-                                <th style={{ width: 28 }} />
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {modes.map((mode, mi) => (
-                                <tr key={mi} style={{ borderBottom: "0.5px solid var(--color-border-tertiary)",
-                                    background: mi % 2 === 0 ? "transparent" : "var(--color-background-secondary)" }}>
-                                  <td style={{ padding: "3px 6px" }}>
+                    <div style={{ overflowX: "auto", marginTop: 8 }}>
+                      <table style={{ borderCollapse: "collapse", fontSize: 11 }}>
+                        <thead>
+                          <tr style={{ background: hdrBg }}>
+
+                            {/* ── Corner cell: diagonal split "Mode / CM" ── */}
+                            <th style={{ position: "relative", width: 110, minWidth: 110,
+                                padding: 0, borderBottom: borderH, borderRight: borderH,
+                                background: hdrBg }}>
+                              <svg style={{ position: "absolute", inset: 0, width: "100%", height: "100%",
+                                  pointerEvents: "none" }} preserveAspectRatio="none">
+                                <line x1="0" y1="0" x2="100%" y2="100%"
+                                  stroke="var(--color-border-tertiary)" strokeWidth="1" />
+                              </svg>
+                              {/* "Mode" in upper-right — describes the column axis */}
+                              <span style={{ position: "absolute", top: 5, right: 7,
+                                  fontSize: 10, fontWeight: 600, color: "var(--color-text-secondary)",
+                                  lineHeight: 1, userSelect: "none" }}>
+                                Mode
+                              </span>
+                              {/* "CM" in lower-left — describes the row axis */}
+                              <span style={{ position: "absolute", bottom: 5, left: 7,
+                                  fontSize: 10, fontWeight: 600, color: "var(--color-text-secondary)",
+                                  lineHeight: 1, userSelect: "none" }}>
+                                CM
+                              </span>
+                              {/* Invisible spacer so the th has height */}
+                              <div style={{ visibility: "hidden", padding: "14px 8px", fontSize: 10 }}>CM{"\n"}Mode</div>
+                            </th>
+
+                            {/* ── One <th> per mode: Nr input + Name input + X ── */}
+                            {modes.map((mode, mi) => (
+                              <th key={mi} style={{ padding: "5px 6px", borderBottom: borderH,
+                                  borderRight: borderH, textAlign: "center", minWidth: 140,
+                                  verticalAlign: "bottom", background: hdrBg }}>
+                                <div style={{ display: "flex", flexDirection: "column", gap: 3, alignItems: "stretch" }}>
+                                  <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
                                     <input type="number" value={mode.mode_nr ?? mi + 1} min={1}
                                       onChange={e => updateModeField(mi, "mode_nr", e.target.value)}
-                                      style={{ ...cellSx, width: 48, textAlign: "center", fontFamily: "var(--font-mono)" }} />
-                                  </td>
-                                  <td style={{ padding: "3px 6px" }}>
-                                    <input value={mode.mode_name ?? ""} placeholder="e.g. Auto"
-                                      onChange={e => updateModeField(mi, "mode_name", e.target.value)}
-                                      style={{ ...cellSx, width: "100%" }} />
-                                  </td>
-                                  {columns.map((colName, ci) => {
-                                    const currentVal = (mode.cells || {})[colName] ?? 0;
-                                    const knownOption = valveCommands.find(o => o.value === currentVal);
-                                    return (
-                                      <td key={ci} style={{ padding: "3px 6px" }}>
-                                        <select
-                                          value={knownOption ? currentVal : "__other__"}
-                                          onChange={e => {
-                                            if (e.target.value !== "__other__") setCell(mi, colName, e.target.value);
-                                          }}
-                                          style={{ ...cellSx, marginBottom: knownOption ? 0 : 3 }}>
-                                          {valveCommands.map(o => (
-                                            <option key={o.value} value={o.value}>{o.label}</option>
-                                          ))}
-                                          <option value="__other__">Other…</option>
-                                        </select>
-                                        {!knownOption && (
-                                          <input type="number" value={currentVal} min={0}
-                                            onChange={e => setCell(mi, colName, e.target.value)}
-                                            placeholder="code"
-                                            style={{ ...cellSx, fontFamily: "var(--font-mono)", marginTop: 2 }} />
-                                        )}
-                                      </td>
-                                    );
-                                  })}
-                                  <td style={{ padding: "3px 4px", textAlign: "center" }}>
+                                      style={{ ...cellSx, width: 42, textAlign: "center",
+                                        fontFamily: "var(--font-mono)", fontWeight: 600 }} />
+                                    {/* X: delete this mode column */}
                                     <button onClick={() => removeMode(mi)}
                                       style={{ border: "none", background: "transparent", cursor: "pointer",
-                                        color: "#DC2626", fontSize: 13, padding: "0 2px" }}>
+                                        color: "#DC2626", fontSize: 13, padding: "0 2px", marginLeft: "auto" }}>
                                       <i className="ti ti-x" />
                                     </button>
+                                  </div>
+                                  <input value={mode.mode_name ?? ""} placeholder="e.g. Auto"
+                                    onChange={e => updateModeField(mi, "mode_name", e.target.value)}
+                                    style={{ ...cellSx, width: "100%" }} />
+                                </div>
+                              </th>
+                            ))}
+
+                            {/* ── "+ Add mode" as the last header cell ── */}
+                            <th style={{ padding: "6px 8px", borderBottom: borderH,
+                                verticalAlign: "middle", background: hdrBg, whiteSpace: "nowrap" }}>
+                              <Btn onClick={addMode} style={{ fontSize: 11 }}>
+                                <i className="ti ti-plus" /> Add mode
+                              </Btn>
+                            </th>
+                          </tr>
+                        </thead>
+
+                        <tbody>
+                          {/* ── One row per CM ── */}
+                          {columns.map((colName, ci) => (
+                            <tr key={ci} style={{ borderBottom: borderH,
+                                background: ci % 2 === 0 ? "transparent" : hdrBg }}>
+
+                              {/* X then editable CM name — delete is at the START for easy scanning */}
+                              <td style={{ padding: "3px 6px", borderRight: borderH, whiteSpace: "nowrap" }}>
+                                <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                                  <button onClick={() => removeColumn(ci)}
+                                    style={{ border: "none", background: "transparent", cursor: "pointer",
+                                      color: "#DC2626", fontSize: 13, padding: "0 2px", flexShrink: 0 }}>
+                                    <i className="ti ti-x" />
+                                  </button>
+                                  <input value={colName} onChange={e => updateColumn(ci, e.target.value)}
+                                    placeholder={`RCM${String(ci + 1).padStart(2, "0")}`}
+                                    style={{ ...cellSx, width: 90, fontFamily: "var(--font-mono)", fontWeight: 600 }} />
+                                </div>
+                              </td>
+
+                              {/* ── One dropdown cell per mode ── */}
+                              {modes.map((mode, mi) => {
+                                const currentVal = (mode.cells || {})[colName] ?? 0;
+                                const knownOption = valveCommands.find(o => o.value === currentVal);
+                                return (
+                                  <td key={mi} style={{ padding: "3px 6px", borderRight: borderH }}>
+                                    <select
+                                      value={knownOption ? currentVal : "__other__"}
+                                      onChange={e => {
+                                        if (e.target.value !== "__other__") setCell(mi, colName, e.target.value);
+                                      }}
+                                      style={{ ...cellSx, marginBottom: knownOption ? 0 : 3 }}>
+                                      {valveCommands.map(o => (
+                                        <option key={o.value} value={o.value}>{o.label}</option>
+                                      ))}
+                                      <option value="__other__">Other…</option>
+                                    </select>
+                                    {!knownOption && (
+                                      <input type="number" value={currentVal} min={0}
+                                        onChange={e => setCell(mi, colName, e.target.value)}
+                                        placeholder="code"
+                                        style={{ ...cellSx, fontFamily: "var(--font-mono)", marginTop: 2 }} />
+                                    )}
                                   </td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
-                      )}
+                                );
+                              })}
+
+                              {/* Empty cell under "+ Add mode" column */}
+                              <td />
+                            </tr>
+                          ))}
+
+                          {/* ── "+ Add CM" as the last body row, in the label column ── */}
+                          <tr>
+                            <td style={{ padding: "5px 6px", borderRight: borderH }} colSpan={1}>
+                              <Btn onClick={addColumn} style={{ fontSize: 11 }}>
+                                <i className="ti ti-plus" /> Add CM
+                              </Btn>
+                            </td>
+                            {/* Span remaining mode cells + the add-mode column */}
+                            <td colSpan={modes.length + 1} />
+                          </tr>
+                        </tbody>
+                      </table>
                     </div>
                   </div>
                 );

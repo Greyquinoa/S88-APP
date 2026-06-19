@@ -603,6 +603,275 @@ function ensureSchema() {
     });
   }
 
+  // ── HW Engineering Extension ─────────────────────────────────────────────────
+  _db.run(`CREATE TABLE IF NOT EXISTS hw_module_templates (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_no       TEXT NOT NULL UNIQUE,
+    display_name   TEXT NOT NULL,
+    family         TEXT NOT NULL,
+    signal_type    TEXT,
+    channel_count  INTEGER DEFAULT 0,
+    input_bytes    INTEGER DEFAULT 0,
+    output_bytes   INTEGER DEFAULT 0,
+    in_addr_fmt    TEXT,
+    out_addr_fmt   TEXT,
+    param_template TEXT,
+    version        TEXT,
+    gsdml_file     TEXT,
+    dap_id         TEXT,
+    hw_category    TEXT
+  )`);
+
+  _db.run(`CREATE TABLE IF NOT EXISTS hw_imports (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id   INTEGER NOT NULL REFERENCES projects(id),
+    baseline_cfg TEXT,
+    excel_name   TEXT,
+    status       TEXT NOT NULL DEFAULT 'pending',
+    imported_at  TEXT DEFAULT (datetime('now'))
+  )`);
+  _db.run(`CREATE INDEX IF NOT EXISTS idx_hwi_proj ON hw_imports(project_id)`);
+
+  _db.run(`CREATE TABLE IF NOT EXISTS hw_signals (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    hw_import_id    INTEGER NOT NULL REFERENCES hw_imports(id),
+    row_number      INTEGER,
+    station_address INTEGER NOT NULL,
+    station_name    TEXT,
+    ip_address      TEXT,
+    slot            INTEGER NOT NULL,
+    channel         INTEGER,
+    module_order_no TEXT NOT NULL,
+    module_name     TEXT,
+    tag             TEXT,
+    description     TEXT,
+    signal_type     TEXT,
+    subsystem_no    INTEGER,
+    router_address  TEXT
+  )`);
+  _db.run(`CREATE INDEX IF NOT EXISTS idx_hws_import ON hw_signals(hw_import_id)`);
+
+  // Migration: add subsystem_no to hw_signals if missing
+  const hwSigCols = rawAll('PRAGMA table_info(hw_signals)').map(c => c.name);
+  if (!hwSigCols.includes('subsystem_no')) {
+    _db.run('ALTER TABLE hw_signals ADD COLUMN subsystem_no INTEGER');
+  }
+  if (!hwSigCols.includes('router_address')) {
+    _db.run('ALTER TABLE hw_signals ADD COLUMN router_address TEXT');
+  }
+  if (!hwSigCols.includes('approved')) {
+    _db.run('ALTER TABLE hw_signals ADD COLUMN approved INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!hwSigCols.includes('pip_no')) {
+    _db.run('ALTER TABLE hw_signals ADD COLUMN pip_no INTEGER');
+  }
+  if (!hwSigCols.includes('potential_group')) {
+    _db.run("ALTER TABLE hw_signals ADD COLUMN potential_group TEXT");
+  }
+
+  // Migration: add hw_category to hw_module_templates
+  // Values: 'station' (IM / station head), 'slot' (IO card), 'subslot' (IFACE block), null (unknown)
+  const hwTplCols = rawAll('PRAGMA table_info(hw_module_templates)').map(c => c.name);
+  if (!hwTplCols.includes('hw_category')) {
+    _db.run('ALTER TABLE hw_module_templates ADD COLUMN hw_category TEXT');
+    // Infer category for existing rows from order_no patterns.
+    // Slot cards:   IO card order numbers (DI/DO/AI/AO modules — they have I/O bytes in practice,
+    //               but we key off order_no prefix here for reliability).
+    //   ET200SP IO cards: 6ES7 13x-6, 6ES7 134-6, 6ES7 135-6 (these are the slot cards)
+    //   ET200SP IMs:      6ES7 155-6, 6ES7 193-6 → station
+    //   ET200AL IO:       6ES7 141-6, 6ES7 142-6 → slot  |  6ES7 157-0 (IM) → station
+    //   ET200eco IO:      6ES7 14x-4 → slot       |  6ES7 154-8, 6ES7 140-6 → station
+    //   ET200M IMs:       6ES7 153-4, 6ES7 154-4 → station  |  6ES7 3xx → slot
+    //   SCALANCE/HMI/GSDML → station (they are network heads, not slot cards)
+    //   _S7H_HSP_... → subslot (PCS7 IFACE blocks)
+    //   CFU/PA META\... → slot
+    _db.run(`UPDATE hw_module_templates SET hw_category = 'subslot' WHERE order_no LIKE '_S7H_HSP_%'`);
+    _db.run(`UPDATE hw_module_templates SET hw_category = 'station'
+      WHERE hw_category IS NULL AND (
+        order_no LIKE '6ES7 155-6%'  OR  -- ET200SP IM 155
+        order_no LIKE '6ES7 193-6%'  OR  -- ET200SP server module / BU
+        order_no LIKE '6ES7 157-0%'  OR  -- ET200AL IM 157
+        order_no LIKE '6ES7 154-8%'  OR  -- ET200eco IM 154-8
+        order_no LIKE '6ES7 140-6%'  OR  -- ET200eco IM 140-6
+        order_no LIKE '6ES7 153-4%'  OR  -- ET200M IM 153
+        order_no LIKE '6ES7 154-4%'  OR  -- ET200M IM 154
+        order_no LIKE '6ES7 15%-4%'  OR  -- ET200M IM general
+        order_no LIKE '6ES7 4%'      OR  -- S7-400 CPU / CP / IM
+        order_no LIKE '6GK%'         OR  -- SCALANCE / CP
+        order_no LIKE 'GSDML%'       OR  -- 3rd-party GSDML heads
+        order_no LIKE '7KM%'         OR  -- SENTRON PAC
+        order_no LIKE '6DL%'         OR  -- SINAUT RTU
+        order_no LIKE '6NH%'             -- SINAUT RTU
+      )`);
+    // Versioned pseudo-order for ET200SP IMs (e.g. "V1_1:6ES7 193-6...")
+    _db.run(`UPDATE hw_module_templates SET hw_category = 'station'
+      WHERE hw_category IS NULL AND order_no LIKE 'V%:%'`);
+    // ET200SP / ET200AL / ET200eco / ET200M IO cards — remaining unclassified Siemens modules
+    _db.run(`UPDATE hw_module_templates SET hw_category = 'slot'
+      WHERE hw_category IS NULL AND (
+        order_no LIKE '6ES7 13%'  OR
+        order_no LIKE '6ES7 14%'  OR
+        order_no LIKE '6ES7 3%'   OR
+        order_no LIKE '3RK%'      OR
+        order_no LIKE 'META\\%'
+      )`);
+  }
+
+  // Migration: add device_name to hw_imports (PROFINET device name for the station head)
+  const hwImpCols = rawAll('PRAGMA table_info(hw_imports)').map(c => c.name);
+  if (!hwImpCols.includes('baseline_info')) {
+    _db.run('ALTER TABLE hw_imports ADD COLUMN baseline_info TEXT');
+  }
+
+  _db.run(`CREATE TABLE IF NOT EXISTS hw_generated_cfgs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    hw_import_id INTEGER NOT NULL REFERENCES hw_imports(id),
+    cfg_text     TEXT NOT NULL,
+    stats        TEXT,
+    generated_at TEXT DEFAULT (datetime('now'))
+  )`);
+  _db.run(`CREATE INDEX IF NOT EXISTS idx_hwcfg_import ON hw_generated_cfgs(hw_import_id)`);
+
+  // ── HW Controller & Fieldbus (migrated from App2) ─────────────────────────
+  _db.run(`CREATE TABLE IF NOT EXISTS hw_controllers (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id             INTEGER NOT NULL REFERENCES projects(id),
+    T16_Controller_TagName TEXT,
+    T16_Station_Type       TEXT,
+    T24_Program_Container  TEXT,
+    INT_Controller_No      INTEGER,
+    T8_Version             TEXT,
+    T15_IP_Address         TEXT,
+    T50_Rack_Order_No      TEXT,
+    T50_Rack_Name          TEXT,
+    T50_PS_Order_No        TEXT,
+    T50_PS_Name            TEXT,
+    YN_Redundant           INTEGER DEFAULT 0,
+    YN_Slave               INTEGER DEFAULT 0,
+    MEM_Doc_Change         TEXT,
+    created_at             TEXT DEFAULT (datetime('now')),
+    updated_at             TEXT DEFAULT (datetime('now'))
+  )`);
+  _db.run(`CREATE INDEX IF NOT EXISTS idx_hwctrl_proj ON hw_controllers(project_id)`);
+
+  _db.run(`CREATE TABLE IF NOT EXISTS hw_fieldbuses (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    hw_controller_id    INTEGER NOT NULL REFERENCES hw_controllers(id),
+    INT_DP_Subsystem    INTEGER,
+    INT_Bus_DP_Address  INTEGER,
+    T50_Fieldbus_Name   TEXT,
+    LINT_T_Driver       TEXT,
+    T15_IP_Address      TEXT,
+    created_at          TEXT DEFAULT (datetime('now')),
+    updated_at          TEXT DEFAULT (datetime('now'))
+  )`);
+  _db.run(`CREATE INDEX IF NOT EXISTS idx_hwfb_ctrl ON hw_fieldbuses(hw_controller_id)`);
+
+  // Seed common module templates. Idempotent: INSERT OR IGNORE adds any template
+  // missing from an existing DB (e.g. modules added to this list after the DB was
+  // first created) without overwriting user-edited rows. order_no is UNIQUE, so a
+  // row already present is left untouched.
+  {
+    // order_no, display_name, family, signal_type, ch, in_bytes, out_bytes, in_fmt, out_fmt, param, version, gsdml, dap, hw_category
+    const hwTemplates = [
+      // NOTE: PCS7's own export of these ST modules emits NO PARAMETER block
+      // (no POTENTIAL_GROUP, no DIAGNOSTICS_WIRE_BREAK). Keep param_template null
+      // so generated blocks match the golden and reimport cleanly.
+      ['6ES7 131-6BH01-0BA0', 'ET200SP DI 16×24VDC', 'ET200SP', 'DI', 16, 2, 0,
+        '{{addr}}, 0, 2, 0, 0, 16', null, null, null, null, null, 'slot'],
+      ['6ES7 132-6BH01-0BA0', 'ET200SP DO 16×24VDC', 'ET200SP', 'DO', 16, 0, 2,
+        null, '{{addr}}, 0, 2, 0, 0, 16', null, null, null, null, 'slot'],
+      ['6ES7 134-6HD01-0BA1', 'ET200SP AI 4×U/I/RTD', 'ET200SP', 'AI', 4, 8, 0,
+        '{{addr}}, 0, 8, 0, 0, 32', null, null, 'V2.0', null, null, 'slot'],
+      ['6ES7 135-6HD00-0BA1', 'ET200SP AO 4×U/I', 'ET200SP', 'AO', 4, 0, 8,
+        null, '{{addr}}, 0, 8, 0, 0, 32', null, null, null, null, 'slot'],
+      ['6ES7 155-6AU01-0CN0', 'ET200SP IM 155-6 PN HF', 'ET200SP', 'INFRA', 0, 0, 0,
+        null, null, null, 'V4.2', null, null, 'station'],
+      ['META\\PA139700.GSD\\Transmitter 1 AI (Phy MBP)', 'CFU-PA AI Transmitter', 'CFU_PA', 'PA', 1, 5, 0,
+        '{{addr}}, 0, 5, 0, 8, 0', null, null, null, null, null, 'slot'],
+      ['_S7H_HSP_CFU_PA_V1_2_DI8_DQ8_CT', 'CFU-PA DIQ8 DC24V/0.5A', 'CFU_PA', 'MIXED', 8, 1, 1,
+        '{{addr}}, 0, 1, 0, 1, 0', '{{addr}}, 0, 1, 0, 1, 0', null, null, null, null, 'subslot'],
+      ['GSDML-V2.4-Siemens-002A-SCALANCE_XC200-20210310.xml', 'SCALANCE XC208', 'SCALANCE', 'INFRA', 8, 0, 0,
+        null, null, null, 'V4.3', 'GSDML-V2.4-Siemens-002A-SCALANCE_XC200-20210310.xml', '4F', 'station'],
+      ['GSDML-V2.4-Siemens-002A-SCALANCE_XB200-20201026.xml', 'SCALANCE XB208', 'SCALANCE', 'INFRA', 8, 0, 0,
+        null, null, null, 'V4.3', 'GSDML-V2.4-Siemens-002A-SCALANCE_XB200-20201026.xml', '71', 'station'],
+      ['GSDML-V2.25-Siemens-HMI_PP-20110915.xml', 'Siemens KP8 Panel', 'HMI', 'MIXED', 0, 2, 4,
+        '{{addr}}, 0, 2, 3, 0, 0', '{{addr}}, 0, 4, 3, 0, 0', null, null,
+        'GSDML-V2.25-Siemens-HMI_PP-20110915.xml', '1', 'station'],
+      ['GSDML-V2.3-MT-IND570-PIR-20150930.XML', 'Mettler Toledo IND570', 'GSDML', 'MIXED', 0, 8, 8,
+        '{{addr}}, 0, 8, 3, 0, 0', '{{addr}}, 0, 8, 3, 0, 0', null, null,
+        'GSDML-V2.3-MT-IND570-PIR-20150930.XML', null, 'station'],
+      ['6ES7 410-5HX08-0AB0', 'CPU 410-5H', 'S7400', 'INFRA', 0, 0, 0, null, null, null, 'V8.2.3', null, null, 'station'],
+      ['6GK7 443-1EX30-0XE1', 'CP 443-1 EX30', 'S7400', 'INFRA', 0, 0, 0, null, null, null, 'V3.0', null, null, 'station'],
+      // Additional ET200SP modules from real CFG
+      ['6ES7 135-6TD00-0CA1', 'ET200SP AQ4×I HART', 'ET200SP', 'AO', 4, 0, 8,
+        null, '{{addr}}, 0, 8, 0, 2, 0', `  POTENTIAL_GROUP, "NEW_GROUP"`, null, null, null, 'slot'],
+      // AI4 ST V1.0: golden header carries NO version string and NO PARAMETER block.
+      ['6ES7 134-6HD00-0BA1', 'ET200SP AI4×U/I ST', 'ET200SP', 'AI', 4, 8, 0,
+        '{{addr}}, 0, 8, 0, 0, 32', null, null, null, null, null, 'slot'],
+      ['V1_1:6ES7 193-6PA00-0AA0', 'ET200SP Server Module V1.1', 'ET200SP', 'INFRA', 0, 0, 0,
+        null, null, null, 'V1.1', null, null, 'station'],
+      ['6ES7 155-6AU00-0CN0', 'ET200SP IM 155-6 PN HF V4.2', 'ET200SP', 'INFRA', 0, 0, 0,
+        null, null, null, 'V4.2', null, null, 'station'],
+
+      // ── CFU_PA (Common Foundation Unit – PROFIBUS PA) ─────────────────────────
+      // Station IM — "V_2_0_PA:6ES7 655-5PX11-0XX0"
+      ['V_2_0_PA:6ES7 655-5PX11-0XX0', 'CFU-PA IM V2.0', 'CFU_PA', 'INFRA', 0, 0, 0,
+        null, null, null, 'V2.0', null, null, 'station'],
+      // Slot 0 ethernet head (AUTOCREATED in CFG — order used verbatim for SLOT 0 block)
+      ['V_2_0_PA_ETER:6ES7 655-5PX11-0XX0', 'CFU-PA Ethernet Head (Slot 0)', 'CFU_PA', 'INFRA', 0, 0, 0,
+        null, null, null, 'V2.0', null, null, 'subslot'],
+      // Slot 1 — DIQ8 (digital DI+DQ, 1 byte each — goes in digital address space)
+      // channel_count=16: channels 0-7 are DI, channels 8-15 are DO
+      ['_S7H_HSP_CFU_PA_V2_0_DI8_DQ8_CT', 'CFU-PA DIQ8 DC24V/0.5A', 'CFU_PA', 'MIXED', 16, 1, 1,
+        '{{addr}}, 0, 1, 0, 1, 0', '{{addr}}, 0, 1, 0, 1, 0',
+        null, null, null, null, 'slot'],
+      // Slot 2 — PROFIBUS PA Master (AUTOCREATED). The Subslot 2 Status+Notifications block
+      // carries 4 DI bytes + 2 DQ bytes in the ANALOG process image. These bytes ARE drawn
+      // from the global analog pool (e.g. 528→532 for DI, 528→530 for DQ), advancing the
+      // pointer so that PA transmitter Slot 3+ addresses start correctly after Slot 2.
+      // signal_type='PA' makes isAnalog() return true; input_bytes=4, output_bytes=2.
+      ['_S7H_HSP_CFU_PA_V2_0_PA_MASTER_CT', 'CFU-PA PA Master (Slot 2)', 'CFU_PA', 'PA', 0, 4, 2,
+        '{{addr}}, 0, 4, 0, 0, 0', '{{addr}}, 0, 2, 0, 0, 0', null, null, null, null, 'slot'],
+    ];
+
+    const insSql = `INSERT OR IGNORE INTO hw_module_templates
+       (order_no, display_name, family, signal_type, channel_count, input_bytes, output_bytes,
+        in_addr_fmt, out_addr_fmt, param_template, version, gsdml_file, dap_id, hw_category)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`;
+    for (const t of hwTemplates) _db.run(insSql, t);
+  }
+
+  // Migration: correct templates whose seeded PARAMETER/version blocks did not
+  // match PCS7's own export (caused HW import errors). Idempotent.
+  const fixTpl = (orderNo, param, version) =>
+    _db.run('UPDATE hw_module_templates SET param_template = ?, version = ? WHERE order_no = ?',
+      [param, version, orderNo]);
+  fixTpl('6ES7 131-6BH01-0BA0', null, null);                       // DI16 ST — no PARAMETER
+  fixTpl('6ES7 132-6BH01-0BA0', null, null);                       // DQ16 ST — no PARAMETER
+  fixTpl('6ES7 134-6HD00-0BA1', null, null);                       // AI4 ST V1.0 — no PARAMETER, no version str
+  fixTpl('6ES7 135-6TD00-0CA1', '  POTENTIAL_GROUP, "NEW_GROUP"', null); // AQ4 HART
+
+  // Migration: DIQ8 channel_count was seeded as 8 (DI only) — must be 16 (8 DI + 8 DO)
+  {
+    const diq8 = rawGet("SELECT channel_count FROM hw_module_templates WHERE order_no='_S7H_HSP_CFU_PA_V2_0_DI8_DQ8_CT'");
+    if (diq8 && diq8.channel_count !== 16) {
+      _db.run("UPDATE hw_module_templates SET channel_count=16 WHERE order_no='_S7H_HSP_CFU_PA_V2_0_DI8_DQ8_CT'");
+    }
+  }
+
+  // Migration: PA Master must use signal_type='PA', input_bytes=4, output_bytes=2 so that
+  // allocateAddresses reserves the correct analog addresses for Subslot 2 (Status+Notifications)
+  // and advances the pointer so Slot 3+ PA transmitters start at the right address.
+  {
+    const paMaster = rawGet("SELECT signal_type, input_bytes, output_bytes FROM hw_module_templates WHERE order_no='_S7H_HSP_CFU_PA_V2_0_PA_MASTER_CT'");
+    if (paMaster && (paMaster.signal_type !== 'PA' || paMaster.input_bytes !== 4 || paMaster.output_bytes !== 2)) {
+      _db.run(`UPDATE hw_module_templates SET signal_type='PA', input_bytes=4, output_bytes=2,
+        in_addr_fmt='{{addr}}, 0, 4, 0, 0, 0', out_addr_fmt='{{addr}}, 0, 2, 0, 0, 0'
+        WHERE order_no='_S7H_HSP_CFU_PA_V2_0_PA_MASTER_CT'`);
+    }
+  }
+
   saveDb();
   console.log('[DB] Schema ready');
 }

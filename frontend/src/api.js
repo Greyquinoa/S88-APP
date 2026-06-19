@@ -204,6 +204,130 @@ export async function parseProjectXml(projectId, file) {
 export async function getValveCommands()              { return request('GET', '/valve-commands'); }
 export async function saveValveCommands(entries)       { return request('PUT', '/valve-commands', entries); }
 
+// ── HW Engineering Extension ─────────────────────────────────────────────────
+export async function hexToIp(hex) {
+  return request('GET', `/hw-config/utils/hex-to-ip?hex=${encodeURIComponent(hex)}`);
+}
+export async function listHwModuleTemplates() {
+  return request('GET', '/hw-config/module-templates');
+}
+export async function upsertHwModuleTemplate(data) {
+  return request('POST', '/hw-config/module-templates', data);
+}
+export async function getHwModuleTemplateUsage(id) {
+  return request('GET', `/hw-config/module-templates/${id}/usage`);
+}
+export async function deleteHwModuleTemplate(id) {
+  return request('DELETE', `/hw-config/module-templates/${id}`);
+}
+export async function parseCfgForCatalogue(file) {
+  const fd = new FormData();
+  fd.append('cfg', file);
+  return request('POST', '/hw-config/module-templates/parse-cfg', fd, true);
+}
+export async function bulkUpsertCatalogueTemplates(devices) {
+  return request('POST', '/hw-config/module-templates/bulk-upsert', { devices });
+}
+export async function listHwImports(projectId) {
+  return request('GET', `/hw-config/project/${projectId}/imports`);
+}
+export async function uploadHwBaseline(projectId, file) {
+  const fd = new FormData();
+  fd.append('baseline', file);
+  return request('POST', `/hw-config/project/${projectId}/upload-baseline`, fd, true);
+}
+export async function uploadHwIoList(importId, file, sheetName) {
+  const fd = new FormData();
+  fd.append('iolist', file);
+  const qs = sheetName ? `?sheet=${encodeURIComponent(sheetName)}` : '';
+  return request('POST', `/hw-config/imports/${importId}/upload-iolist${qs}`, fd, true);
+}
+export async function getHwStations(importId) {
+  return request('GET', `/hw-config/imports/${importId}/stations`);
+}
+export async function getHwAddressPreview(importId) {
+  return request('GET', `/hw-config/imports/${importId}/preview-addresses`);
+}
+export async function getHwSignals(importId, page = 0, limit = 100) {
+  return request('GET', `/hw-config/imports/${importId}/signals?page=${page}&limit=${limit}`);
+}
+export async function updateHwStation(importId, addr, data) {
+  return request('PATCH', `/hw-config/imports/${importId}/stations/${addr}`, data);
+}
+export async function updateHwSlot(importId, addr, slot, data) {
+  return request('PATCH', `/hw-config/imports/${importId}/stations/${addr}/slots/${slot}`, data);
+}
+export async function addHwStation(importId, data) {
+  return request('POST', `/hw-config/imports/${importId}/stations`, data);
+}
+export async function copyHwStation(importId, addr) {
+  return request('POST', `/hw-config/imports/${importId}/stations/${addr}/copy`);
+}
+export async function deleteHwStation(importId, addr) {
+  return request('DELETE', `/hw-config/imports/${importId}/stations/${addr}`);
+}
+export async function addHwSlot(importId, addr, data) {
+  return request('POST', `/hw-config/imports/${importId}/stations/${addr}/slots`, data);
+}
+export async function deleteHwSlot(importId, addr, slot) {
+  return request('DELETE', `/hw-config/imports/${importId}/stations/${addr}/slots/${slot}`);
+}
+export async function getSlotChannels(importId, addr, slot) {
+  return request('GET', `/hw-config/imports/${importId}/stations/${addr}/slots/${slot}/channels`);
+}
+export async function patchSlotChannel(importId, addr, slot, ch, data) {
+  return request('PATCH', `/hw-config/imports/${importId}/stations/${addr}/slots/${slot}/channels/${ch}`, data);
+}
+export async function patchSlotPip(importId, addr, slot, pipNo) {
+  return request('PATCH', `/hw-config/imports/${importId}/stations/${addr}/slots/${slot}/pip`, { pipNo });
+}
+export async function patchSlotPotentialGroup(importId, addr, slot, potentialGroup) {
+  return request('PATCH', `/hw-config/imports/${importId}/stations/${addr}/slots/${slot}/potential-group`, { potentialGroup });
+}
+export async function generateHwCfg(importId, options = {}) {
+  return request('POST', `/hw-config/imports/${importId}/generate`, options);
+}
+export async function bulkDeleteHwStations(importId, addresses) {
+  return request('POST', `/hw-config/imports/${importId}/stations/bulk-delete`, { addresses });
+}
+export async function bulkApproveHwStations(importId, addresses, approved = true) {
+  return request('POST', `/hw-config/imports/${importId}/stations/bulk-approve`, { addresses, approved });
+}
+export async function listHwCfgs(importId) {
+  return request('GET', `/hw-config/imports/${importId}/cfgs`);
+}
+export function hwCfgDownloadUrl(importId, cfgId) {
+  return `/api/hw-config/imports/${importId}/cfgs/${cfgId}/download`;
+}
+
+// ── HW Controllers (migrated from App2) ──────────────────────────────────────
+export async function listHwControllers(projectId) {
+  return request('GET', `/hw-controllers?projectId=${projectId}`);
+}
+export async function createHwController(data) {
+  return request('POST', '/hw-controllers', data);
+}
+export async function updateHwController(id, data) {
+  return request('PUT', `/hw-controllers/${id}`, data);
+}
+export async function deleteHwController(id) {
+  return request('DELETE', `/hw-controllers/${id}`);
+}
+
+// ── HW Fieldbuses (migrated from App2) ───────────────────────────────────────
+export async function listHwFieldbuses(controllerId) {
+  return request('GET', `/hw-fieldbuses?controllerId=${controllerId}`);
+}
+export async function createHwFieldbus(data) {
+  return request('POST', '/hw-fieldbuses', data);
+}
+export async function updateHwFieldbus(id, data) {
+  return request('PUT', `/hw-fieldbuses/${id}`, data);
+}
+export async function deleteHwFieldbus(id) {
+  return request('DELETE', `/hw-fieldbuses/${id}`);
+}
+
 // ── Composite CM Types ────────────────────────────────────────────────────────
 export async function listCompositeCmTypes()           { return request('GET',    '/composite-cm-types'); }
 export async function getCompositeCmType(id)           { return request('GET',    `/composite-cm-types/${id}`); }
