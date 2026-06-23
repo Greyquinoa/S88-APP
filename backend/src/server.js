@@ -22,8 +22,7 @@ const mrpConfigRoutes      = require('./routes/mrpConfig');
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
-const allowedOrigin = process.env.FRONTEND_ORIGIN || 'http://localhost:5173';
-app.use(cors({ origin: allowedOrigin }));
+app.use(cors({ origin: 'http://localhost:5173' }));
 app.use(express.json({ limit: '10mb' }));
 
 app.use('/api/library',    libraryRoutes);
@@ -40,13 +39,6 @@ app.use('/api/hw-fieldbuses',    hwFieldbusesRoutes);
 app.use('/api/mrp',              mrpConfigRoutes);
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
-
-// Serve built frontend in production
-const DIST = path.join(__dirname, '..', '..', 'frontend', 'dist');
-if (require('fs').existsSync(DIST)) {
-  app.use(express.static(DIST));
-  app.get('*', (_req, res) => res.sendFile(path.join(DIST, 'index.html')));
-}
 
 async function start() {
   try {
