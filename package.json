@@ -1,0 +1,9 @@
+{
+  "name": "pcs7-app",
+  "version": "1.0.0",
+  "scripts": {
+    "build": "cd frontend && npm install && npm run build",
+    "start": "cd backend && npm install && node src/server.js"
+  }
+}
+
