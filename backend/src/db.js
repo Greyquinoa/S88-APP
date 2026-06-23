@@ -668,10 +668,47 @@ function ensureSchema() {
   if (!hwSigCols.includes('potential_group')) {
     _db.run("ALTER TABLE hw_signals ADD COLUMN potential_group TEXT");
   }
+  if (!hwSigCols.includes('pa_profile')) {
+    // Stores the user-selected PROFIBUS PA subslot-1 profile for CFU_PA device slots (slot ≥ 3).
+    // Valid values: 'Analog Input (AI)short' | 'Analog Input (AI)long' | 'SP (short)' | null
+    _db.run("ALTER TABLE hw_signals ADD COLUMN pa_profile TEXT");
+  }
+
+  // Per-subslot PA profile assignments (one row per function subslot of a CFU_PA device slot)
+  _db.run(`CREATE TABLE IF NOT EXISTS hw_slot_subslots (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    hw_import_id    INTEGER NOT NULL REFERENCES hw_imports(id),
+    station_address INTEGER NOT NULL,
+    slot            INTEGER NOT NULL,
+    subslot_no      INTEGER NOT NULL,
+    pa_profile      TEXT,
+    UNIQUE(hw_import_id, station_address, slot, subslot_no)
+  )`);
+  _db.run(`CREATE INDEX IF NOT EXISTS idx_hwss_import ON hw_slot_subslots(hw_import_id)`);
+
+  // One-time migration: copy existing pa_profile values from hw_signals into hw_slot_subslots as subslot_no=1
+  {
+    const existing = rawAll(
+      "SELECT hw_import_id, station_address, slot, pa_profile FROM hw_signals WHERE pa_profile IS NOT NULL"
+    );
+    const upsert = _db.prepare(
+      `INSERT OR IGNORE INTO hw_slot_subslots (hw_import_id, station_address, slot, subslot_no, pa_profile)
+       VALUES (?, ?, ?, 1, ?)`
+    );
+    for (const r of existing) {
+      upsert.run(r.hw_import_id, r.station_address, r.slot, r.pa_profile);
+    }
+  }
 
   // Migration: add hw_category to hw_module_templates
   // Values: 'station' (IM / station head), 'slot' (IO card), 'subslot' (IFACE block), null (unknown)
   const hwTplCols = rawAll('PRAGMA table_info(hw_module_templates)').map(c => c.name);
+  if (!hwTplCols.includes('subslot_defaults')) {
+    _db.run('ALTER TABLE hw_module_templates ADD COLUMN subslot_defaults TEXT');
+  }
+  if (!hwTplCols.includes('port_config')) {
+    _db.run('ALTER TABLE hw_module_templates ADD COLUMN port_config TEXT');
+  }
   if (!hwTplCols.includes('hw_category')) {
     _db.run('ALTER TABLE hw_module_templates ADD COLUMN hw_category TEXT');
     // Infer category for existing rows from order_no patterns.
@@ -871,6 +908,82 @@ function ensureSchema() {
         WHERE order_no='_S7H_HSP_CFU_PA_V2_0_PA_MASTER_CT'`);
     }
   }
+
+  // ── Signal types (user-extensible list) ─────────────────────────────────────
+  _db.run(`CREATE TABLE IF NOT EXISTS hw_signal_types (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL UNIQUE,
+    sort_order INTEGER NOT NULL DEFAULT 999
+  )`);
+  // Seed built-in types (INSERT OR IGNORE — never clobber existing rows)
+  const builtinTypes = [
+    ['DI', 1], ['DO', 2], ['AI', 3], ['AO', 4],
+    ['PA', 5], ['INFRA', 6], ['MIXED', 7],
+    ['CFU_STATION', 8],
+  ];
+  for (const [name, sort_order] of builtinTypes) {
+    _db.run(`INSERT OR IGNORE INTO hw_signal_types (name, sort_order) VALUES (?, ?)`, [name, sort_order]);
+  }
+  // Migrate: any signal_type values already used in hw_module_templates but not in the table
+  {
+    const existing = rawAll(`SELECT DISTINCT signal_type FROM hw_module_templates WHERE signal_type IS NOT NULL`);
+    for (const row of existing) {
+      _db.run(`INSERT OR IGNORE INTO hw_signal_types (name) VALUES (?)`, [row.signal_type]);
+    }
+  }
+
+  // ── Slot ↔ Subslot compatibility (M2M) ───────────────────────────────────────
+  _db.run(`CREATE TABLE IF NOT EXISTS hw_slot_subslot_compat (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    slot_order_no   TEXT NOT NULL REFERENCES hw_module_templates(order_no) ON DELETE CASCADE,
+    subslot_order_no TEXT NOT NULL REFERENCES hw_module_templates(order_no) ON DELETE CASCADE,
+    is_default      INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(slot_order_no, subslot_order_no)
+  )`);
+  _db.run(`CREATE INDEX IF NOT EXISTS idx_compat_slot    ON hw_slot_subslot_compat(slot_order_no)`);
+  _db.run(`CREATE INDEX IF NOT EXISTS idx_compat_subslot ON hw_slot_subslot_compat(subslot_order_no)`);
+
+  // ── MRP Configuration Module ─────────────────────────────────────────────────
+  _db.run(`CREATE TABLE IF NOT EXISTS mrp_configs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    hw_import_id    INTEGER NOT NULL REFERENCES hw_imports(id),
+    domain_name     TEXT NOT NULL DEFAULT 'mrpdomain-1',
+    fieldbus_no     INTEGER NOT NULL,
+    station_name    TEXT NOT NULL,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now'))
+  )`);
+  _db.run(`CREATE INDEX IF NOT EXISTS idx_mrpcfg_import ON mrp_configs(hw_import_id)`);
+
+  // One row per device participating in the MRP ring
+  _db.run(`CREATE TABLE IF NOT EXISTS mrp_device_roles (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    mrp_config_id INTEGER NOT NULL REFERENCES mrp_configs(id) ON DELETE CASCADE,
+    device_alias  TEXT NOT NULL,
+    io_address    INTEGER,
+    subsystem_no  INTEGER,
+    mrp_role      INTEGER NOT NULL DEFAULT 0,
+    mrp_instances INTEGER NOT NULL DEFAULT 0
+  )`);
+  // Migration: add io_address / subsystem_no if missing (existing DB)
+  try { _db.run('ALTER TABLE mrp_device_roles ADD COLUMN io_address INTEGER'); } catch {}
+  try { _db.run('ALTER TABLE mrp_device_roles ADD COLUMN subsystem_no INTEGER'); } catch {}
+  try { _db.run('ALTER TABLE mrp_device_roles ADD COLUMN ring_port_1 INTEGER'); } catch {}
+  try { _db.run('ALTER TABLE mrp_device_roles ADD COLUMN ring_port_2 INTEGER'); } catch {}
+  _db.run(`CREATE INDEX IF NOT EXISTS idx_mrpdr_cfg ON mrp_device_roles(mrp_config_id)`);
+
+  // Directed port-to-port cable links forming the ring
+  _db.run(`CREATE TABLE IF NOT EXISTS mrp_port_links (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    mrp_config_id        INTEGER NOT NULL REFERENCES mrp_configs(id) ON DELETE CASCADE,
+    from_device          TEXT NOT NULL,
+    from_iface_subslot   INTEGER NOT NULL,
+    from_port_subslot    INTEGER NOT NULL,
+    to_device            TEXT NOT NULL,
+    to_iface_subslot     INTEGER NOT NULL,
+    to_port_subslot      INTEGER NOT NULL
+  )`);
+  _db.run(`CREATE INDEX IF NOT EXISTS idx_mrppl_cfg ON mrp_port_links(mrp_config_id)`);
 
   saveDb();
   console.log('[DB] Schema ready');

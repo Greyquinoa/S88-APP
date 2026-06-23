@@ -460,7 +460,7 @@ export default function App() {
       });
       setResult(r);
       setLoading("");
-      setStep(7);
+      setStep(8);
     } catch (e) {
       setError(e.message);
       setLoading("");
@@ -468,7 +468,7 @@ export default function App() {
   }
 
   function goTo(i) {
-    if (i === 7) return; // Generate output is not a direct nav target
+    if (i === 8) return; // Generate output is not a direct nav target
     if (i > 0 && !savedProjectName.trim()) {
       setError("Select or create a project first.");
       setStep(0);

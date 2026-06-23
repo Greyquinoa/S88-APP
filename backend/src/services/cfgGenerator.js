@@ -289,36 +289,40 @@ function renderCfuPa(station, templateMap, ioNo, diag) {
     const slot = station.slots.get(slotNo);
     const tpl  = findTemplate(templateMap, slot.orderNo);
 
-    // Resolve subslot 1 order: if the slot's own order_no IS a known subslot type
-    // (happens when user imports from CFG catalogue), use it directly. Otherwise
-    // derive from template signal_type, defaulting to AI short.
-    let subslot1Order;
-    if (KNOWN_PA_SUBSLOT_ORDERS.has(slot.orderNo)) {
-      subslot1Order = slot.orderNo;
+    // Build per-subslot profile map from slot.subslots (keyed by 1-based subslot_no)
+    // Falls back to legacy slot.paProfile (slot-level) for subslot 1 if no per-subslot entry exists.
+    const subslotProfileMap = new Map();
+    if (Array.isArray(slot.subslots)) {
+      for (const ss of slot.subslots) {
+        if (ss.paProfile && KNOWN_PA_SUBSLOT_ORDERS.has(ss.paProfile)) {
+          subslotProfileMap.set(ss.subslotNo, ss.paProfile);
+        }
+      }
+    }
+    // Resolve default (used when a subslot has no specific assignment)
+    let defaultSubslotOrder;
+    if (slot.paProfile && KNOWN_PA_SUBSLOT_ORDERS.has(slot.paProfile)) {
+      defaultSubslotOrder = slot.paProfile;
+    } else if (KNOWN_PA_SUBSLOT_ORDERS.has(slot.orderNo)) {
+      defaultSubslotOrder = slot.orderNo;
     } else {
       const sigType = tpl ? (tpl.signal_type || 'PA').toUpperCase() : 'PA';
-      subslot1Order = sigType === 'AO' ? 'SP (short)' : 'Analog Input (AI)short';
+      defaultSubslotOrder = sigType === 'AO' ? 'SP (short)' : 'Analog Input (AI)short';
     }
 
-    // Build Subslot 1 address lines. For GSD-path slots that have no catalogue template
-    // (and therefore no in_addr_fmt), construct the address line directly from the
-    // allocated inputAddr and the fixed 5-byte GSD profile length.
-    let ss1AddressLines;
-    if (tpl && tpl.in_addr_fmt && slot.inputAddr != null) {
-      // Template found — use standard buildAddressLines (channel_count=1 per PA device)
-      const ss1Tpl = { ...tpl, channel_count: 1 };
-      ss1AddressLines = buildAddressLines(ss1Tpl, { ...slot, channels: slot.channels || [] });
-    } else if (slot.inputAddr != null) {
-      // GSD-path fallback: emit the address line directly, then SYMBOL lines
-      const inBytes = (tpl && tpl.input_bytes > 0) ? tpl.input_bytes : 5;
-      const pipNo   = slot.pipNo != null ? slot.pipNo : 8;
-      ss1AddressLines = [
-        'LOCAL_IN_ADDRESSES',
-        `  ADDRESS  ${slot.inputAddr}, 0, ${inBytes}, 0, ${pipNo}, 0`,
-        ...buildSymbolLines('I', slot.channels || [], inBytes, 1),
-      ];
-    } else {
-      ss1AddressLines = [];
+    // Number of function subslots: channel_count from template (min 1).
+    // For simple profiles (Transmitter, Actuator) this is 1.
+    // For multi-function profiles (Analyzer etc.) this equals the number of PA functions.
+    const funcCount = (tpl && (tpl.channel_count || 0) > 1) ? tpl.channel_count : 1;
+    const perSubslotBytes = (tpl && tpl.input_bytes > 0) ? tpl.input_bytes : 5;
+    const perSubslotOutBytes = (tpl && tpl.output_bytes > 0) ? tpl.output_bytes : 0;
+    const pipNo = slot.pipNo != null ? slot.pipNo : 8;
+
+    // Index channels 0..(funcCount-1) to subslots 1..funcCount.
+    const channelsBySubslot = new Map();
+    for (const ch of (slot.channels || [])) {
+      // channel field = 0-based function index; subslot = channel + 1
+      if (ch.channel != null) channelsBySubslot.set(ch.channel, ch);
     }
 
     out.push(blocks.cfuPaPaSlotBlock({
@@ -327,13 +331,58 @@ function renderCfuPa(station, templateMap, ioNo, diag) {
       name: slot.name,
       diag: diag.ptr--,
     }));
-    out.push(blocks.cfuPaPaSubslot1Block({
-      ioNo, addr, slotNo,
-      subslotOrder: subslot1Order,
-      addressLines: ss1AddressLines,
-    }));
+
+    // Emit one signal subslot per function
+    for (let fi = 0; fi < funcCount; fi++) {
+      const ssNo = fi + 1;
+      const ssInAddr  = slot.inputAddr  != null ? slot.inputAddr  + fi * perSubslotBytes    : null;
+      const ssOutAddr = slot.outputAddr != null ? slot.outputAddr + fi * perSubslotOutBytes : null;
+
+      // Build address lines for this individual subslot
+      let ssAddressLines;
+      if (tpl && tpl.in_addr_fmt && ssInAddr != null) {
+        // Template with addr_fmt: build using single-subslot byte counts
+        const ssTpl = { ...tpl, channel_count: 1 };
+        const ch = channelsBySubslot.get(fi);
+        ssAddressLines = buildAddressLines(ssTpl, {
+          ...slot,
+          inputAddr:  ssInAddr,
+          outputAddr: ssOutAddr,
+          channels:   ch ? [ch] : [],
+        });
+      } else if (ssInAddr != null) {
+        // GSD-path fallback: construct ADDRESS line directly
+        ssAddressLines = [
+          'LOCAL_IN_ADDRESSES',
+          `  ADDRESS  ${ssInAddr}, 0, ${perSubslotBytes}, 0, ${pipNo}, 0`,
+        ];
+        const ch = channelsBySubslot.get(fi);
+        if (ch && ch.tag) {
+          ssAddressLines.push(`SYMBOL  I , 0, "${ch.tag}", "${ch.desc || ''}"`);
+        }
+        if (perSubslotOutBytes > 0 && ssOutAddr != null) {
+          ssAddressLines.push('LOCAL_OUT_ADDRESSES', `  ADDRESS  ${ssOutAddr}, 0, ${perSubslotOutBytes}, 0, ${pipNo}, 0`);
+          if (ch && ch.tag) {
+            ssAddressLines.push(`SYMBOL  Q , 0, "${ch.tag}", "${ch.desc || ''}"`);
+          }
+        }
+      } else {
+        ssAddressLines = [];
+      }
+
+      const subslotOrder = subslotProfileMap.get(ssNo) || defaultSubslotOrder;
+      out.push(blocks.cfuPaPaSubslot1Block({
+        ioNo, addr, slotNo,
+        subslotNo: ssNo,
+        subslotOrder,
+        addressLines: ssAddressLines,
+      }));
+    }
+
+    // Service subslot always last: funcCount + 1
     out.push(blocks.cfuPaPaSubslot2Block({
       ioNo, addr, slotNo,
+      subslotNo: funcCount + 1,
       diag: diag.ptr--,
     }));
   }
@@ -342,8 +391,55 @@ function renderCfuPa(station, templateMap, ioNo, diag) {
 }
 
 /**
+ * Render a Scalance network switch station.
+ * Structure: device header → SLOT 0 (DAP) → SUBSLOT 1 (PN-IO) → SUBSLOT N (ports).
+ * Port definitions come from tpl.port_config JSON; device identity from tpl.gsdml_file + tpl.dap_id.
+ */
+function renderScalance(station, templateMap, ioNo, diag) {
+  const addr   = station.address;
+  const hexIp  = ipToHex(station.ip);
+  const name   = deviceName(station);
+
+  const headSlot = station.slots.get(0);
+  const headTpl  = headSlot ? findTemplate(templateMap, headSlot.orderNo) : null;
+
+  const gsdmlFile = headTpl && headTpl.gsdml_file ? headTpl.gsdml_file : '';
+  const dapId     = headTpl && headTpl.dap_id     ? headTpl.dap_id     : '';
+  const gsdmlPath = dapId ? `${gsdmlFile}<DAP ${dapId}>` : gsdmlFile;
+  const version   = headTpl && headTpl.version    ? headTpl.version    : '';
+  const mlfb      = headSlot ? headSlot.orderNo : (headTpl ? headTpl.order_no : '');
+
+  let meta = {};
+  if (headTpl && headTpl.param_template) {
+    try { meta = JSON.parse(headTpl.param_template); } catch (_) {}
+  }
+
+  let ports = [];
+  if (headTpl && headTpl.port_config) {
+    try { ports = JSON.parse(headTpl.port_config); } catch (_) {}
+  }
+
+  const out = [];
+  out.push(blocks.scalanceDeviceHeaderBlock({
+    ioNo, addr, gsdmlPath, version, name, mlfb,
+    posX: station.posX, posY: station.posY, meta,
+  }));
+  out.push(blocks.scalanceSlot0Block({
+    ioNo, addr, gsdmlPath, name, hexIp, mlfb, diag: diag.ptr--, meta,
+  }));
+  out.push(blocks.scalancePnioBlock({ ioNo, addr, diag: diag.ptr-- }));
+  for (const p of ports) {
+    if (p.type !== 'port') continue;
+    out.push(blocks.scalancePortBlock({
+      ioNo, addr, gsdmlPath, subslot: p.subslot, portName: p.name, medium: p.medium || 'RJ45', diag: diag.ptr--,
+    }));
+  }
+  return out.join('\n\n');
+}
+
+/**
  * Render a station. ET200SP gets full PCS7 fidelity; CFU_PA gets its own renderer;
- * other families fall back to a minimal block until their templates are built.
+ * Scalance gets its GSDML-based renderer; others fall back to a minimal block.
  */
 function renderStation(station, templateMap, ioNo, diag) {
   const headSlot = station.slots.get(0) ||
@@ -353,6 +449,10 @@ function renderStation(station, templateMap, ioNo, diag) {
 
   if (family === 'CFU_PA') {
     return renderCfuPa(station, templateMap, ioNo, diag);
+  }
+
+  if (family === 'Scalance') {
+    return renderScalance(station, templateMap, ioNo, diag);
   }
 
   if (family === 'ET200SP') {

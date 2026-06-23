@@ -17,6 +17,7 @@ const valveCommandRoutes   = require('./routes/valveCommands');
 const hwConfigRoutes       = require('./routes/hwConfig');
 const hwControllersRoutes  = require('./routes/hwControllers');
 const hwFieldbusesRoutes   = require('./routes/hwFieldbuses');
+const mrpConfigRoutes      = require('./routes/mrpConfig');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -35,6 +36,7 @@ app.use('/api/valve-commands',   valveCommandRoutes);
 app.use('/api/hw-config',        hwConfigRoutes);
 app.use('/api/hw-controllers',   hwControllersRoutes);
 app.use('/api/hw-fieldbuses',    hwFieldbusesRoutes);
+app.use('/api/mrp',              mrpConfigRoutes);
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 

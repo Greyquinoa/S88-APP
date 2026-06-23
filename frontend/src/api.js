@@ -208,6 +208,12 @@ export async function saveValveCommands(entries)       { return request('PUT', '
 export async function hexToIp(hex) {
   return request('GET', `/hw-config/utils/hex-to-ip?hex=${encodeURIComponent(hex)}`);
 }
+export async function listHwSignalTypes() {
+  return request('GET', '/hw-config/signal-types');
+}
+export async function addHwSignalType(name) {
+  return request('POST', '/hw-config/signal-types', { name });
+}
 export async function listHwModuleTemplates() {
   return request('GET', '/hw-config/module-templates');
 }
@@ -284,6 +290,12 @@ export async function patchSlotPip(importId, addr, slot, pipNo) {
 export async function patchSlotPotentialGroup(importId, addr, slot, potentialGroup) {
   return request('PATCH', `/hw-config/imports/${importId}/stations/${addr}/slots/${slot}/potential-group`, { potentialGroup });
 }
+export async function patchSlotPaProfile(importId, addr, slot, paProfile) {
+  return request('PATCH', `/hw-config/imports/${importId}/stations/${addr}/slots/${slot}/pa-profile`, { paProfile });
+}
+export async function patchSlotSubslotProfile(importId, addr, slot, ssNo, paProfile) {
+  return request('PATCH', `/hw-config/imports/${importId}/stations/${addr}/slots/${slot}/subslots/${ssNo}/pa-profile`, { paProfile });
+}
 export async function generateHwCfg(importId, options = {}) {
   return request('POST', `/hw-config/imports/${importId}/generate`, options);
 }
@@ -326,6 +338,43 @@ export async function updateHwFieldbus(id, data) {
 }
 export async function deleteHwFieldbus(id) {
   return request('DELETE', `/hw-fieldbuses/${id}`);
+}
+
+// ── Slot ↔ Subslot Compatibility ─────────────────────────────────────────────
+export async function listSlotCompat() {
+  return request('GET', '/hw-config/slot-compat');
+}
+export async function addSlotCompat(slot_order_no, subslot_order_no, is_default = false) {
+  return request('POST', '/hw-config/slot-compat', { slot_order_no, subslot_order_no, is_default });
+}
+export async function removeSlotCompat(slot_order_no, subslot_order_no) {
+  return request('DELETE', '/hw-config/slot-compat', { slot_order_no, subslot_order_no });
+}
+
+// ── MRP Configuration ─────────────────────────────────────────────────────────
+export async function mrpGetDevices(importId) {
+  return request('GET', `/mrp/${importId}/devices`);
+}
+export async function mrpGetConfig(importId) {
+  return request('GET', `/mrp/${importId}/config`);
+}
+export async function mrpSaveConfig(importId, config) {
+  return request('POST', `/mrp/${importId}/config`, config);
+}
+export async function mrpDownloadCfg(importId) {
+  const res = await fetch(`${BASE}/mrp/${importId}/apply`, { method: 'POST' });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `HTTP ${res.status}`);
+  }
+  const blob = await res.blob();
+  const cd   = res.headers.get('Content-Disposition') || '';
+  const fnMatch = cd.match(/filename="?([^"]+)"?/);
+  const filename = fnMatch ? fnMatch[1] : 'station_mrp.cfg';
+  const url = URL.createObjectURL(blob);
+  const a   = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
 }
 
 // ── Composite CM Types ────────────────────────────────────────────────────────

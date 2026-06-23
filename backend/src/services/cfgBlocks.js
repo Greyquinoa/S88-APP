@@ -527,10 +527,10 @@ const PA_SUBSLOT1_META = {
   'SP (short)':             { id: '164', slaveCfg: '01 00 A4',          normRef: '1' },
 };
 
-function cfuPaPaSubslot1Block({ ioNo, addr, slotNo, subslotOrder, addressLines }) {
+function cfuPaPaSubslot1Block({ ioNo, addr, slotNo, subslotNo = 1, subslotOrder, addressLines }) {
   const meta = PA_SUBSLOT1_META[subslotOrder] || PA_SUBSLOT1_META['Analog Input (AI)short'];
   const out = [
-    `IOSUBSYSTEM ${ioNo}, IOADDRESS ${addr}, SLOT ${slotNo}, SUBSLOT 1, "${subslotOrder}", "${meta.id}"`,
+    `IOSUBSYSTEM ${ioNo}, IOADDRESS ${addr}, SLOT ${slotNo}, SUBSLOT ${subslotNo}, "${subslotOrder}", "${meta.id}"`,
     `BEGIN `,
     `  ASSET_ID "${newGuid()}"`,
     `  SLAVE_CFG_DATA "${meta.slaveCfg}"`,
@@ -557,10 +557,11 @@ function cfuPaPaSubslot1Block({ ioNo, addr, slotNo, subslotOrder, addressLines }
   return out.join('\n');
 }
 
-// CFU_PA Slot 3+ Subslot 2 — service block (AUTOCREATED, diagnostic address only).
-function cfuPaPaSubslot2Block({ ioNo, addr, slotNo, diag }) {
+// CFU_PA Slot 3+ Service subslot (AUTOCREATED, diagnostic address only).
+// subslotNo = channel_count + 1 (last subslot in the slot range).
+function cfuPaPaSubslot2Block({ ioNo, addr, slotNo, subslotNo = 2, diag }) {
   return [
-    `IOSUBSYSTEM ${ioNo}, IOADDRESS ${addr}, SLOT ${slotNo}, SUBSLOT 2, "_S7H_NORM_PDM_BUB_MODULE_CT", "Service"`,
+    `IOSUBSYSTEM ${ioNo}, IOADDRESS ${addr}, SLOT ${slotNo}, SUBSLOT ${subslotNo}, "_S7H_NORM_PDM_BUB_MODULE_CT", "Service"`,
     `AUTOCREATED `,
     `BEGIN `,
     `  ASSET_ID "${newGuid()}"`,
@@ -633,6 +634,244 @@ function subsystemHeaderBlock({ no, subnetName, posX, posY, sizeX }) {
   ].join('\n');
 }
 
+// ── SCALANCE device blocks ────────────────────────────────────────────────────
+// gsdmlPath = "GSDML-V2.42-...-SCALANCE_XC200-20230619.xml<DAP 87>"
+// For the device header line PCS7 appends "EXTENDED" after the DAP suffix.
+
+function scalanceDeviceHeaderBlock({ ioNo, addr, gsdmlPath, version, name, mlfb, posX, posY, meta }) {
+  const ver      = version ? ` "${version}"` : '';
+  const vendorId = meta && meta.PN_VENDOR_ID ? meta.PN_VENDOR_ID : '42';
+  const deviceId = meta && meta.PN_DEVICE_ID ? meta.PN_DEVICE_ID : '';
+  const minVer   = meta && meta.PN_MIN_VERSION ? meta.PN_MIN_VERSION : '';
+  const hwRel    = meta && meta.PN_HW_RELEASE  ? meta.PN_HW_RELEASE  : '1';
+  const swRel    = meta && meta.PN_SW_RELEASE  ? meta.PN_SW_RELEASE  : (version || '');
+  return [
+    `IOSUBSYSTEM ${ioNo}, IOADDRESS ${addr}, "${gsdmlPath}EXTENDED"${ver}, "${name}"`,
+    `BEGIN`,
+    `  ASSET_ID "${newGuid()}"`,
+    `  INSTALLATION_DATE ""`,
+    `  HAS_SHARED_SUBMODULES "0"`,
+    `  ADDITIONAL_INFORMATION ""`,
+    `  PDM_PARAM "0"`,
+    `  PLANT_LOCATION ""`,
+    `  PN_HW_RELEASE "${hwRel}"`,
+    `  PN_SW_RELEASE "${swRel}"`,
+    `  PN_VENDOR_ID "${vendorId}"`,
+    `  PN_FIXED_UPDATE_TIME "0"`,
+    `  PN_MIN_VERSION "${minVer}"`,
+    `  PN_DEVICE_ID "${deviceId}"`,
+    `  GUI_HIDE "0"`,
+    `  OBJECT_REMOVEABLE "1"`,
+    `  POS_X "${posX != null ? posX : 355}"`,
+    `  POS_Y "${posY != null ? posY : 245}"`,
+    `  SIZE_X "78"`,
+    `  SIZE_Y "64"`,
+    `  MODULE_ADD_FLAGS "0"`,
+    `  PN_DEVICE_SCF_L "32"`,
+    `  CAX_APP_ID ""`,
+    `  PN_GENERATED_SCF "0"`,
+    `  SHARED_PROXY_DATA ""`,
+    `  PN_WATCHDOGFACTOR "3"`,
+    `  OBJECT_COPYABLE "1"`,
+    `  CREATOR ""`,
+    `  LIST_SUBMODULES ""`,
+    `  COMMENT ""`,
+    `  PN_DEVICE_UPD_TIME "128"`,
+    `  CONFIG_FILE_NAME ""`,
+    `  CONFIG_FILE_DATA ""`,
+    `  PLANT_DESIGNATION ""`,
+    `  IRT_GROUP_NR "1"`,
+    `END`,
+  ].join('\n');
+}
+
+function scalanceSlot0Block({ ioNo, addr, gsdmlPath, name, hexIp, mlfb, diag, meta }) {
+  const minVer = meta && meta.PN_MIN_VERSION ? meta.PN_MIN_VERSION : '';
+  const hwRel  = meta && meta.PN_HW_RELEASE  ? meta.PN_HW_RELEASE  : '1';
+  const swRel  = meta && meta.PN_SW_RELEASE  ? meta.PN_SW_RELEASE  : '';
+  return [
+    `IOSUBSYSTEM ${ioNo}, IOADDRESS ${addr}, SLOT 0, "${gsdmlPath}", "${name}"`,
+    `AUTOCREATED `,
+    `BEGIN `,
+    `  ASSET_ID "${newGuid()}"`,
+    `  MACADDRESS "080006010000"`,
+    `  IPACTIVE "1"`,
+    `  IPADDRESS "${hexIp}"`,
+    `  SUBNETMASK "FFFFFF00"`,
+    `  ROUTERADDRESS "${hexIp}"`,
+    `  ROUTERACTIVE "0"`,
+    `  ISOACTIVE "0"`,
+    `  PN_TI "0"`,
+    `  PN_TO "0"`,
+    `  PN_EQUIDISTANT_CYCLE "0"`,
+    `  COUPLING_UID ""`,
+    `  PN_MODULE_IDENTNUMBER "135"`,
+    `  PN_HW_RELEASE "${hwRel}"`,
+    `  PN_SUBMODULE_IDENTNUMBER "65537"`,
+    `  PN_SW_RELEASE "${swRel}"`,
+    `  PN_IPADDR_MODE_DEV "0"`,
+    `  PN_MIN_VERSION "${minVer}"`,
+    `  GUI_HIDE "0"`,
+    `  OBJECT_REMOVEABLE "0"`,
+    `  POS_X "0"`,
+    `  POS_Y "0"`,
+    `  SIZE_X "0"`,
+    `  SIZE_Y "0"`,
+    `  MLFB "${mlfb}"`,
+    `  CAX_APP_ID ""`,
+    `  OBJECT_COPYABLE "0"`,
+    `  CREATOR ""`,
+    `  COMMENT ""`,
+    `  IRT_GROUP_NR "1"`,
+    `LOCAL_IN_ADDRESSES `,
+    `  ADDRESS  ${diag}, 0, 0, 0, 0, 0`,
+    `PARAMETER `,
+    `  "TOK_ParaRecDataItem_REF_DS4_Text_Var1 PRDIndex 33 DataID 48", "TOK_REF_DS33_LocalConfig"`,
+    `  "TOK_ParaRecDataItem_REF_DS4_Text_Var2 PRDIndex 33 DataID 56", "TOK_REF_DS33_NotMotitored"`,
+    `  "TOK_ParaRecDataItem_REF_DS4_Text_Var3 PRDIndex 33 DataID 64", "0"`,
+    `END `,
+  ].join('\n');
+}
+
+function scalancePnioBlock({ ioNo, addr, diag }) {
+  return [
+    `IOSUBSYSTEM ${ioNo}, IOADDRESS ${addr}, SLOT 0, SUBSLOT 1, "_S7H_SCALANCE_INTERFACE_EXTDS2_CT", "PN-IO"`,
+    `AUTOCREATED `,
+    `BEGIN `,
+    `  ASSET_ID "${newGuid()}"`,
+    `  PN_TI "0"`,
+    `  INSTALLATION_DATE ""`,
+    `  PN_TO "0"`,
+    `  NETWORK_COMPONENT_DIAG "0"`,
+    `  IRT_DETERMINATION_LEVEL "1"`,
+    `  PN_EQUIDISTANT_CYCLE "0"`,
+    `  NO_OF_EXT_CONTROLLER "0"`,
+    `  ADDITIONAL_INFORMATION ""`,
+    `  NO_SET_TO_MAX "0"`,
+    `  IRT_SYNC_FLAG "65280"`,
+    `  IRT_CACF "1"`,
+    `  IRT_DEVICE_CYCLE_GROUP ""`,
+    `  EXT_SENDCLOCK "32"`,
+    `  PN_DEVICE_FSU_PRIORITY "0"`,
+    `  PLANT_LOCATION ""`,
+    `  IRT_ADJUST_TITO "1"`,
+    `  IRT_PN_USER_RATIO "30"`,
+    `  MRP_CONFIGURATION "mrpdomain-1\t0"`,
+    `  PN_SUBMODULE_IDENTNUMBER "257"`,
+    `  IRT_PTCP_SUBDOMAIN_ID_DATA ""`,
+    `  PN_MIN_VERSION "V2.0"`,
+    `  IRT_PTCP_SUBDOMAIN_ID_HASH ""`,
+    `  GUI_HIDE "0"`,
+    `  OBJECT_REMOVEABLE "0"`,
+    `  IRT_BANDWIDTH_OVERRIDE_ALLOWED "0"`,
+    `  IRT_OPTIMIZATION_STRUCT ""`,
+    `  IRT_DOMAIN_NAME "syncdomain-default"`,
+    `  POS_X "0"`,
+    `  IRT_SENDCLOCK_FACTOR "32"`,
+    `  POS_Y "0"`,
+    `  SIZE_X "0"`,
+    `  ALTERNATIVE_REDUNDANCY_ENABLE "0"`,
+    `  MRP_MULTI_CONFIGURATION "6D 72 70 64 6F 6D 61 69 6E 2D 31 09 30 09 6D 72 70 64 6F 6D 61 69 6E 2D 32 09 30 09 6D 72 70 64 6F 6D 61 69 6E 2D 33 09 30 09 6D 72 70 64 6F 6D 61 69 6E 2D 34 09 30 09 00"`,
+    `  MRP_DIAGNOSIS "0"`,
+    `  SIZE_Y "0"`,
+    `  MRP_MULTI_DIAGNOSIS "0"`,
+    `  MRP_INSTANCES "0"`,
+    `  PNDX_MODE "0"`,
+    `  CAX_APP_ID ""`,
+    `  PTCP_TIME_SYNC_ENABLED "0"`,
+    `  IRT_PN_RATIO "-1"`,
+    `  OBJECT_COPYABLE "0"`,
+    `  CREATOR ""`,
+    `  COMMENT ""`,
+    `  PLANT_DESIGNATION ""`,
+    `  IRT_SYNC_WHOLE_DEVICE "1"`,
+    `  IRT_GROUP_NR "1"`,
+    `LOCAL_IN_ADDRESSES `,
+    `  ADDRESS  ${diag}, 0, 0, 0, 0, 0`,
+    `PARAMETER `,
+    `  "TOK_ParaRecDataItem_REF_DS3_Text_Var1 PRDIndex 3 DataID 72", "TOK_REF_DS3_Var1_0"`,
+    `  "TOK_ParaRecDataItem_REF_DS_LD_Interface_Text_Var1 PRDIndex 12309 DataID 48", "TOK_REF_DS_LD_Interface_Var1_255"`,
+    `  "TOK_ParaRecDataItem_REF_DS_LD_Interface_Text_Var2 PRDIndex 12309 DataID 56", "TOK_REF_DS_LD_Interface_Var2_1"`,
+    `  "TOK_ParaRecDataItem_REF_DS_LD_Interface_Text_Var3 PRDIndex 12309 DataID 64", "TOK_REF_DS_LD_Interface_Var3_1"`,
+    `  "TOK_ParaRecDataItem_REF_DS_LD_Interface_Text_Var4 PRDIndex 12309 DataID 72", "0"`,
+    `  "TOK_ParaRecDataItem_REF_DS_LD_Interface_Text_Var5 PRDIndex 12309 DataID 80", "2"`,
+    `  "TOK_ParaRecDataItem_REF_DS_PM_Interface_Text_Var1 PRDIndex 12312 DataID 48", "TOK_REF_DS_PM_Interface_Var1_255"`,
+    `  "TOK_ParaRecDataItem_REF_DS_PM_Interface_Text_Var2 PRDIndex 12312 DataID 56", "TOK_REF_DS_PM_Interface_Var2_0"`,
+    `  "TOK_ParaRecDataItem_REF_DS_PM_Interface_Text_Var3 PRDIndex 12312 DataID 64", "1"`,
+    `  "TOK_ParaRecDataItem_REF_DS_PM_Interface_Text_Var4 PRDIndex 12312 DataID 80", "0"`,
+    `END `,
+  ].join('\n');
+}
+
+function scalancePortBlock({ ioNo, addr, gsdmlPath, subslot, portName, medium, diag }) {
+  const isFO        = medium && medium.toUpperCase() === 'FO';
+  const lineDelay   = isFO ? '18000' : '600';
+  const rtCheck     = isFO ? '0' : '1';
+  const fiberType   = isFO ? '2' : '0';
+  return [
+    `IOSUBSYSTEM ${ioNo}, IOADDRESS ${addr}, SLOT 0, SUBSLOT ${subslot}, "${gsdmlPath}", "${portName}"`,
+    `AUTOCREATED `,
+    `BEGIN `,
+    `  ASSET_ID "${newGuid()}"`,
+    `  IRT_FIBEROPTIC_CABLETYPE "${isFO ? '1' : '0'}"`,
+    `  LINE_COMMENT ""`,
+    `  INSTALLATION_DATE ""`,
+    `  LINK_STATE_DIAG_NEW_VERSION "0"`,
+    `  LINE_DELAY "${lineDelay}"`,
+    `  S7H_IRT_PORT_THRESHOLD_SFP_L "0"`,
+    `  ADDITIONAL_INFORMATION ""`,
+    `  S7H_IRT_PORT_TXF_SFP_L "0"`,
+    `  S7H_IRT_PORT_RXL_SFP_L "0"`,
+    `  PLANT_LOCATION ""`,
+    `  LINK_STATE_DIAG_REQUIRE "0"`,
+    `  ETH_MEDIUM_RUNTIME_CHECK "${rtCheck}"`,
+    `  PN_MRPI_DOMAIN_ID "0"`,
+    `  PN_MRPI_DOMAIN_NAME ""`,
+    `  PORT_DEACTIVATED "0"`,
+    `  PN_MRPI_ROLE "0"`,
+    `  PN_MRPI_DIAGNOSIS "0"`,
+    `  PN_MRPI_STARTUP "2"`,
+    `  MRP_DOMAIN ""`,
+    `  PORT_DOMAIN_BOUNDARY "0"`,
+    `  PN_MIN_VERSION "V1.0"`,
+    `  GUI_HIDE "0"`,
+    `  OBJECT_REMOVEABLE "0"`,
+    `  PORT_DCP_BOUNDARY "0"`,
+    `  POS_X "0"`,
+    `  PORT_LLDP_BOUNDARY "0"`,
+    `  POS_Y "0"`,
+    `  PN_RINGSTATUS_STRUCT ""`,
+    `  SIZE_X "0"`,
+    `  IRT_LINE_RX_DELAY "0"`,
+    `  SIZE_Y "0"`,
+    `  MRP_INSTANCE_NUMBER "0"`,
+    `  PNDX_MODE "0"`,
+    `  CAX_APP_ID ""`,
+    `  OBJECT_COPYABLE "0"`,
+    `  CREATOR ""`,
+    `  COMMENT ""`,
+    `  MULTICAST_BOUNDARY "0"`,
+    `  ETHERNET_MED_DUP "8"`,
+    `  PLANT_DESIGNATION ""`,
+    `  IRT_FIBEROPTIC_TYPE "${fiberType}"`,
+    `  LINE_DELAY_SELECTOR "0"`,
+    `  IRT_GROUP_NR "1"`,
+    `LOCAL_IN_ADDRESSES `,
+    `  ADDRESS  ${diag}, 0, 0, 0, 0, 0`,
+    `PARAMETER `,
+    `  "TOK_ParaRecDataItem_REF_DS_NNM2_Port_Text_Var1 PRDIndex 32 DataID 48", "TOK_REF_DS_NNM2_Var1_255"`,
+    `  "TOK_ParaRecDataItem_REF_DS_NNM2_Port_Text_Var2 PRDIndex 32 DataID 64", "0"`,
+    `  "TOK_ParaRecDataItem_REF_DS_NNM3_Port_Text_Var3 PRDIndex 32 DataID 80", "TOK_REF_DS_NNM3_Var3_0"`,
+    `  "TOK_ParaRecDataItem_REF_DS_LD_Port_Text_Var1 PRDIndex 12310 DataID 48", "TOK_REF_DS_LD_Port_Var1_2"`,
+    `  "TOK_ParaRecDataItem_REF_DS_LD_Port_Text_Var2 PRDIndex 12310 DataID 56", "TOK_REF_DS_LD_Port_Var2_2"`,
+    `  "TOK_ParaRecDataItem_REF_DS_LD_Port_Text_Var3 PRDIndex 12310 DataID 64", "TOK_REF_DS_LD_Port_Var3_2"`,
+    `  "TOK_ParaRecDataItem_REF_DS_LD_Port_Text_Var4 PRDIndex 12310 DataID 72", "0"`,
+    `  "TOK_ParaRecDataItem_REF_DS_LD_Port_Text_Var5 PRDIndex 12310 DataID 80", "2"`,
+    `  "TOK_ParaRecDataItem_REF_DS_PM_Port_Text_Var1 PRDIndex 12313 DataID 48", "TOK_REF_DS_PM_Port_Var1_0"`,
+    `END `,
+  ].join('\n');
+}
+
 module.exports = {
   newGuid,
   ifaceOrderString,
@@ -654,4 +893,8 @@ module.exports = {
   cfuPaPaSlotBlock,
   cfuPaPaSubslot1Block,
   cfuPaPaSubslot2Block,
+  scalanceDeviceHeaderBlock,
+  scalanceSlot0Block,
+  scalancePnioBlock,
+  scalancePortBlock,
 };

@@ -147,13 +147,134 @@ function addrFmt(fields) {
   return parts.join(', ');
 }
 
+// ── Scalance GSDML device detection ──────────────────────────────────────────
+// Detects GSDML-referenced IOSUBSYSTEM devices (e.g. SCALANCE switches) that are
+// identified by a GSDML XML path rather than a Siemens order number.
+// Returns a Map<ioAddress, { gsdmlPath, gsdmlFile, dapId, version, name, mlfb, ports[], vendorId, deviceId, minVersion }>
+function extractScalanceDevices(lines) {
+  const devices = new Map(); // ioAddress → device record
+  let i = 0;
+
+  while (i < lines.length) {
+    const l = lines[i].trimEnd();
+
+    if (!/^IOSUBSYSTEM\s+\d+,\s*IOADDRESS\s+\d+/.test(l)) { i++; continue; }
+
+    const ioAddrM = l.match(/\bIOADDRESS\s+(\d+)/i);
+    const slotM   = l.match(/\bSLOT\s+(\d+)/i);
+    const ssM     = l.match(/\bSUBSLOT\s+(\d+)/i);
+    const ioAddr  = ioAddrM ? parseInt(ioAddrM[1], 10) : null;
+
+    // Extract all quoted strings from the header line
+    const quoted = [];
+    const qRe = /"([^"]*)"/g; let qm;
+    while ((qm = qRe.exec(l)) !== null) quoted.push(qm[1]);
+    const orderNo = quoted[0] || '';
+
+    // Only care about GSDML-path devices (order_no starts with "GSDML")
+    if (!/^GSDML/i.test(orderNo) || ioAddr === null) { i++; continue; }
+
+    // Parse the GSDML path: "GSDML-V2.42-...-SCALANCE_XC200-20230619.xml<DAP 87>EXTENDED"
+    // → gsdmlFile = "GSDML-V2.42-...-SCALANCE_XC200-20230619.xml", dapId = "87"
+    const gsdmlBase  = orderNo.replace(/EXTENDED$/i, '').replace(/<DAP\s*\d+>/i, '').trim();
+    const gsdmlFileM = gsdmlBase.match(/(GSDML[^<]+\.xml)/i);
+    const gsdmlFile  = gsdmlFileM ? gsdmlFileM[1] : gsdmlBase;
+    const dapM       = orderNo.match(/<DAP\s*(\d+)>/i);
+    const dapId      = dapM ? dapM[1] : null;
+    const gsdmlPath  = dapId ? `${gsdmlFile}<DAP ${dapId}>` : gsdmlFile;
+
+    const version = (quoted.length >= 3 && /^V\d/i.test(quoted[1])) ? quoted[1] : null;
+    const devName = quoted[quoted.length - 1] || '';
+
+    // Collect body lines
+    i++;
+    const bodyLines = [];
+    let depth = 0;
+    while (i < lines.length) {
+      const bl = lines[i].trimEnd();
+      if (/\bBEGIN\b/.test(bl)) depth++;
+      if (/^\s*END\b/.test(bl)) { if (depth <= 1) { i++; break; } depth--; }
+      bodyLines.push(bl); i++;
+    }
+
+    // ── Case 1: No SLOT — this is the device-level header block ──────────────
+    if (!slotM && !ssM) {
+      // Extract device-level properties from body (PN_VENDOR_ID, PN_DEVICE_ID, etc.)
+      const vendorIdM  = bodyLines.join('\n').match(/PN_VENDOR_ID\s+"(\w+)"/);
+      const deviceIdM  = bodyLines.join('\n').match(/PN_DEVICE_ID\s+"(\w+)"/);
+      const minVerM    = bodyLines.join('\n').match(/PN_MIN_VERSION\s+"([^"]+)"/);
+      const hwRelM     = bodyLines.join('\n').match(/PN_HW_RELEASE\s+"([^"]+)"/);
+      const swRelM     = bodyLines.join('\n').match(/PN_SW_RELEASE\s+"([^"]+)"/);
+      if (!devices.has(ioAddr)) devices.set(ioAddr, { gsdmlPath, gsdmlFile, dapId, version, name: devName, mlfb: null, ports: [],
+        vendorId: vendorIdM ? vendorIdM[1] : null, deviceId: deviceIdM ? deviceIdM[1] : null,
+        minVersion: minVerM ? minVerM[1] : null, hwRelease: hwRelM ? hwRelM[1] : null,
+        swRelease: swRelM ? swRelM[1] : null });
+      continue;
+    }
+
+    // ── Case 2: SLOT 0 (no subslot) — device DAP, contains MLFB ─────────────
+    if (slotM && parseInt(slotM[1], 10) === 0 && !ssM) {
+      const mlfbM = bodyLines.join('\n').match(/MLFB\s+"([^"]+)"/);
+      if (mlfbM) {
+        if (!devices.has(ioAddr)) devices.set(ioAddr, { gsdmlPath, gsdmlFile, dapId, version, name: devName, mlfb: null, ports: [],
+          vendorId: null, deviceId: null, minVersion: null, hwRelease: null, swRelease: null });
+        devices.get(ioAddr).mlfb = mlfbM[1];
+      }
+      continue;
+    }
+
+    // ── Case 3: SLOT 0, SUBSLOT N — port subslot entries ─────────────────────
+    if (slotM && parseInt(slotM[1], 10) === 0 && ssM) {
+      const ssNo    = parseInt(ssM[1], 10);
+      const portName = devName; // e.g. "Port 1 - RJ45", "PN-IO"
+
+      if (!devices.has(ioAddr)) devices.set(ioAddr, { gsdmlPath, gsdmlFile, dapId, version, name: '', mlfb: null, ports: [],
+        vendorId: null, deviceId: null, minVersion: null, hwRelease: null, swRelease: null });
+      const dev = devices.get(ioAddr);
+
+      // Detect port type: PN-IO interface or physical port
+      const isInterface = orderNo.startsWith('_S7H_');
+      let medium = null;
+      if (!isInterface) {
+        // Derive medium from port name: "Port N - RJ45" → "RJ45", "Port N - FO" → "FO"
+        const medM = portName.match(/[-–]\s*(RJ45|FO|SFP|LC|SC|MT-RJ)/i);
+        medium = medM ? medM[1].toUpperCase() : 'RJ45';
+      }
+
+      dev.ports.push({ subslot: ssNo, name: portName, type: isInterface ? 'interface' : 'port',
+        medium, orderNo });
+      continue;
+    }
+
+    // Other SLOT entries (slot ≠ 0) — not relevant for Scalance
+  }
+
+  return devices;
+}
+
 // ── Main par───────────────────────────────────────────────────────
 function parseCfgForCatalogue(text) {
   const lines = text.split(/\r?\n/);
 
+  // ── Pre-pass: extract GSDML Scalance device records ──────────────────────────
+  const scalanceDevices = extractScalanceDevices(lines);
+
   // Collect all IOSUBSYSTEM IOADDRESS blocks (device heads + slot cards).
   // Each candidate block: { header_line, body_lines[] }
   const blocks = [];
+  // Tracks the highest SUBSLOT number seen for each (ioAddress, slot) pair.
+  // The last (highest) subslot is the service module — subslot_no - 1 = function count.
+  // Key: "<ioAddress>:<slotNo>", value: highest subslot number seen.
+  const maxSubslotByKey = new Map();
+  // Tracks every function subslot's order_no for each (ioAddress, slot) pair.
+  // Key: "<ioAddress>:<slotNo>", value: Map<ssNo (number), orderNo (string)>
+  // The entry at maxSubslotByKey[key] is the service module (excluded from defaults);
+  // all others are configurable function subslots used to build subslot_defaults[].
+  const funcSubslotsByKey = new Map();
+  // Tracks SLOT 0 port subslots per ioAddress (for ET200 / non-Scalance devices).
+  // Key: ioAddress (number), value: [{ subslot, name, orderNo }, ...]
+  // Subslot 1 = PN-IO interface; subslot ≥ 2 = physical ports.
+  const imPortsByAddr = new Map();
   let i = 0;
 
   while (i < lines.length) {
@@ -161,27 +282,53 @@ function parseCfgForCatalogue(text) {
 
     // Match: IOSUBSYSTEM <no>, IOADDRESS <addr>[, SLOT <s>[, SUBSLOT <ss>]], "<orderNo>", "<label>"
     if (/^IOSUBSYSTEM\s+\d+,\s*IOADDRESS\s+\d+/.test(l)) {
-      // Skip SUBSLOT ≥ 2 — these are ethernet ports, secondary interfaces, etc.
-      // SUBSLOT 1 = main device/IFACE head → keep.
-      // No SUBSLOT  = plain IO card in a numbered slot → keep.
       const ssm = l.match(/\bSUBSLOT\s+(\d+)/i);
-      if (ssm && parseInt(ssm[1], 10) >= 2) {
-        // Consume the block without storing it
-        i++;
-        let depth = 0;
-        while (i < lines.length) {
-          const bl = lines[i].trimEnd();
-          if (/\bBEGIN\b/.test(bl)) depth++;
-          if (/^\s*END\b/.test(bl)) { if (depth <= 1) { i++; break; } depth--; }
-          i++;
+      const ssNo = ssm ? parseInt(ssm[1], 10) : null;
+
+      // SUBSLOT 1 = IFACE/device head → keep as background (auto-imported, not shown to user)
+      // SUBSLOT ≥ 2 = function subslots + service module → keep as visible candidates
+      // No SUBSLOT  = plain IO card in a numbered slot / station head → keep
+
+      // Track highest subslot number per (ioAddress, slot) — used to identify service module
+      if (ssNo !== null && ssNo >= 1) {
+        const ioAddrMss = l.match(/\bIOADDRESS\s+(\d+)/i);
+        const slotMss   = l.match(/\bSLOT\s+(\d+)/i);
+        if (ioAddrMss && slotMss) {
+          const key  = `${ioAddrMss[1]}:${slotMss[1]}`;
+          const prev = maxSubslotByKey.get(key) || 0;
+          if (ssNo > prev) maxSubslotByKey.set(key, ssNo);
+          // Capture order_no for each function subslot (non-META entries)
+          const qSsMss = []; const qReMss = /"([^"]*)"/g; let qmMss;
+          while ((qmMss = qReMss.exec(l)) !== null) qSsMss.push(qmMss[1]);
+          const ssOrderNo = qSsMss[0] || null;
+          if (ssOrderNo && !/^META[/\\]/i.test(ssOrderNo)) {
+            if (!funcSubslotsByKey.has(key)) funcSubslotsByKey.set(key, new Map());
+            funcSubslotsByKey.get(key).set(ssNo, ssOrderNo);
+          }
         }
-        continue;
+      }
+
+      // Collect SLOT 0 port subslots (≥2) for non-GSDML ET200 IM modules.
+      // SUBSLOT 1 is the PN-IO interface head; SUBSLOT ≥ 2 are physical ports.
+      const slotMpre   = l.match(/\bSLOT\s+(\d+)/i);
+      const ssNoPre    = ssm ? parseInt(ssm[1], 10) : null;
+      const ioAddrMpre = l.match(/\bIOADDRESS\s+(\d+)/i);
+      if (slotMpre && parseInt(slotMpre[1], 10) === 0 && ssNoPre !== null && ssNoPre >= 1 && ioAddrMpre) {
+        const qsPre = []; const qRePre = /"([^"]*)"/g; let qmPre;
+        while ((qmPre = qRePre.exec(l)) !== null) qsPre.push(qmPre[1]);
+        const portOrderNo = qsPre[0] || '';
+        const portLabel   = qsPre[qsPre.length - 1] || `Port ${ssNoPre}`;
+        // Skip GSDML-path entries (handled by extractScalanceDevices) and _S7H_ iface heads
+        if (!/^GSDML/i.test(portOrderNo)) {
+          const addr = parseInt(ioAddrMpre[1], 10);
+          if (!imPortsByAddr.has(addr)) imPortsByAddr.set(addr, []);
+          imPortsByAddr.get(addr).push({ subslot: ssNoPre, name: portLabel, orderNo: portOrderNo });
+        }
       }
 
       const headerLine = l;
       const bodyLines = [];
       i++;
-      // Collect up to the matching END (handle nested BEGIN/END)
       let depth = 0;
       while (i < lines.length) {
         const bl = lines[i].trimEnd();
@@ -255,6 +402,13 @@ function parseCfgForCatalogue(text) {
       // Skip if order_no is suspiciously empty or internal
       if (!order_no || order_no.length < 4) continue;
 
+      // Skip GSDML-path blocks that belong to a detected Scalance device — those are
+      // handled by extractScalanceDevices() and injected as a single 'Scalance' candidate.
+      if (/^GSDML/i.test(order_no)) {
+        const ioAddrN = ioAddrM ? parseInt(ioAddrM[1], 10) : null;
+        if (ioAddrN !== null && scalanceDevices.has(ioAddrN)) continue;
+      }
+
       // ── Parse the block body ──────────────────────────────────────────────
       const body = bodyLines.join('\n');
 
@@ -317,12 +471,33 @@ function parseCfgForCatalogue(text) {
       const in_addr_fmt  = inAddrFields  ? addrFmt(inAddrFields)  : null;
       const out_addr_fmt = outAddrFields ? addrFmt(outAddrFields) : null;
 
-      // Estimate channel count from bytes (rough heuristic for DI/DO = 1ch/bit, AI/AO = 2 or 4 bytes/ch)
-      // We leave channel_count as 0 — the user can correct it; we don't have enough info from .cfg alone
-      const channel_count = 0;
+      // For CFU_PA slot entries (META\... GSD paths), derive function_count and subslot_defaults.
+      // The service module is the highest-numbered subslot; all others are configurable functions.
+      // subslot_defaults: [{ssNo, paProfile}, ...] — one entry per function subslot (excluding service).
+      // e.g. Transmitter: service at SS 2 → 1 function (SS 1); Analyzer: service at SS 33 → 32 functions (SS 1..32).
+      let channel_count = 0;
+      let subslot_defaults = null;
+      if (slotM && /^META[/\\]/i.test(order_no)) {
+        const compatKey  = `${ioAddress}:${slotM[1]}`;
+        const servicePos = maxSubslotByKey.get(compatKey) || 0;
+        if (servicePos > 1) channel_count = servicePos - 1;
+        const ssMap = funcSubslotsByKey.get(compatKey);
+        if (ssMap && ssMap.size > 0) {
+          const entries = [];
+          for (const [ssNo, paProfile] of ssMap) {
+            if (ssNo !== servicePos) entries.push({ ssNo, paProfile });
+          }
+          entries.sort((a, b) => a.ssNo - b.ssNo);
+          if (entries.length > 0) subslot_defaults = JSON.stringify(entries);
+        }
+      }
 
       let signal_type = deriveSignalType(input_bytes, output_bytes);
       signal_type = refineSignalType(signal_type, label);
+
+      // GSD-path PROFIBUS PA transmitter slots (META\...) are always PA signal type,
+      // regardless of byte count heuristics which incorrectly classify them as AI.
+      if (/^META[/\\]/i.test(order_no)) signal_type = 'PA';
 
       // Family: COMMENT override > order-number derivation
       const derivedFamily = deriveFamily(order_no);
@@ -332,14 +507,44 @@ function parseCfgForCatalogue(text) {
       const param_template = paramLines.length > 0 ? paramLines.join('\n') : null;
       const display_name = label || order_no;
 
-      const isSubslot1 = !!(slotM && subslotM && parseInt(subslotM[1], 10) === 1);
+      const subslotNo = subslotM ? parseInt(subslotM[1], 10) : null;
+
+      // Determine if this subslot is the service module (highest-numbered subslot for this slot).
+      // Service modules are infrastructure-only (AUTOCREATED in PCS7) — not user-importable.
+      let isServiceModule = false;
+      if (slotM && subslotNo !== null && subslotNo >= 1) {
+        const compatKey  = `${ioAddress}:${slotM[1]}`;
+        const servicePos = maxSubslotByKey.get(compatKey) || 0;
+        // Only mark as service module if there are multiple subslots (servicePos > 1),
+        // meaning this is truly the highest = AUTOCREATED one; single-subslot slots are not service modules.
+        if (servicePos > 1 && subslotNo === servicePos) isServiceModule = true;
+      }
+
+      // SUBSLOT 1 IFACE infrastructure heads have order_no starting with "_S7H_".
+      // These are auto-imported alongside their parent and hidden from the user preview.
+      // Plain PA profile types appearing at SUBSLOT 1 (e.g. "Analog Input (AI)long") are
+      // real function subslots — they should be visible and importable independently.
+      const isIfaceHead = !!(slotM && subslotNo === 1 && order_no.startsWith('_S7H_'));
+
       let hw_category;
-      if (isSubslot1) {
+      if (subslotNo !== null) {
         hw_category = 'subslot';
       } else if (slotM) {
         hw_category = 'slot';
       } else {
         hw_category = 'station';
+      }
+
+      // For station-head entries (hw_category === 'station'), attach any SLOT 0 port subslots
+      // collected in the pre-pass so the template can display port sub-rows in the UI.
+      // Only applies to non-GSDML (ET200/CFU) IM modules; Scalance gets port_config via extractScalanceDevices.
+      let port_config = null;
+      if (hw_category === 'station' && !(/^GSDML/i.test(order_no))) {
+        const imPorts = imPortsByAddr.get(ioAddress);
+        if (imPorts && imPorts.length > 0) {
+          const sorted = [...imPorts].sort((a, b) => a.subslot - b.subslot);
+          port_config = JSON.stringify(sorted);
+        }
       }
 
       const candidate = {
@@ -355,16 +560,26 @@ function parseCfgForCatalogue(text) {
         out_addr_fmt,
         param_template,
         channel_count,
-        slotInfo,      // e.g. "Slot 1", "Station head", "Slot 0 / Subslot 1" — for display only
+        subslot_defaults, // CFU_PA slot only: JSON array [{ssNo,paProfile},...] from CFG — null for all others
+        port_config,   // ET200/CFU station heads: JSON [{subslot, name, orderNo},...] — null otherwise
+        slotInfo,      // e.g. "Slot 1", "Station head", "Slot 3 / Subslot 2" — for display only
         ioAddress,     // numeric IO station address — used to group entries in the import UI
         hw_category,   // 'station' | 'slot' | 'subslot'
-        // Background entries (SUBSLOT 1 IFACE heads) are hidden from the preview list but
-        // auto-imported alongside their visible parent station when any sibling row is checked.
-        isBackground: isSubslot1,
+        subslotNo,     // null for non-subslot entries; 1-based subslot number otherwise
+        // SUBSLOT 1 _S7H_ IFACE heads: hidden from preview, auto-imported alongside their parent slot.
+        // Plain PA profile types at SUBSLOT 1 (e.g. "Analog Input (AI)long") are visible function subslots.
+        isBackground: isIfaceHead,
+        // Service modules (highest-numbered subslot = AUTOCREATED diagnostic block): excluded entirely
+        isServiceModule,
         parseError: null,
       };
 
-      // Dedup: if same order_no seen before, keep the one with more info (has addresses)
+      // Service modules are AUTOCREATED infrastructure — never import them
+      if (isServiceModule) continue;
+
+      // Dedup by order_no — one row per unique type regardless of how many slots use it.
+      // For visible subslots (SUBSLOT ≥ 2), the same type (e.g. "Analog Input (AI)short")
+      // may appear in many slots; show it once only.
       if (byOrderNo.has(order_no)) {
         const existing = byOrderNo.get(order_no);
         // Prefer the entry that has address info
@@ -386,6 +601,50 @@ function parseCfgForCatalogue(text) {
         parseError: e.message,
       });
     }
+  }
+
+  // ── Inject Scalance GSDML device candidates ──────────────────────────────────
+  // One catalogue entry per unique MLFB (order number). The GSDML path + port_config
+  // are stored as template metadata so the CFG generator can reconstruct the full block.
+  for (const [, dev] of scalanceDevices) {
+    if (!dev.mlfb) continue; // no MLFB found — skip incomplete records
+
+    const order_no = dev.mlfb;
+    if (byOrderNo.has(order_no)) continue; // already seen (multi-instance in same CFG)
+
+    dev.ports.sort((a, b) => a.subslot - b.subslot);
+    const portCount = dev.ports.filter(p => p.type === 'port').length;
+    const portConfig = dev.ports.length > 0 ? JSON.stringify(dev.ports) : null;
+    const paramMeta = JSON.stringify({
+      PN_VENDOR_ID: dev.vendorId, PN_DEVICE_ID: dev.deviceId,
+      PN_MIN_VERSION: dev.minVersion, PN_HW_RELEASE: dev.hwRelease, PN_SW_RELEASE: dev.swRelease,
+    });
+
+    byOrderNo.set(order_no, {
+      order_no,
+      version:       dev.version || null,
+      display_name:  dev.name.replace(/-/g, ' ').trim() || order_no,
+      family:        'Scalance',
+      familySource:  'auto',
+      signal_type:   null,
+      input_bytes:   0,
+      output_bytes:  0,
+      in_addr_fmt:   null,
+      out_addr_fmt:  null,
+      param_template: paramMeta,
+      channel_count: portCount,
+      subslot_defaults: null,
+      port_config:   portConfig,
+      gsdml_file:    dev.gsdmlFile || null,
+      dap_id:        dev.dapId || null,
+      hw_category:   'station',
+      slotInfo:      'Station head',
+      ioAddress:     0,
+      subslotNo:     null,
+      isBackground:  false,
+      isServiceModule: false,
+      parseError:    null,
+    });
   }
 
   return { error: null, candidates: [...byOrderNo.values()] };

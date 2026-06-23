@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
+import MRPTopologyView from "./MRPTopologyView.jsx";
 import {
   listHwImports, uploadHwBaseline, uploadHwIoList,
   getHwStations, getHwAddressPreview, generateHwCfg, listHwCfgs, hwCfgDownloadUrl,
@@ -6,11 +7,15 @@ import {
   listHwModuleTemplates,
   addHwStation, deleteHwStation, addHwSlot, deleteHwSlot,
   listHwControllers, listHwFieldbuses,
-  getSlotChannels, patchSlotChannel, patchSlotPip, patchSlotPotentialGroup,
+  getSlotChannels, patchSlotChannel, patchSlotPip, patchSlotPotentialGroup, patchSlotPaProfile, patchSlotSubslotProfile,
   copyHwStation,
   bulkDeleteHwStations, bulkApproveHwStations,
   parseCfgForCatalogue, bulkUpsertCatalogueTemplates,
   deleteHwModuleTemplate, getHwModuleTemplateUsage,
+  upsertHwModuleTemplate,
+  listSlotCompat, addSlotCompat, removeSlotCompat,
+  listHwSignalTypes, addHwSignalType,
+  mrpGetDevices, mrpGetConfig, mrpSaveConfig, mrpDownloadCfg,
 } from "./api.js";
 
 import StepController from "./StepController.jsx";
@@ -51,11 +56,20 @@ export default function StepHWConfig({ projectId }) {
   // Catalogue delete confirmation modal
   const [deleteCatalogueTarget, setDeleteCatalogueTarget] = useState(null);
 
+  // Slot ↔ Subslot compatibility map
+  const [slotCompat, setSlotCompat] = useState([]); // [{ id, slot_order_no, subslot_order_no, is_default }]
+  const reloadSlotCompat = () => listSlotCompat().then(setSlotCompat).catch(() => {});
+
+  // Signal types — loaded from DB; user-extensible
+  const [sigTypes, setSigTypes] = useState([]);
+
   const baselineRef = useRef();
   const ioListRef   = useRef();
 
   useEffect(() => {
     listHwModuleTemplates().then(setTemplates).catch(() => {});
+    listSlotCompat().then(setSlotCompat).catch(() => {});
+    listHwSignalTypes().then(setSigTypes).catch(() => {});
   }, []);
 
   const loadControllers = async () => {
@@ -304,14 +318,31 @@ export default function StepHWConfig({ projectId }) {
 
   async function commitAddSlot(stationAddr) {
     if (!newSlot.moduleOrderNo) { setError("Select a module."); return; }
+    if (!newSlot.moduleName.trim()) { setError("Module Name is required."); return; }
     setLoading("Adding slot…");
     setError("");
     try {
+      const slotNo = parseInt(newSlot.slot, 10);
       await addHwSlot(importId, stationAddr, {
-        slot: parseInt(newSlot.slot, 10),
+        slot: slotNo,
         moduleOrderNo: newSlot.moduleOrderNo,
         moduleName: newSlot.moduleName,
       });
+
+      // CFU_PA only: apply per-subslot defaults captured from the CFG file at import time.
+      // subslot_defaults is a JSON array of {ssNo, paProfile} — one entry per function subslot.
+      // ET200 stations are never affected — they have no per-subslot paProfile concept.
+      const selectedTpl = templates.find(t => t.order_no === newSlot.moduleOrderNo);
+      if (selectedTpl && selectedTpl.family === 'CFU_PA') {
+        let defaults = [];
+        try { defaults = selectedTpl.subslot_defaults ? JSON.parse(selectedTpl.subslot_defaults) : []; } catch {}
+        for (const { ssNo, paProfile } of defaults) {
+          if (ssNo && paProfile) {
+            await patchSlotSubslotProfile(importId, stationAddr, slotNo, ssNo, paProfile);
+          }
+        }
+      }
+
       await loadStations(importId);
       setAddingSlot(null);
     } catch (e) { setError(e.message); }
@@ -331,6 +362,47 @@ export default function StepHWConfig({ projectId }) {
           ),
         };
       }));
+    } catch (e) { setError(e.message); }
+  }
+
+  async function handleSaveSlotPaProfile(stationAddr, slotNo, paProfile) {
+    setError("");
+    try {
+      await patchSlotPaProfile(importId, stationAddr, slotNo, paProfile || null);
+      // Update local station state and refresh addresses
+      setStations(prev => prev.map(s => {
+        if (s.address !== stationAddr) return s;
+        return {
+          ...s,
+          slots: s.slots.map(sl =>
+            sl.slot === slotNo ? { ...sl, paProfile: paProfile || null } : sl
+          ),
+        };
+      }));
+      // Refresh address map since profile change may affect byte counts
+      getHwAddressPreview(importId).then(setAddrMap).catch(() => {});
+    } catch (e) { setError(e.message); }
+  }
+
+  async function handleSaveSlotSubslotProfile(stationAddr, slotNo, ssNo, paProfile) {
+    setError("");
+    try {
+      await patchSlotSubslotProfile(importId, stationAddr, slotNo, ssNo, paProfile || null);
+      setStations(prev => prev.map(s => {
+        if (s.address !== stationAddr) return s;
+        return {
+          ...s,
+          slots: s.slots.map(sl => {
+            if (sl.slot !== slotNo) return sl;
+            const existing = sl.subslots || [];
+            const updated = existing.filter(ss => ss.subslotNo !== ssNo);
+            updated.push({ subslotNo: ssNo, paProfile: paProfile || null });
+            updated.sort((a, b) => a.subslotNo - b.subslotNo);
+            return { ...sl, subslots: updated };
+          }),
+        };
+      }));
+      getHwAddressPreview(importId).then(setAddrMap).catch(() => {});
     } catch (e) { setError(e.message); }
   }
 
@@ -410,7 +482,30 @@ export default function StepHWConfig({ projectId }) {
         {hwTab === "catalogue" && (
           <CataloguePanel
             templates={templates}
+            slotCompat={slotCompat}
+            sigTypes={sigTypes}
             onTemplatesChanged={() => listHwModuleTemplates().then(setTemplates).catch(() => {})}
+            onPatchTemplate={async (tpl, patch) => {
+              setError("");
+              try {
+                await upsertHwModuleTemplate({ ...tpl, ...patch });
+                setTemplates(prev => prev.map(t => t.id === tpl.id ? { ...t, ...patch } : t));
+              } catch (e) { setError(e.message); }
+            }}
+            onAddSigType={async (name) => {
+              try {
+                const updated = await addHwSignalType(name);
+                setSigTypes(updated);
+              } catch (e) { setError(e.message); }
+            }}
+            onAddCompat={async (slotOrderNo, subslotOrderNo) => {
+              await addSlotCompat(slotOrderNo, subslotOrderNo);
+              reloadSlotCompat();
+            }}
+            onRemoveCompat={async (slotOrderNo, subslotOrderNo) => {
+              await removeSlotCompat(slotOrderNo, subslotOrderNo);
+              reloadSlotCompat();
+            }}
             onDeleteTemplate={async (tpl) => {
               setError("");
               try {
@@ -435,11 +530,11 @@ export default function StepHWConfig({ projectId }) {
         )}
 
         {/* Controller — sub-tabs when a controller is selected */}
-        {(hwTab === "controller" || hwTab === "config") && (
+        {(hwTab === "controller" || hwTab === "config" || hwTab === "mrp") && (
           <>
             {/* Sub-tab bar */}
             <div style={{ display: "flex", gap: 4, marginBottom: 20, borderBottom: "2px solid #dde" }}>
-              {[["controller", "Controller"], ["config", "Configuration"]].map(([id, label]) => (
+              {[["controller", "Controller"], ["config", "Configuration"], ["mrp", "MRP"]].map(([id, label]) => (
                 <button key={id} onClick={() => setHwTab(id)}
                   style={{
                     padding: "7px 18px", border: "none", background: "none", cursor: "pointer",
@@ -458,6 +553,16 @@ export default function StepHWConfig({ projectId }) {
                 onSaved={loadControllers}
                 onDeleted={() => { setSelectedId(null); loadControllers(); }}
                 pipMappings={baselineInfo?.pipMappings || []}
+              />
+            )}
+
+            {hwTab === "mrp" && (
+              <MrpPanel
+                importId={importId}
+                fieldbuses={fieldbuses}
+                stations={stations}
+                controllers={controllers}
+                templates={templates}
               />
             )}
 
@@ -484,7 +589,28 @@ export default function StepHWConfig({ projectId }) {
                 onToggleSelectAll={toggleSelectAll}
                 onClearSelection={() => setSelectedAddrs(new Set())}
                 onSetNewStation={setNewStation}
-                onStartAddStation={() => { if (!importId) { setError("Upload a baseline CFG first."); return; } setAddingStation(true); }}
+                onStartAddStation={() => {
+                  if (!importId) { setError("Upload a baseline CFG first."); return; }
+                  // Auto-fill next address and next IP from existing stations
+                  const nextAddr = stations.length > 0
+                    ? Math.max(...stations.map(s => s.address)) + 1
+                    : 1;
+                  const lastIp = stations.length > 0
+                    ? stations.reduce((best, s) => {
+                        if (!s.ip) return best;
+                        const lastOctet = parseInt(s.ip.split('.').pop(), 10);
+                        if (!best || lastOctet > parseInt(best.split('.').pop(), 10)) return s.ip;
+                        return best;
+                      }, null)
+                    : null;
+                  const nextIp = lastIp ? (() => {
+                    const parts = lastIp.split('.');
+                    parts[3] = String(parseInt(parts[3], 10) + 1);
+                    return parts.join('.');
+                  })() : "";
+                  setNewStation({ address: String(nextAddr), name: "", ip: nextIp, subsystemNo: 100, imOrderNo: "", imName: "" });
+                  setAddingStation(true);
+                }}
                 onCancelAddStation={() => { setAddingStation(false); setNewStation({ address: "", name: "", ip: "", subsystemNo: 100, imOrderNo: "", imName: "" }); }}
                 onCommitAddStation={commitAddStation}
                 onCopyStation={handleCopyStation}
@@ -499,6 +625,8 @@ export default function StepHWConfig({ projectId }) {
                 onDeleteSlot={handleDeleteSlot}
                 onSaveSlotPip={handleSaveSlotPip}
                 onSaveSlotPotentialGroup={handleSaveSlotPotentialGroup}
+                onSaveSlotPaProfile={handleSaveSlotPaProfile}
+                onSaveSlotSubslotProfile={handleSaveSlotSubslotProfile}
                 onGenerate={handleGenerate}
                 isEditing={isEditing}
                 editVal={editVal}
@@ -514,6 +642,1020 @@ export default function StepHWConfig({ projectId }) {
     </div>
   );
 }
+
+// ── MRP Ring Canvas (visual topology editor for screen 3) ────────────────────
+const RC_W          = 118;  // node width
+const RC_PORT_PITCH = 22;   // vertical px between port rows
+const RC_PORT_TOP   = 36;   // y-offset of first port inside node
+const RC_PORT_R     = 5;    // port circle radius
+
+function rcNodeH(portCount) {
+  return RC_PORT_TOP + Math.max(portCount, 1) * RC_PORT_PITCH + 10;
+}
+
+// Port dot lives on the right edge of the node
+function rcPortXY(pos, portIdx) {
+  return {
+    x: pos.x + RC_W,
+    y: pos.y + RC_PORT_TOP + portIdx * RC_PORT_PITCH + RC_PORT_PITCH / 2,
+  };
+}
+
+function RingCanvas({ ringDevices, roles, links, setRole, setLink, nodePos, setNodePos, edgeOffsets, setEdgeOffsets }) {
+  const svgRef = useRef(null);
+  const [selectedAlias, setSelectedAlias] = useState(null);
+  const [dragging,      setDragging]      = useState(null);  // {alias, ox, oy}
+  const [edgeDragging,  setEdgeDragging]  = useState(null);  // {edgeKey, ox, oy, initBulge, initMidYOff}
+  const [pendingEdge,   setPendingEdge]   = useState(null);  // {fromAlias, fromSubslot, fromPortIdx, mx, my}
+
+  // Auto-layout: circle on first appearance
+  useEffect(() => {
+    const N = ringDevices.length;
+    if (!N) return;
+    const cx = 420, cy = 270, r = Math.max(140, Math.min(230, N * 42));
+    setNodePos(prev => {
+      const next = { ...prev };
+      ringDevices.forEach((d, i) => {
+        if (!next[d.alias]) {
+          const a  = (2 * Math.PI * i / N) - Math.PI / 2;
+          const nh = rcNodeH(d.ports.length);
+          next[d.alias] = {
+            x: Math.round(cx + r * Math.cos(a) - RC_W / 2),
+            y: Math.round(cy + r * Math.sin(a) - nh / 2),
+          };
+        }
+      });
+      return next;
+    });
+  }, [ringDevices.map(d => d.alias).join(",")]); // eslint-disable-line
+
+  useEffect(() => {
+    const h = e => { if (e.key === "Escape") setPendingEdge(null); };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, []);
+
+  function getSvgXY(e) {
+    const svg = svgRef.current;
+    if (!svg) return { x: 0, y: 0 };
+    const pt = svg.createSVGPoint();
+    pt.x = e.clientX; pt.y = e.clientY;
+    return pt.matrixTransform(svg.getScreenCTM().inverse());
+  }
+
+  function onSvgMouseMove(e) {
+    const { x, y } = getSvgXY(e);
+    if (dragging)     setNodePos(prev => ({ ...prev, [dragging.alias]: { x: x - dragging.ox, y: y - dragging.oy } }));
+    if (pendingEdge)  setPendingEdge(p => ({ ...p, mx: x, my: y }));
+    if (edgeDragging) {
+      setEdgeOffsets(prev => ({
+        ...prev,
+        [edgeDragging.edgeKey]: { hx: x - edgeDragging.ox, hy: y - edgeDragging.oy },
+      }));
+    }
+  }
+
+  function onNodeMouseDown(e, alias) {
+    e.stopPropagation();
+    const { x, y } = getSvgXY(e);
+    const pos = nodePos[alias] || { x: 0, y: 0 };
+    setDragging({ alias, ox: x - pos.x, oy: y - pos.y });
+    setSelectedAlias(alias);
+  }
+
+  function onPortClick(e, dev, portIdx, port) {
+    e.stopPropagation();
+    if (pendingEdge && pendingEdge.fromAlias !== dev.alias) {
+      const { fromAlias, fromSubslot } = pendingEdge;
+      const fromDev = ringDevices.find(d => d.alias === fromAlias);
+      // Set both directions
+      setLink(fromAlias,  fromSubslot,    "toDevice",        dev.alias);
+      setLink(fromAlias,  fromSubslot,    "toIfaceSubslot",  dev.ifaceSubslot ?? 1);
+      setLink(fromAlias,  fromSubslot,    "toPortSubslot",   port.subslot);
+      setLink(dev.alias,  port.subslot,   "toDevice",        fromAlias);
+      setLink(dev.alias,  port.subslot,   "toIfaceSubslot",  fromDev?.ifaceSubslot ?? 1);
+      setLink(dev.alias,  port.subslot,   "toPortSubslot",   fromSubslot);
+      setPendingEdge(null);
+    } else if (!pendingEdge) {
+      const pos = nodePos[dev.alias] || { x: 0, y: 0 };
+      const { x, y } = rcPortXY(pos, portIdx);
+      setPendingEdge({ fromAlias: dev.alias, fromSubslot: port.subslot, fromPortIdx: portIdx, mx: x, my: y });
+    }
+  }
+
+  // Build deduplicated bezier edges
+  const edgeElems   = [];
+  const drawnEdges  = new Set();
+  const ROLE_COLORS = { 0: "#94a3b8", 1: "#dc2626", 2: "#2563eb", 3: "#d97706" };
+
+  for (const dev of ringDevices) {
+    const fromPos = nodePos[dev.alias];
+    if (!fromPos) continue;
+    for (let pi = 0; pi < dev.ports.length; pi++) {
+      const port = dev.ports[pi];
+      const link = links.get(`${dev.alias}:${port.subslot}`);
+      if (!link?.toDevice) continue;
+      const toDev = ringDevices.find(d => d.alias === link.toDevice);
+      if (!toDev) continue;
+      const toPos = nodePos[link.toDevice];
+      if (!toPos) continue;
+      const toPortIdx = toDev.ports.findIndex(p => p.subslot === link.toPortSubslot);
+      if (toPortIdx < 0) continue;
+
+      const edgeKey = [dev.alias + ":" + port.subslot, link.toDevice + ":" + link.toPortSubslot].sort().join("|");
+      if (drawnEdges.has(edgeKey)) continue;
+      drawnEdges.add(edgeKey);
+
+      const from  = rcPortXY(fromPos, pi);
+      const to    = rcPortXY(toPos, toPortIdx);
+      const rev   = links.get(`${link.toDevice}:${link.toPortSubslot}`);
+      const isBidi = rev?.toDevice === dev.alias && rev?.toPortSubslot === port.subslot;
+      const col   = isBidi ? "#16a34a" : "#f59e0b";
+
+      // Quadratic bezier: handle (hx,hy) is where the curve visually peaks.
+      // Default handle = midpoint offset perpendicular by 40px (alternating side).
+      // When user drags the handle, we store (hx, hy) = absolute SVG coords of the handle.
+      // The quadratic control point that produces the desired handle position:
+      //   cp = 2·handle − 0.5·(from + to)
+      // which satisfies: midpoint@t=0.5 of Q(from, cp, to) = 0.25·from + 0.5·cp + 0.25·to = handle
+      const off  = edgeOffsets[edgeKey];
+      const defMidX = (from.x + to.x) / 2;
+      const defMidY = (from.y + to.y) / 2;
+      // Default perpendicular offset so parallel edges between same nodes don't overlap
+      const dx = to.x - from.x, dy = to.y - from.y;
+      const len = Math.sqrt(dx * dx + dy * dy) || 1;
+      const perpDir = ((pi + toPortIdx) % 2 === 0 ? 1 : -1);
+      const perpOff = 50 + (pi + toPortIdx) * 15;
+      const hx = off ? off.hx : defMidX + (-dy / len) * perpOff * perpDir;
+      const hy = off ? off.hy : defMidY + ( dx / len) * perpOff * perpDir;
+      // Quadratic control point from handle
+      const cpx  = 2 * hx - 0.5 * (from.x + to.x);
+      const cpy  = 2 * hy - 0.5 * (from.y + to.y);
+      const path = `M ${from.x} ${from.y} Q ${cpx} ${cpy} ${to.x} ${to.y}`;
+
+      const fromLbl = (port.label || `P${pi + 1}`).replace(/^Port\s+/i, "P");
+      const toLbl   = (toDev.ports[toPortIdx]?.label || `P${toPortIdx + 1}`).replace(/^Port\s+/i, "P");
+      const edgeTxt = `${dev.alias.slice(0, 7)}:${fromLbl} ↔ ${toDev.alias.slice(0, 7)}:${toLbl}`;
+      const isEdgeDragging = edgeDragging?.edgeKey === edgeKey;
+
+      function startEdgeDrag(e) {
+        e.stopPropagation();
+        const { x, y } = getSvgXY(e);
+        // Store offset from cursor to handle so the handle jumps exactly to cursor
+        setEdgeDragging({ edgeKey, ox: x - hx, oy: y - hy });
+      }
+
+      edgeElems.push(
+        <g key={edgeKey}>
+          <path d={path} fill="none" stroke={col} strokeWidth={2}
+            strokeDasharray={isBidi ? undefined : "6 3"} />
+          {/* Invisible wider hit-area — drag anywhere on the line */}
+          <path d={path} fill="none" stroke="transparent" strokeWidth={14} style={{ cursor: "grab" }}
+            onMouseDown={startEdgeDrag} />
+          {/* Draggable handle at the visual midpoint of the curve */}
+          <circle cx={hx} cy={hy} r={7}
+            fill={isEdgeDragging ? "#2563eb" : "white"}
+            stroke={isEdgeDragging ? "#1d4ed8" : col}
+            strokeWidth={1.5} style={{ cursor: "grab" }}
+            onMouseDown={startEdgeDrag}>
+            <title>Drag to reshape this connection line</title>
+          </circle>
+          {/* Edge label above the handle */}
+          <rect x={hx - edgeTxt.length * 2.9} y={hy - 22} width={edgeTxt.length * 5.8} height={13}
+            fill="white" opacity={0.88} rx={2} pointerEvents="none" />
+          <text x={hx} y={hy - 11} textAnchor="middle" fontSize={9} fill={col} fontWeight={500}
+            style={{ pointerEvents: "none", userSelect: "none" }}>
+            {edgeTxt}
+          </text>
+        </g>
+      );
+    }
+  }
+
+  const selectedDev = selectedAlias ? ringDevices.find(d => d.alias === selectedAlias) : null;
+
+  return (
+    <div style={{ display: "flex", border: "1px solid #e2e8f0", borderRadius: 8, overflow: "hidden" }}>
+      {/* Scrollable SVG canvas */}
+      <div style={{ flex: 1, overflow: "auto", background: "#f8fafc", minHeight: 480 }}>
+        <svg ref={svgRef} viewBox="0 0 920 580" width={920} height={580}
+          style={{ display: "block", cursor: (dragging || edgeDragging) ? "grabbing" : "default" }}
+          onMouseMove={onSvgMouseMove}
+          onMouseUp={() => { setDragging(null); setEdgeDragging(null); }}
+          onClick={() => { if (!dragging) { setSelectedAlias(null); setPendingEdge(null); } }}>
+
+          {/* Edges first (below nodes) */}
+          {edgeElems}
+
+          {/* In-progress edge */}
+          {pendingEdge && (() => {
+            const fd = ringDevices.find(d => d.alias === pendingEdge.fromAlias);
+            const fp = nodePos[pendingEdge.fromAlias];
+            if (!fd || !fp) return null;
+            const { x, y } = rcPortXY(fp, pendingEdge.fromPortIdx);
+            return <line x1={x} y1={y} x2={pendingEdge.mx} y2={pendingEdge.my}
+              stroke="#2563eb" strokeWidth={1.5} strokeDasharray="4 3" pointerEvents="none" />;
+          })()}
+
+          {/* Nodes */}
+          {ringDevices.map(dev => {
+            const pos  = nodePos[dev.alias] || { x: 30, y: 30 };
+            const role = roles.get(dev.alias)?.role ?? 0;
+            const rc   = ROLE_COLORS[role] || "#94a3b8";
+            const sel  = selectedAlias === dev.alias;
+            const nh   = rcNodeH(dev.ports.length);
+            return (
+              <g key={dev.alias} onMouseDown={e => onNodeMouseDown(e, dev.alias)} style={{ cursor: "grab" }}>
+                {/* Box */}
+                <rect x={pos.x} y={pos.y} width={RC_W} height={nh} rx={6}
+                  fill={sel ? "#eff6ff" : "#ffffff"}
+                  stroke={sel ? "#2563eb" : "#cbd5e1"} strokeWidth={sel ? 2 : 1.5} />
+                {/* Role color accent */}
+                <rect x={pos.x + 1} y={pos.y + 1} width={RC_W - 2} height={5} rx={2} fill={rc} />
+                {/* Device name */}
+                <text x={pos.x + RC_W / 2} y={pos.y + 22} textAnchor="middle"
+                  fontSize={11} fontWeight={700} fill="#1e293b"
+                  style={{ pointerEvents: "none", userSelect: "none" }}>
+                  {dev.alias.length > 15 ? dev.alias.slice(0, 13) + "…" : dev.alias}
+                </text>
+
+                {/* Port rows */}
+                {dev.ports.map((port, pi) => {
+                  const { x: px, y: py } = rcPortXY(pos, pi);
+                  const link    = links.get(`${dev.alias}:${port.subslot}`);
+                  const hasLink = !!link?.toDevice;
+                  const isSrc   = pendingEdge?.fromAlias === dev.alias && pendingEdge?.fromSubslot === port.subslot;
+                  // Short label: strip "Port " prefix
+                  const shortLbl = (port.label || `Port ${pi + 1}`).replace(/^Port\s+/i, "P");
+                  return (
+                    <g key={port.subslot}>
+                      {/* Port name inside node, right-aligned */}
+                      <text x={px - 9} y={py + 4} textAnchor="end" fontSize={9}
+                        fill={hasLink ? "#374151" : "#9ca3af"}
+                        style={{ pointerEvents: "none", userSelect: "none" }}>
+                        {shortLbl}
+                      </text>
+                      {/* Separator line between port rows */}
+                      {pi > 0 && (
+                        <line x1={pos.x + 4} y1={py - RC_PORT_PITCH / 2}
+                              x2={pos.x + RC_W - 4} y2={py - RC_PORT_PITCH / 2}
+                              stroke="#f1f5f9" strokeWidth={1} pointerEvents="none" />
+                      )}
+                      {/* Large transparent hit area */}
+                      <circle cx={px} cy={py} r={RC_PORT_R + 7} fill="transparent"
+                        style={{ cursor: "crosshair" }}
+                        onClick={e => onPortClick(e, dev, pi, port)} />
+                      {/* Visible port dot */}
+                      <circle cx={px} cy={py} r={RC_PORT_R}
+                        fill={isSrc ? "#2563eb" : hasLink ? "#bbf7d0" : "#f1f5f9"}
+                        stroke={isSrc ? "#1d4ed8" : hasLink ? "#16a34a" : "#94a3b8"}
+                        strokeWidth={1.5} pointerEvents="none" />
+                      <title>{port.label || `Port ${port.subslot}`}{hasLink ? ` → ${link.toDevice}` : " (unconnected)"}</title>
+                    </g>
+                  );
+                })}
+              </g>
+            );
+          })}
+
+          {ringDevices.length === 0 && (
+            <text x="460" y="280" textAnchor="middle" fontSize={13} fill="#94a3b8">
+              No ring devices — assign MRP roles in Step 2 first
+            </text>
+          )}
+
+          {/* Drawing hint banner */}
+          {pendingEdge && (
+            <>
+              <rect x={0} y={0} width={920} height={24} fill="#eff6ff" opacity={0.93} pointerEvents="none" />
+              <text x="460" y="16" textAnchor="middle" fontSize={11} fill="#2563eb" fontWeight={500} pointerEvents="none">
+                Click a port ● on another device to connect · Esc to cancel
+              </text>
+            </>
+          )}
+
+          {/* Legend */}
+          <g transform="translate(14, 555)">
+            <circle cx={6}  cy={6} r={5} fill="#bbf7d0" stroke="#16a34a" strokeWidth={1.5} />
+            <text x={16} y={10} fontSize={9} fill="#64748b">= connected port</text>
+            <circle cx={96} cy={6} r={5} fill="#f1f5f9" stroke="#94a3b8" strokeWidth={1.5} />
+            <text x={106} y={10} fontSize={9} fill="#64748b">= unconnected</text>
+            <line x1={196} y1={6} x2={220} y2={6} stroke="#16a34a" strokeWidth={2} />
+            <text x={224} y={10} fontSize={9} fill="#64748b">= bidirectional link</text>
+            <line x1={326} y1={6} x2={350} y2={6} stroke="#f59e0b" strokeWidth={2} strokeDasharray="5 3" />
+            <text x={354} y={10} fontSize={9} fill="#64748b">= one-way only</text>
+          </g>
+        </svg>
+      </div>
+
+      {/* Side panel — port connection detail for selected node */}
+      {selectedDev && (
+        <div style={{ width: 240, flexShrink: 0, borderLeft: "1px solid #e2e8f0", background: "#fff", padding: 14, fontSize: 13, overflowY: "auto" }}>
+          <div style={{ fontWeight: 700, fontSize: 14, color: "#1e293b", paddingBottom: 8, marginBottom: 10, borderBottom: "1px solid #f1f5f9" }}>
+            {selectedDev.alias}
+          </div>
+
+          <label style={{ display: "block", color: "#6b7280", fontSize: 11, marginBottom: 3 }}>MRP Role</label>
+          <select style={{ width: "100%", padding: "5px 8px", border: "1px solid #d1d5db", borderRadius: 5, fontSize: 12, marginBottom: 14 }}
+            value={roles.get(selectedDev.alias)?.role ?? 0}
+            onChange={e => setRole(selectedDev.alias, parseInt(e.target.value, 10))}>
+            {MRP_ROLES.map(r => <option key={r.value} value={r.value}>{r.label}</option>)}
+          </select>
+
+          <div style={{ fontWeight: 600, fontSize: 12, color: "#374151", marginBottom: 8 }}>
+            Port Connections ({selectedDev.ports.filter(p => !!links.get(`${selectedDev.alias}:${p.subslot}`)?.toDevice).length}/{selectedDev.ports.length} connected)
+          </div>
+
+          {selectedDev.ports.length === 0 && (
+            <div style={{ color: "#94a3b8", fontSize: 12 }}>No ports detected</div>
+          )}
+          {selectedDev.ports.map((port, pi) => {
+            const lKey    = `${selectedDev.alias}:${port.subslot}`;
+            const link    = links.get(lKey);
+            const toDev   = link?.toDevice ? ringDevices.find(d => d.alias === link.toDevice) : null;
+            const toPort  = toDev?.ports.find(p => p.subslot === link.toPortSubslot);
+            const connected = !!link?.toDevice;
+            return (
+              <div key={port.subslot} style={{
+                marginBottom: 6, padding: "8px 10px",
+                background: connected ? "#f0fdf4" : "#f8fafc",
+                border: `1px solid ${connected ? "#bbf7d0" : "#e2e8f0"}`,
+                borderRadius: 6, fontSize: 12,
+              }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 3 }}>
+                  <span style={{ fontWeight: 600, color: "#1e293b" }}>
+                    {port.label || `Port ${pi + 1}`}
+                  </span>
+                  <span style={{ fontSize: 10, color: "#94a3b8" }}>ss{port.subslot}</span>
+                </div>
+                {connected ? (
+                  <>
+                    <div style={{ color: "#15803d", fontSize: 11, marginBottom: 1 }}>→ {link.toDevice}</div>
+                    <div style={{ color: "#6b7280", fontSize: 11, marginBottom: 5 }}>
+                      {toPort?.label || `Port ss${link.toPortSubslot}`}
+                    </div>
+                    <button
+                      style={{ fontSize: 11, padding: "2px 8px", background: "#fef2f2", border: "1px solid #fca5a5", color: "#dc2626", borderRadius: 4, cursor: "pointer" }}
+                      onClick={() => {
+                        const rev = links.get(`${link.toDevice}:${link.toPortSubslot}`);
+                        if (rev?.toDevice === selectedDev.alias) {
+                          setLink(link.toDevice, link.toPortSubslot, "toDevice",       "");
+                          setLink(link.toDevice, link.toPortSubslot, "toPortSubslot",  2);
+                        }
+                        setLink(selectedDev.alias, port.subslot, "toDevice",       "");
+                        setLink(selectedDev.alias, port.subslot, "toPortSubslot",  2);
+                      }}>✕ Disconnect</button>
+                  </>
+                ) : (
+                  <div style={{ color: "#94a3b8", fontSize: 11 }}>Not connected — click port dot to wire</div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── MRP Panel ─────────────────────────────────────────────────────────────────
+const MRP_ROLES = [
+  { value: 0, label: "0 – Not participating (Auto/disabled)" },
+  { value: 1, label: "1 – Manager (active ring master)" },
+  { value: 2, label: "2 – Client (ring participant)" },
+  { value: 3, label: "3 – Manager Auto (auto-negotiate MRM)" },
+];
+
+function mrpRoleLabel(v) {
+  return MRP_ROLES.find(r => r.value === v)?.label ?? "Off";
+}
+
+function MrpPanel({ importId, fieldbuses, stations, controllers, templates }) {
+  const [cfgPortMap,   setCfgPortMap]   = useState({});  // alias → ports[] from CFG (optional enrichment)
+  const [cfgDeviceMap, setCfgDeviceMap] = useState({}); // subsystemNo → { alias, rackSlot, ifaceSubslot, subnetName } from CFG parser
+  const [cfgSubnetMap, setCfgSubnetMap] = useState({}); // "addr:N" → subnetName for IO devices
+  const [domainName,  setDomainName]  = useState("mrpdomain-1");
+  const [fieldbusNo,  setFieldbusNo]  = useState(null);
+  const [roles,       setRoles]       = useState(new Map());
+  const [links,       setLinks]       = useState(new Map());
+
+  const [screen,      setScreen]      = useState(1);
+  const [portView,    setPortView]    = useState("canvas"); // "canvas" | "form"
+  const [nodePos,     setNodePos]     = useState(() => {
+    try { return JSON.parse(localStorage.getItem(`mrp_nodePos_${importId}`) || '{}'); } catch { return {}; }
+  });
+  const [edgeOffsets, setEdgeOffsets] = useState(() => {
+    try { return JSON.parse(localStorage.getItem(`mrp_edgeOffsets_${importId}`) || '{}'); } catch { return {}; }
+  });
+  const [loading,     setLoading]     = useState("");
+  const [error,       setError]       = useState("");
+  const [saved,       setSaved]       = useState(false);
+  const [saving,      setSaving]      = useState(false);
+  const [downloading, setDownloading] = useState(false);
+
+  // Derive port list for a station from its slot-0 template's port_config.
+  // Same logic as StationDetailPanel: parse port_config, keep subslots ≥ 2.
+  function stationPorts(st) {
+    const imSlot = (st.slots || []).find(s => s.slot === 0);
+    if (!imSlot) return cfgPortMap[`addr:${st.address}`] || [];
+    let tpl = (templates || []).find(t => t.order_no === imSlot.orderNo);
+    // Fallback for GSDML-path order_no (Scalance stations)
+    if (!tpl && /^GSDML-.*\.xml<DAP/.test(imSlot.orderNo)) {
+      const gsdmlFile = imSlot.orderNo.replace(/<DAP[\s\S]*/, '').trim();
+      tpl = (templates || []).find(t => t.family === 'Scalance' && t.gsdml_file === gsdmlFile);
+    }
+    if (!tpl || !tpl.port_config) return cfgPortMap[`addr:${st.address}`] || [];
+    try {
+      const parsed = JSON.parse(tpl.port_config);
+      const isScalance = tpl.family === 'Scalance' || tpl.family === 'SCALANCE';
+      // Scalance: port_config has {type:'port'} entries; ET200: all entries are ports (subslot >= 2)
+      const portArr = isScalance ? parsed.filter(p => p.type === 'port') : parsed.filter(p => p.subslot >= 2);
+      if (portArr.length > 0) return portArr.map(p => ({ subslot: p.subslot, label: p.label || p.name || `Port ${p.subslot}` }));
+    } catch (_) {}
+    return cfgPortMap[`addr:${st.address}`] || [];
+  }
+
+  // Build device list directly from stations already loaded in HW Config.
+  const devices = React.useMemo(() => {
+    const list = [];
+    // Controllers (CPUs) — one entry per PN-IO interface (one per fieldbus)
+    for (const ctrl of (controllers || [])) {
+      const alias = ctrl.T16_Controller_TagName || ctrl.name || `CPU-${ctrl.id}`;
+      if (fieldbuses.length === 0) {
+        list.push({ alias, ioAddress: null, rackSlot: null, ifaceSubslot: null, ports: [], isSwitch: false, deviceType: "cpu", subsystemNo: null });
+      } else {
+        for (const fb of fieldbuses) {
+          const sno     = fb.INT_DP_Subsystem;
+          const ports   = cfgPortMap[`cpu:${sno}`] || [];
+          const cfgDev  = cfgDeviceMap[sno];
+          const label   = fieldbuses.length > 1 ? `${alias} (${fb.T50_Fieldbus_Name || `SS${sno}`})` : alias;
+          // subnetName: prefer CFG LINKED_SUBNETNAME, fallback to fieldbus table name
+          const subnetName = cfgDev?.subnetName ?? fb.T50_Fieldbus_Name ?? null;
+          list.push({
+            alias: label,
+            cfgAlias: cfgDev?.alias ?? null,   // real PN-IO subslot name used in LINKED_PORT
+            ioAddress: null,
+            rackSlot: cfgDev?.rackSlot ?? null,
+            ifaceSubslot: cfgDev?.ifaceSubslot ?? null,
+            ports, isSwitch: false, deviceType: "cpu", subsystemNo: sno,
+            subnetName,
+          });
+        }
+      }
+    }
+    // IO stations — ports from template port_config, CFG parser as fallback
+    for (const st of (stations || [])) {
+      const alias = st.name || st.deviceName || `Station-${st.address}`;
+      const ports = stationPorts(st);
+      const subnetName = cfgSubnetMap[`addr:${st.address}`] ?? null;
+      list.push({ alias, ioAddress: st.address, rackSlot: null, ifaceSubslot: null, ports, isSwitch: false, deviceType: "device", subsystemNo: st.subsystemNo, subnetName });
+    }
+    return list;
+  }, [controllers, stations, fieldbuses, templates, cfgPortMap, cfgDeviceMap, cfgSubnetMap]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (fieldbuses.length > 0 && fieldbusNo == null) {
+      setFieldbusNo(fieldbuses[0].INT_DP_Subsystem);
+    }
+  }, [fieldbuses]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Persist canvas layout to localStorage so moves survive page refresh
+  useEffect(() => {
+    if (!importId || !Object.keys(nodePos).length) return;
+    localStorage.setItem(`mrp_nodePos_${importId}`, JSON.stringify(nodePos));
+  }, [nodePos]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!importId) return;
+    localStorage.setItem(`mrp_edgeOffsets_${importId}`, JSON.stringify(edgeOffsets));
+  }, [edgeOffsets]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!importId) return;
+    // Load saved MRP config and optionally enrich port info from CFG parser
+    Promise.all([
+      mrpGetDevices(importId).catch(() => ({ devices: [] })),
+      mrpGetConfig(importId).catch(() => null),
+    ]).then(([devData, cfg]) => {
+      // Build a port map keyed by ioAddress (for IO devices) or subsystemNo (for CPU).
+      // Station names in the DB rarely match CFG aliases, so key by address instead.
+      const pm = {};
+      const dm = {};
+      const sm = {}; // "addr:N" → subnetName for IO devices
+      for (const d of (devData.devices || [])) {
+        if (d.ioAddress != null) {
+          if (d.ports && d.ports.length > 0) pm[`addr:${d.ioAddress}`] = d.ports;
+          if (d.subnetName) sm[`addr:${d.ioAddress}`] = d.subnetName;
+        } else if (d.subsystemNo != null) {
+          if (d.ports && d.ports.length > 0) pm[`cpu:${d.subsystemNo}`] = d.ports;
+          // Store real CFG alias, rackSlot, ifaceSubslot and subnetName keyed by subsystemNo
+          dm[d.subsystemNo] = { alias: d.alias, rackSlot: d.rackSlot, ifaceSubslot: d.ifaceSubslot, subnetName: d.subnetName ?? null };
+        }
+      }
+      setCfgPortMap(pm);
+      setCfgDeviceMap(dm);
+      setCfgSubnetMap(sm);
+
+      if (cfg) {
+        setDomainName(cfg.domain_name || "mrpdomain-1");
+        if (cfg.fieldbus_no != null) setFieldbusNo(cfg.fieldbus_no);
+        const rMap = new Map();
+        for (const r of cfg.roles || []) {
+          rMap.set(r.device_alias, { role: r.mrp_role, mrpInstances: r.mrp_instances, ringPort1: r.ring_port_1 ?? null, ringPort2: r.ring_port_2 ?? null });
+        }
+        setRoles(rMap);
+        // DB stores cfgAlias for CPU (e.g. "PN-IO-X8") and raw alias without #N for
+        // switch sub-rows (e.g. "S2"). The UI links Map is keyed by display alias
+        // (e.g. "AS01 (Fieldbus)") and sub-row alias (e.g. "S2#0"). Reverse-map here.
+
+        // 1. CPU: cfgAlias → UI display alias (mirrors devices useMemo label logic)
+        const cfgAliasToUi = new Map();
+        for (const ctrl of (controllers || [])) {
+          const ctrlAlias = ctrl.T16_Controller_TagName || ctrl.name || `CPU-${ctrl.id}`;
+          for (const fb of (fieldbuses || [])) {
+            const sno = fb.INT_DP_Subsystem;
+            const cfgDev = dm[sno];
+            if (cfgDev?.alias) {
+              const uiLabel = (fieldbuses || []).length > 1
+                ? `${ctrlAlias} (${fb.T50_Fieldbus_Name || `SS${sno}`})`
+                : ctrlAlias;
+              cfgAliasToUi.set(cfgDev.alias, uiLabel);
+            }
+          }
+        }
+
+        // 2. Switch sub-rows: "rawAlias:portSubslot" → "rawAlias#N"
+        const portSubslotToRowAlias = new Map();
+        for (const d of (devData.devices || [])) {
+          if (d.ioAddress != null) {
+            const physPorts = (pm[`addr:${d.ioAddress}`] || []).filter(p => /port/i.test(p.label || ''));
+            const ringCount = Math.max(1, Math.floor(physPorts.length / 2));
+            if (ringCount > 1) {
+              for (let i = 0; i < ringCount; i++) {
+                for (const p of physPorts.slice(i * 2, i * 2 + 2)) {
+                  portSubslotToRowAlias.set(`${d.alias}:${p.subslot}`, `${d.alias}#${i}`);
+                }
+              }
+            }
+          }
+        }
+
+        function dbAliasToUi(dbDevice, portSubslot) {
+          const plain = dbDevice.replace(/#\d+$/, '');
+          const rowKey = portSubslotToRowAlias.get(`${plain}:${portSubslot}`);
+          if (rowKey) return rowKey;
+          return cfgAliasToUi.get(plain) ?? plain;
+        }
+
+        const lMap = new Map();
+        for (const l of cfg.links || []) {
+          const fromUi = dbAliasToUi(l.from_device, l.from_port_subslot);
+          const toUi   = dbAliasToUi(l.to_device,   l.to_port_subslot);
+          lMap.set(`${fromUi}:${l.from_port_subslot}`, {
+            toDevice: toUi, toIfaceSubslot: l.to_iface_subslot, toPortSubslot: l.to_port_subslot,
+          });
+        }
+        setLinks(lMap);
+      }
+      setLoading("");
+    }).catch(e => { setError(e.message); setLoading(""); });
+  }, [importId]);
+
+  // Derive the subnet name for the currently selected fieldbus so screen 2 can
+  // filter devices to only those connected to that network.
+  const selectedFieldbus = fieldbuses.find(fb => fb.INT_DP_Subsystem === fieldbusNo) ?? null;
+  const selectedSubnetName = selectedFieldbus?.T50_Fieldbus_Name ?? null;
+
+  // Filter devices to those whose LINKED_SUBNETNAME matches the selected fieldbus,
+  // or include all if subnet info is missing (e.g. no LINKED_SUBNETNAME in CFG).
+  const filteredDevices = React.useMemo(() => {
+    if (!selectedSubnetName) return devices;
+    // A device matches if its subnetName equals the selected fieldbus name (case-insensitive),
+    // or if subnetName is null (subnet info not available from CFG — don't hide it).
+    return devices.filter(d =>
+      d.subnetName == null ||
+      d.subnetName.toLowerCase() === selectedSubnetName.toLowerCase()
+    );
+  }, [devices, selectedSubnetName]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const allPortDevices  = filteredDevices.filter(d => d.ports && d.ports.length > 0);
+
+  // Expanded flat list matching the sub-row logic in the Device Roles table.
+  // Each entry has alias = row key (e.g. "SCALANCE-1#0"), ports = the 2-port slice for that ring.
+  const expandedDevices = React.useMemo(() => {
+    const rows = [];
+    for (const dev of devices) {
+      const physPorts = (dev.ports ?? []).filter(p => /port/i.test(p.label));
+      const ringCount = Math.max(1, Math.floor(physPorts.length / 2));
+      for (let i = 0; i < ringCount; i++) {
+        const rowKey   = ringCount > 1 ? `${dev.alias}#${i}` : dev.alias;
+        const rowPorts = ringCount > 1 ? physPorts.slice(i * 2, i * 2 + 2) : physPorts;
+        rows.push({ ...dev, alias: rowKey, displayAlias: dev.alias, ringLabel: ringCount > 1 ? `Ring ${i + 1}` : null, ports: rowPorts });
+      }
+    }
+    return rows;
+  }, [devices]); // eslint-disable-line react-hooks/exhaustive-deps
+
+
+  function setRole(alias, role) {
+    setRoles(prev => {
+      const next = new Map(prev);
+      const existing = next.get(alias) || { role: 0, mrpInstances: 0, ringPort1: null, ringPort2: null };
+      next.set(alias, { ...existing, role, mrpInstances: (role === 1 || role === 3) ? 1 : 0 });
+      return next;
+    });
+    setSaved(false);
+  }
+
+  function setRingPort(alias, field, subslot) {
+    setRoles(prev => {
+      const next = new Map(prev);
+      const existing = next.get(alias) || { role: 0, mrpInstances: 0, ringPort1: null, ringPort2: null };
+      next.set(alias, { ...existing, [field]: subslot });
+      return next;
+    });
+    setSaved(false);
+  }
+
+  function setLink(fromAlias, fromPortSubslot, field, value) {
+    const key = `${fromAlias}:${fromPortSubslot}`;
+    setLinks(prev => {
+      const next = new Map(prev);
+      const existing = next.get(key) || { toDevice: "", toIfaceSubslot: 1, toPortSubslot: 2 };
+      next.set(key, { ...existing, [field]: value });
+      return next;
+    });
+    setSaved(false);
+  }
+
+  async function handleSave() {
+    setSaving(true); setError("");
+    try {
+      const rolesArr = [...roles.entries()].map(([alias, r]) => {
+        const dev = expandedDevices.find(d => d.alias === alias);
+        return { deviceAlias: alias, ioAddress: dev?.ioAddress ?? null, subsystemNo: dev?.subsystemNo ?? null, mrpRole: r.role, mrpInstances: r.mrpInstances, ringPort1: r.ringPort1 ?? null, ringPort2: r.ringPort2 ?? null };
+      });
+      const linksArr = [...links.entries()].map(([key, l]) => {
+        const [fromDevice, fromPortSubslot] = key.split(":");
+        const fromDev = expandedDevices.find(d => d.alias === fromDevice);
+        const toDev   = expandedDevices.find(d => d.alias === (l.toDevice || "").replace(/#\d+$/, ''));
+        // Use cfgAlias (real PN-IO subslot name) if available, else the display alias
+        const realFrom = (fromDev?.cfgAlias ?? fromDevice).replace(/#\d+$/, '');
+        const realTo   = toDev?.cfgAlias ?? (l.toDevice || "").replace(/#\d+$/, '');
+        return {
+          fromDevice: realFrom, fromIfaceSubslot: fromDev?.ifaceSubslot ?? 1,
+          fromPortSubslot: parseInt(fromPortSubslot, 10),
+          toDevice: realTo, toIfaceSubslot: l.toIfaceSubslot, toPortSubslot: l.toPortSubslot,
+        };
+      });
+      const stationName = controllers[0]?.T16_Controller_TagName || "";
+      await mrpSaveConfig(importId, { domainName, fieldbusNo, stationName, roles: rolesArr, links: linksArr });
+      setSaved(true);
+    } catch (e) { setError(e.message); }
+    finally { setSaving(false); }
+  }
+
+  async function handleDownload() {
+    setDownloading(true); setError("");
+    try {
+      // Always regenerate the HW Config CFG before applying MRP, so all IO devices
+      // are present in the source (the cached CFG may be stale or absent).
+      await generateHwCfg(importId);
+      await mrpDownloadCfg(importId);
+    }
+    catch (e) { setError(e.message); }
+    finally { setDownloading(false); }
+  }
+
+  const ringDevices = expandedDevices.filter(d => (roles.get(d.alias)?.role ?? 0) !== 0);
+
+  function validateRing() {
+    const issues = [];
+    for (const dev of ringDevices) {
+      for (const port of dev.ports || []) {
+        const key = `${dev.alias}:${port.subslot}`;
+        const link = links.get(key);
+        if (!link || !link.toDevice) issues.push(`${dev.alias} port (subslot ${port.subslot}) has no connection`);
+      }
+    }
+    return issues;
+  }
+
+  const ringIssues = validateRing();
+  const canDownload = saved && ringIssues.length === 0;
+
+  if (!importId) {
+    return <div style={mrpSt.notice}>No HW import found. Upload a baseline CFG in the Import tab first.</div>;
+  }
+  if (loading) return <div style={mrpSt.notice}>{loading}</div>;
+
+  return (
+    <div>
+      <h3 style={{ margin: "0 0 16px 0", fontSize: 16, fontWeight: 600 }}>MRP Ring Configuration</h3>
+
+      <div style={mrpSt.tabs}>
+        {["1. Domain & Fieldbus", "2. Device Roles", "3. Port Connections", "4. Topology View"].map((label, idx) => (
+          <button key={idx}
+            style={{ ...mrpSt.tab, ...(screen === idx + 1 ? mrpSt.tabActive : {}) }}
+            onClick={() => setScreen(idx + 1)}
+          >{label}</button>
+        ))}
+      </div>
+
+      {error && <div style={mrpSt.error}>{error}</div>}
+
+      {screen === 1 && (
+        <div style={mrpSt.section}>
+          <label style={mrpSt.label}>MRP Domain Name</label>
+          <input style={mrpSt.input} value={domainName}
+            onChange={e => { setDomainName(e.target.value); setSaved(false); }}
+            placeholder="mrpdomain-1" />
+
+          <label style={{ ...mrpSt.label, marginTop: 16 }}>Fieldbus</label>
+          <select style={mrpSt.input} value={fieldbusNo ?? ""}
+            onChange={e => { setFieldbusNo(parseInt(e.target.value, 10)); setSaved(false); }}>
+            <option value="">— select fieldbus —</option>
+            {fieldbuses.map(fb => (
+              <option key={fb.id} value={fb.INT_DP_Subsystem}>
+                {fb.T50_Fieldbus_Name
+                  ? `${fb.T50_Fieldbus_Name} (IOSUBSYSTEM ${fb.INT_DP_Subsystem})`
+                  : `IOSUBSYSTEM ${fb.INT_DP_Subsystem}`}
+              </option>
+            ))}
+          </select>
+
+          <p style={{ ...mrpSt.hint, marginTop: 20 }}>
+            The domain name and fieldbus selected here will be used for all ring devices.
+          </p>
+          <div style={mrpSt.row}>
+            <button style={mrpSt.btnPrimary} onClick={() => setScreen(2)}>Next: Device Roles →</button>
+          </div>
+        </div>
+      )}
+
+      {screen === 2 && (
+        <div style={mrpSt.section}>
+          <p style={mrpSt.hint}>Assign an MRP role to each device. Devices with "Off" are excluded from the ring.</p>
+          {filteredDevices.length === 0 && (
+            <div style={mrpSt.notice}>No devices found. Check that the baseline CFG has IOSUBSYSTEM devices.</div>
+          )}
+          <table style={mrpSt.table}>
+            <thead>
+              <tr>
+                <th style={mrpSt.th}>Device</th>
+                <th style={mrpSt.th}>IO Address / Type</th>
+                <th style={mrpSt.th}>Subnet</th>
+                <th style={mrpSt.th}>Ports</th>
+                <th style={mrpSt.th}>Sub-ring</th>
+                <th style={mrpSt.th}>Ring Port 1</th>
+                <th style={mrpSt.th}>Ring Port 2</th>
+                <th style={mrpSt.th}>MRP Role</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredDevices.flatMap(dev => {
+                const physPorts = (dev.ports ?? []).filter(p => /port/i.test(p.label));
+                const ringCount = Math.max(1, Math.floor(physPorts.length / 2));
+
+                return Array.from({ length: ringCount }, (_, i) => {
+                  const rowKey   = ringCount > 1 ? `${dev.alias}#${i}` : dev.alias;
+                  const rowLabel = ringCount > 1 ? `Ring ${i + 1}` : null;
+                  // Ports available for this sub-row: pairs [p0, p1] for switches
+                  const rowPorts = ringCount > 1 ? physPorts.slice(i * 2, i * 2 + 2) : physPorts;
+                  const currentRole = roles.get(rowKey)?.role ?? 0;
+
+                  const deviceCell = i === 0 ? (
+                    <td style={mrpSt.td} rowSpan={ringCount}><b>{dev.alias}</b></td>
+                  ) : null;
+                  const addrCell = i === 0 ? (
+                    <td style={mrpSt.td} rowSpan={ringCount}>
+                      {dev.ioAddress != null ? `IOADDR ${dev.ioAddress}` : `Rack slot ${dev.rackSlot}`}
+                      {dev.isSwitch ? " (Switch)" : ""}
+                    </td>
+                  ) : null;
+                  const subnetCell = i === 0 ? (
+                    <td style={mrpSt.td} rowSpan={ringCount}>
+                      {dev.subnetName
+                        ? <span style={{ fontSize: 11, padding: "2px 6px", borderRadius: 10, background: "#e0f2fe", color: "#0369a1", fontWeight: 500 }}>{dev.subnetName}</span>
+                        : <span style={{ color: "#9ca3af", fontSize: 11 }}>—</span>}
+                    </td>
+                  ) : null;
+                  const portsCell = i === 0 ? (
+                    <td style={mrpSt.td} rowSpan={ringCount}>{dev.ports?.length ?? 0} port(s)</td>
+                  ) : null;
+
+                  return (
+                    <tr key={rowKey} style={currentRole !== 0 ? mrpSt.rowActive : {}}>
+                      {deviceCell}
+                      {addrCell}
+                      {subnetCell}
+                      {portsCell}
+                      <td style={{ ...mrpSt.td, color: "#6b7280", fontSize: 12 }}>{rowLabel ?? ""}</td>
+                      <td style={mrpSt.td}>
+                        <select style={mrpSt.select}
+                          value={roles.get(rowKey)?.ringPort1 ?? ""}
+                          onChange={e => setRingPort(rowKey, "ringPort1", e.target.value ? parseInt(e.target.value, 10) : null)}>
+                          <option value="">— none —</option>
+                          {rowPorts.map(p => <option key={p.subslot} value={p.subslot}>{p.label}</option>)}
+                        </select>
+                      </td>
+                      <td style={mrpSt.td}>
+                        <select style={mrpSt.select}
+                          value={roles.get(rowKey)?.ringPort2 ?? ""}
+                          onChange={e => setRingPort(rowKey, "ringPort2", e.target.value ? parseInt(e.target.value, 10) : null)}>
+                          <option value="">— none —</option>
+                          {rowPorts.map(p => <option key={p.subslot} value={p.subslot}>{p.label}</option>)}
+                        </select>
+                      </td>
+                      <td style={mrpSt.td}>
+                        <select style={mrpSt.select} value={currentRole}
+                          onChange={e => setRole(rowKey, parseInt(e.target.value, 10))}>
+                          {MRP_ROLES.map(r => <option key={r.value} value={r.value}>{r.label}</option>)}
+                        </select>
+                      </td>
+                    </tr>
+                  );
+                });
+              })}
+            </tbody>
+          </table>
+          <div style={mrpSt.row}>
+            <button style={mrpSt.btnSecondary} onClick={() => setScreen(1)}>← Back</button>
+            <button style={mrpSt.btnPrimary} onClick={() => setScreen(3)}>Next: Port Connections →</button>
+          </div>
+        </div>
+      )}
+
+      {screen === 3 && (
+        <div style={mrpSt.section}>
+          {/* View toggle */}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+            <p style={{ ...mrpSt.hint, margin: 0 }}>
+              {portView === "canvas"
+                ? "Drag nodes or connection lines to arrange · Click a port circle to start a connection · Click another port to complete"
+                : "For each ring port, select which device and port it connects to (physical cable)."}
+            </p>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0, marginLeft: 16 }}>
+              {portView === "canvas" && (
+                <button style={{ padding: "5px 12px", border: "1px solid #d1d5db", borderRadius: 6, background: "#fff", color: "#374151", fontSize: 12, cursor: "pointer" }}
+                  onClick={() => { setNodePos({}); setEdgeOffsets({}); }}
+                  title="Reset all node and edge positions">
+                  Reset Layout
+                </button>
+              )}
+              <div style={{ display: "flex", border: "1px solid #d1d5db", borderRadius: 6, overflow: "hidden" }}>
+                {[["canvas", "Ring Canvas"], ["form", "Form View"]].map(([v, lbl]) => (
+                  <button key={v} style={{
+                    padding: "5px 14px", border: "none", cursor: "pointer", fontSize: 13,
+                    background: portView === v ? "#2563eb" : "#fff",
+                    color: portView === v ? "#fff" : "#374151",
+                    fontWeight: portView === v ? 600 : 400,
+                  }} onClick={() => setPortView(v)}>{lbl}</button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {ringDevices.length === 0 && (
+            <div style={mrpSt.notice}>No devices have MRP roles assigned. Go back to Device Roles.</div>
+          )}
+
+          {/* ── Ring Canvas ─────────────────────────────────────── */}
+          {portView === "canvas" && (
+            <RingCanvas
+              ringDevices={ringDevices}
+              roles={roles}
+              links={links}
+              setRole={setRole}
+              setLink={setLink}
+              nodePos={nodePos}
+              setNodePos={setNodePos}
+              edgeOffsets={edgeOffsets}
+              setEdgeOffsets={setEdgeOffsets}
+            />
+          )}
+
+          {/* ── Form View ───────────────────────────────────────── */}
+          {portView === "form" && ringDevices.map(dev => (
+            <div key={dev.alias} style={mrpSt.devCard}>
+              <div style={mrpSt.devHeader}>
+                <b>{dev.displayAlias ?? dev.alias}</b>
+                {dev.ringLabel && <span style={{ marginLeft: 6, fontSize: 12, color: "#6b7280" }}>{dev.ringLabel}</span>}
+                <span style={mrpSt.badge}>{mrpRoleLabel(roles.get(dev.alias)?.role ?? 0)}</span>
+              </div>
+              {(dev.ports || []).map(port => {
+                const key = `${dev.alias}:${port.subslot}`;
+                const link = links.get(key) || { toDevice: "", toIfaceSubslot: 1, toPortSubslot: 2 };
+                const toDevObj = expandedDevices.find(d => d.alias === link.toDevice);
+                return (
+                  <div key={port.subslot} style={mrpSt.portRow}>
+                    <span style={mrpSt.portLabel}>Port {port.label || port.subslot} (subslot {port.subslot})</span>
+                    <span style={{ color: "#9ca3af", fontSize: 12 }}>→ connects to</span>
+                    <select style={mrpSt.selectSm} value={link.toDevice}
+                      onChange={e => {
+                        const newDev = allPortDevices.find(d => d.alias === e.target.value);
+                        setLink(dev.alias, port.subslot, "toDevice", e.target.value);
+                        if (newDev?.ports?.[0]) {
+                          setLink(dev.alias, port.subslot, "toIfaceSubslot", newDev.ifaceSubslot ?? 1);
+                          setLink(dev.alias, port.subslot, "toPortSubslot", newDev.ports[0].subslot);
+                        }
+                      }}>
+                      <option value="">— device —</option>
+                      {expandedDevices.filter(d => d.alias !== dev.alias && d.ports.length > 0).map(d => (
+                        <option key={d.alias} value={d.alias}>{d.displayAlias ?? d.alias}{d.ringLabel ? ` (${d.ringLabel})` : ""}</option>
+                      ))}
+                    </select>
+                    <select style={mrpSt.selectSm} value={link.toPortSubslot}
+                      onChange={e => setLink(dev.alias, port.subslot, "toPortSubslot", parseInt(e.target.value, 10))}
+                      disabled={!link.toDevice}>
+                      {(toDevObj?.ports || []).map(p => (
+                        <option key={p.subslot} value={p.subslot}>Port {p.label || p.subslot} (ss {p.subslot})</option>
+                      ))}
+                    </select>
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+
+          {ringIssues.length > 0 && (
+            <div style={mrpSt.warn}>
+              <b>Ring validation issues:</b>
+              <ul style={{ margin: "4px 0 0 0", paddingLeft: 20 }}>
+                {ringIssues.map((issue, i) => <li key={i}>{issue}</li>)}
+              </ul>
+            </div>
+          )}
+          <div style={mrpSt.row}>
+            <button style={mrpSt.btnSecondary} onClick={() => setScreen(2)}>← Back</button>
+            <button style={saving ? mrpSt.btnDisabled : mrpSt.btnPrimary} onClick={handleSave} disabled={saving}>
+              {saving ? "Saving…" : saved ? "✓ Saved" : "Save Configuration"}
+            </button>
+            <button
+              style={(!canDownload || downloading) ? mrpSt.btnDisabled : mrpSt.btnSuccess}
+              onClick={handleDownload} disabled={!canDownload || downloading}
+              title={!saved ? "Save configuration first" : ringIssues.length > 0 ? "Fix ring issues first" : ""}>
+              {downloading ? "Generating…" : "Generate CFG with MRP"}
+            </button>
+          </div>
+          {saved && ringIssues.length === 0 && (
+            <div style={{ marginTop: 12, color: "#15803d", fontSize: 13 }}>
+              Configuration saved. Click <b>Generate CFG with MRP</b> to download the patched .cfg file.
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── Screen 4: Topology View ─────────────────────────────────── */}
+      {screen === 4 && (
+        <div style={mrpSt.section}>
+          <p style={mrpSt.hint}>
+            Interactive network topology. Click a node or link to highlight connections.
+            Hover a link to see port details. Switch between Hierarchy and Ring layouts using the toolbar.
+          </p>
+          <MRPTopologyView
+            devices={devices}
+            links={links}
+            roles={roles}
+            domainName={domainName}
+          />
+          <div style={{ ...mrpSt.row, marginTop: 16 }}>
+            <button style={mrpSt.btnSecondary} onClick={() => setScreen(3)}>← Back</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const mrpSt = {
+  tabs: { display: "flex", gap: 4, marginBottom: 20, borderBottom: "2px solid #e2e8f0" },
+  tab: { padding: "8px 20px", border: "none", background: "none", cursor: "pointer", fontSize: 14, color: "#64748b", borderBottom: "2px solid transparent", marginBottom: -2 },
+  tabActive: { color: "#2563eb", borderBottomColor: "#2563eb", fontWeight: 600 },
+  section: { background: "#fff", borderRadius: 8, border: "1px solid #e2e8f0", padding: 24 },
+  label: { display: "block", fontSize: 13, fontWeight: 500, color: "#374151", marginBottom: 6 },
+  input: { display: "block", width: "100%", padding: "8px 12px", border: "1px solid #d1d5db", borderRadius: 6, fontSize: 14, boxSizing: "border-box", maxWidth: 400 },
+  hint: { fontSize: 13, color: "#6b7280", marginBottom: 16 },
+  notice: { padding: 20, color: "#6b7280", fontStyle: "italic" },
+  error: { background: "#fef2f2", border: "1px solid #fca5a5", color: "#dc2626", padding: "10px 14px", borderRadius: 6, marginBottom: 16, fontSize: 14 },
+  warn: { background: "#fffbeb", border: "1px solid #fcd34d", color: "#92400e", padding: "10px 14px", borderRadius: 6, marginTop: 16, fontSize: 13 },
+  table: { width: "100%", borderCollapse: "collapse", fontSize: 14, marginBottom: 20 },
+  th: { textAlign: "left", padding: "8px 12px", borderBottom: "2px solid #e2e8f0", color: "#374151", fontWeight: 600, fontSize: 13 },
+  td: { padding: "8px 12px", borderBottom: "1px solid #f1f5f9" },
+  rowActive: { background: "#eff6ff" },
+  select: { padding: "6px 10px", border: "1px solid #d1d5db", borderRadius: 5, fontSize: 13, minWidth: 200 },
+  selectSm: { padding: "4px 8px", border: "1px solid #d1d5db", borderRadius: 5, fontSize: 13, minWidth: 120 },
+  devCard: { border: "1px solid #e2e8f0", borderRadius: 8, marginBottom: 16, overflow: "hidden" },
+  devHeader: { background: "#f8fafc", padding: "10px 16px", display: "flex", alignItems: "center", gap: 12, borderBottom: "1px solid #e2e8f0", fontSize: 14 },
+  badge: { background: "#dbeafe", color: "#1d4ed8", padding: "2px 8px", borderRadius: 12, fontSize: 12, fontWeight: 500 },
+  portRow: { display: "flex", alignItems: "center", gap: 12, padding: "10px 16px", borderBottom: "1px solid #f1f5f9", fontSize: 13, flexWrap: "wrap" },
+  portLabel: { minWidth: 180, color: "#374151", fontWeight: 500 },
+  row: { display: "flex", gap: 12, marginTop: 20, alignItems: "center" },
+  btnPrimary: { padding: "9px 20px", background: "#2563eb", color: "#fff", border: "none", borderRadius: 6, fontSize: 14, cursor: "pointer", fontWeight: 500 },
+  btnSecondary: { padding: "9px 20px", background: "#f1f5f9", color: "#374151", border: "1px solid #d1d5db", borderRadius: 6, fontSize: 14, cursor: "pointer" },
+  btnSuccess: { padding: "9px 20px", background: "#16a34a", color: "#fff", border: "none", borderRadius: 6, fontSize: 14, cursor: "pointer", fontWeight: 500 },
+  btnDisabled: { padding: "9px 20px", background: "#e5e7eb", color: "#9ca3af", border: "none", borderRadius: 6, fontSize: 14, cursor: "not-allowed" },
+};
 
 // ── Nav Panel (collapsible left sidebar) ──────────────────────────────────────
 function NavPanel({ hwTab, setHwTab, controllers, selectedId, onSelect }) {
@@ -588,7 +1730,7 @@ function NavPanel({ hwTab, setHwTab, controllers, selectedId, onSelect }) {
           </div>
         ) : controllers.map(c => {
           const isSelected = selectedId === c.id;
-          const isActive = isSelected && (hwTab === "controller" || hwTab === "config");
+          const isActive = isSelected && (hwTab === "controller" || hwTab === "config" || hwTab === "mrp");
           return (
             <div key={c.id} onClick={() => onSelect(c.id)}
               style={{
@@ -659,16 +1801,39 @@ function ImportPanel({
 
 // ── Catalogue Panel ────────────────────────────────────────────────────────────
 const CATALOGUE_COLS = [
-  { header: "Order No",     width: "18%", align: "left"   },
-  { header: "Display Name", width: "26%", align: "left"   },
-  { header: "Category",     width: "9%",  align: "center" },
-  { header: "Sig Type",     width: "7%",  align: "center" },
-  { header: "Channels",     width: "7%",  align: "center" },
-  { header: "In bytes",     width: "7%",  align: "center" },
-  { header: "Out bytes",    width: "7%",  align: "center" },
-  { header: "Version",      width: "11%", align: "left"   },
-  { header: "",             width: "8%",  align: "center" },
+  { key: "orderNo",      header: "Order No",     defaultW: 160, align: "left"   },
+  { key: "displayName",  header: "Display Name", defaultW: 190, align: "left"   },
+  { key: "category",     header: "Category",     defaultW: 80,  align: "center" },
+  { key: "sigType",      header: "Sig Type",     defaultW: 70,  align: "center" },
+  { key: "channels",     header: "Channels",     defaultW: 65,  align: "center" },
+  { key: "inBytes",      header: "In bytes",     defaultW: 65,  align: "center" },
+  { key: "outBytes",     header: "Out bytes",    defaultW: 65,  align: "center" },
+  { key: "version",      header: "Version",      defaultW: 70,  align: "left"   },
+  { key: "subslots",     header: "Subslots",     defaultW: 170, align: "left"   },
+  { key: "actions",      header: "",             defaultW: 44,  align: "center" },
 ];
+
+const CATALOGUE_COL_WIDTHS_KEY = "catalogue-col-widths-v1";
+
+function useCatalogueColWidths() {
+  const defaults = CATALOGUE_COLS.map(c => c.defaultW);
+  const [widths, setWidths] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(CATALOGUE_COL_WIDTHS_KEY));
+      if (Array.isArray(saved) && saved.length === defaults.length && saved.every(w => typeof w === "number" && w > 0)) {
+        return saved;
+      }
+    } catch {}
+    return defaults;
+  });
+
+  const save = (next) => {
+    setWidths(next);
+    try { localStorage.setItem(CATALOGUE_COL_WIDTHS_KEY, JSON.stringify(next)); } catch {}
+  };
+
+  return [widths, save];
+}
 
 const CATEGORY_BADGE = {
   station: { label: "Station", bg: "#e0f2fe", color: "#0369a1" },
@@ -687,11 +1852,58 @@ function CategoryBadge({ category }) {
   );
 }
 
-function CataloguePanel({ templates, onTemplatesChanged, onDeleteTemplate }) {
-  const [search,       setSearch]       = useState("");
-  const [familyFilter, setFamilyFilter] = useState("ALL");
-  const [showImport,   setShowImport]   = useState(false);
+const SIG_TYPES = ['DI', 'DO', 'AI', 'AO', 'PA', 'INFRA', 'MIXED'];
+
+function CataloguePanel({ templates, slotCompat, sigTypes, onTemplatesChanged, onPatchTemplate, onAddSigType, onAddCompat, onRemoveCompat, onDeleteTemplate }) {
+  const [search,          setSearch]          = useState("");
+  const [familyFilter,    setFamilyFilter]    = useState("ALL");
+  const [showImport,      setShowImport]      = useState(false);
+  const [addingSigFor,    setAddingSigFor]    = useState(null);
+  const [newSigInput,     setNewSigInput]     = useState("");
+  const [expandedSlot,    setExpandedSlot]    = useState(null);
   const cfgImportRef = useRef();
+  const [colWidths, saveColWidths] = useCatalogueColWidths();
+  const dragState = useRef(null); // { colIdx, startX, startW }
+
+  const onResizeStart = (colIdx, e) => {
+    e.preventDefault();
+    dragState.current = { colIdx, startX: e.clientX, startW: colWidths[colIdx] };
+    const onMove = (ev) => {
+      if (!dragState.current) return;
+      const { colIdx: ci, startX, startW } = dragState.current;
+      const next = [...colWidths];
+      next[ci] = Math.max(30, startW + ev.clientX - startX);
+      // Update colgroup cols directly for smooth drag without React re-render
+      document.querySelectorAll(`.catalogue-colgroup-col-${ci}`).forEach(el => {
+        el.style.width = next[ci] + "px";
+      });
+      dragState.current._pending = next;
+    };
+    const onUp = () => {
+      if (dragState.current && dragState.current._pending) {
+        saveColWidths(dragState.current._pending);
+      }
+      dragState.current = null;
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  };
+
+  // All known signal types come from the DB (sigTypes prop).
+  // Fall back to hardcoded SIG_TYPES only while the initial fetch is in-flight.
+  const allSigTypes = sigTypes && sigTypes.length ? sigTypes : SIG_TYPES;
+
+  // Build fast lookup sets from slotCompat
+  const compatBySlot    = {};  // slot_order_no    → Set of subslot_order_no
+  const compatBySubslot = {};  // subslot_order_no → Set of slot_order_no
+  for (const row of (slotCompat || [])) {
+    if (!compatBySlot[row.slot_order_no]) compatBySlot[row.slot_order_no] = new Set();
+    compatBySlot[row.slot_order_no].add(row.subslot_order_no);
+    if (!compatBySubslot[row.subslot_order_no]) compatBySubslot[row.subslot_order_no] = new Set();
+    compatBySubslot[row.subslot_order_no].add(row.slot_order_no);
+  }
 
   const families = ["ALL", ...Array.from(new Set(templates.map(t => t.family))).sort()];
 
@@ -747,41 +1959,211 @@ function CataloguePanel({ templates, onTemplatesChanged, onDeleteTemplate }) {
             {family}
           </div>
           <div style={{ overflowX: "auto" }}>
-            <table style={{ ...tableStyle, tableLayout: "fixed" }}>
+            <table style={{ ...tableStyle, tableLayout: "fixed", width: colWidths.reduce((a, w) => a + w, 0) }}>
               <colgroup>
-                {CATALOGUE_COLS.map(col => (
-                  <col key={col.header} style={{ width: col.width }} />
+                {CATALOGUE_COLS.map((col, ci) => (
+                  <col key={col.key} className={`catalogue-colgroup-col-${ci}`} style={{ width: colWidths[ci] }} />
                 ))}
               </colgroup>
               <thead>
                 <tr>
-                  {CATALOGUE_COLS.map(col => (
-                    <th key={col.header} style={{ ...thStyle, textAlign: col.align }}>{col.header}</th>
+                  {CATALOGUE_COLS.map((col, ci) => (
+                    <th key={col.key} style={{ ...thStyle, textAlign: col.align, position: "relative", userSelect: "none", overflow: "hidden" }}>
+                      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "block", paddingRight: 8 }}>{col.header}</span>
+                      {ci < CATALOGUE_COLS.length - 1 && (
+                        <span
+                          onMouseDown={e => onResizeStart(ci, e)}
+                          style={{
+                            position: "absolute", right: 0, top: 0, bottom: 0,
+                            width: 6, cursor: "col-resize",
+                            background: "transparent",
+                            borderRight: "2px solid #c8d4f0",
+                          }}
+                          title="Drag to resize"
+                        />
+                      )}
+                    </th>
                   ))}
                 </tr>
               </thead>
               <tbody>
-                {grouped[family].map((t, i) => (
-                  <tr key={t.id} style={{ background: i % 2 === 0 ? "#fff" : "#f7f9fc" }}>
-                    <td style={{ ...catTdStyle, fontFamily: "monospace", fontSize: 11, textAlign: "left" }} title={t.order_no}>{t.order_no}</td>
-                    <td style={{ ...catTdStyle, textAlign: "left" }} title={t.display_name}>{t.display_name}</td>
-                    <td style={{ ...catTdStyle, textAlign: "center" }}><CategoryBadge category={t.hw_category} /></td>
-                    <td style={{ ...catTdStyle, textAlign: "center" }}>
-                      {t.signal_type && <span style={sigBadge(t.signal_type)}>{t.signal_type}</span>}
-                    </td>
-                    <td style={{ ...catTdStyle, textAlign: "center" }}>{t.channel_count || "—"}</td>
-                    <td style={{ ...catTdStyle, textAlign: "center", fontFamily: "monospace" }}>{t.input_bytes || 0}</td>
-                    <td style={{ ...catTdStyle, textAlign: "center", fontFamily: "monospace" }}>{t.output_bytes || 0}</td>
-                    <td style={{ ...catTdStyle, color: "#888", fontSize: 12, textAlign: "left" }} title={t.version || ""}>{t.version || "—"}</td>
-                    <td style={{ ...catTdStyle, textAlign: "center" }}>
-                      <button
-                        onClick={() => onDeleteTemplate(t)}
-                        title="Delete from catalogue (only if not used in any station)"
-                        style={miniBtn("#e44", "#fff")}
-                      >✕</button>
-                    </td>
-                  </tr>
-                ))}
+                {grouped[family].flatMap((t, i) => {
+                  const isSlot    = t.hw_category === 'slot';
+                  const isSubslot = t.hw_category === 'subslot';
+                  const isExpanded = expandedSlot === t.order_no;
+                  const rowBg = i % 2 === 0 ? "#fff" : "#f7f9fc";
+
+                  // Subslots compatible with this slot (only relevant for slot rows)
+                  const assignedSubslots = compatBySlot[t.order_no] || new Set();
+                  // Slots using this subslot (only relevant for subslot rows)
+                  const usedBySlots = compatBySubslot[t.order_no] || new Set();
+                  // Candidate subslots for assignment = same family, hw_category === 'subslot'
+                  const candidateSubslots = templates.filter(s => s.hw_category === 'subslot' && s.family === t.family);
+
+                  const mainRow = (
+                    <tr key={t.id} style={{ background: rowBg }}>
+                      <td style={{ ...catTdStyle, fontFamily: "monospace", fontSize: 11, textAlign: "left" }} title={t.order_no}>
+                        {t.order_no}
+                      </td>
+                      <td style={{ ...catTdStyle, textAlign: "left" }} title={t.display_name}>{t.display_name}</td>
+                      <td style={{ ...catTdStyle, textAlign: "center" }}><CategoryBadge category={t.hw_category} /></td>
+                      <td style={{ ...catTdStyle, textAlign: "center" }}>
+                        {addingSigFor === t.id ? (
+                          <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+                            <input
+                              autoFocus
+                              value={newSigInput}
+                              onChange={e => setNewSigInput(e.target.value.toUpperCase())}
+                              onKeyDown={e => {
+                                if (e.key === "Enter" && newSigInput.trim()) {
+                                  const val = newSigInput.trim().toUpperCase();
+                                  onAddSigType(val);
+                                  onPatchTemplate(t, { signal_type: val });
+                                  setAddingSigFor(null); setNewSigInput("");
+                                }
+                                if (e.key === "Escape") { setAddingSigFor(null); setNewSigInput(""); }
+                              }}
+                              placeholder="e.g. PID"
+                              style={{ width: 52, fontSize: 11, padding: "2px 4px",
+                                border: "1px solid #2255cc", borderRadius: 4, fontWeight: 700, textTransform: "uppercase" }}
+                            />
+                            <button onClick={() => {
+                              const val = newSigInput.trim().toUpperCase(); if (!val) return;
+                              onAddSigType(val);
+                              onPatchTemplate(t, { signal_type: val });
+                              setAddingSigFor(null); setNewSigInput("");
+                            }} style={{ fontSize: 11, padding: "1px 5px", cursor: "pointer",
+                              background: "#2255cc", color: "#fff", border: "none", borderRadius: 3 }}>✓</button>
+                            <button onClick={() => { setAddingSigFor(null); setNewSigInput(""); }}
+                              style={{ fontSize: 11, padding: "1px 5px", cursor: "pointer",
+                                background: "#eee", color: "#555", border: "none", borderRadius: 3 }}>✕</button>
+                          </div>
+                        ) : (
+                          <select
+                            value={t.signal_type || ''}
+                            onChange={e => {
+                              if (e.target.value === '__add_new__') { setNewSigInput(""); setAddingSigFor(t.id); }
+                              else onPatchTemplate(t, { signal_type: e.target.value });
+                            }}
+                            title="Change signal type"
+                            style={{ fontSize: 11, padding: "2px 4px",
+                              border: `1px solid ${sigBadge(t.signal_type).color}`,
+                              borderRadius: 4, background: sigBadge(t.signal_type).background,
+                              color: sigBadge(t.signal_type).color, fontWeight: 700, cursor: "pointer" }}
+                          >
+                            {allSigTypes.map(st => <option key={st} value={st}>{st}</option>)}
+                            <option disabled style={{ color: "#aaa" }}>──────</option>
+                            <option value="__add_new__">+ Add new…</option>
+                          </select>
+                        )}
+                      </td>
+                      <td style={{ ...catTdStyle, textAlign: "center" }}>{t.channel_count || "—"}</td>
+                      <td style={{ ...catTdStyle, textAlign: "center", fontFamily: "monospace" }}>{t.input_bytes || 0}</td>
+                      <td style={{ ...catTdStyle, textAlign: "center", fontFamily: "monospace" }}>{t.output_bytes || 0}</td>
+                      <td style={{ ...catTdStyle, color: "#888", fontSize: 12, textAlign: "left" }} title={t.version || ""}>{t.version || "—"}</td>
+
+                      {/* Subslots column */}
+                      <td style={{ ...catTdStyle, textAlign: "left" }}>
+                        {isSlot && candidateSubslots.length > 0 && (
+                          <div style={{ display: "flex", flexWrap: "wrap", gap: 3, alignItems: "center" }}>
+                            {[...assignedSubslots].map(sno => {
+                              const s = templates.find(x => x.order_no === sno);
+                              return (
+                                <span key={sno} title={sno} style={{
+                                  fontSize: 10, padding: "1px 6px", borderRadius: 10,
+                                  background: "#e0f2fe", color: "#0369a1", fontWeight: 600, whiteSpace: "nowrap",
+                                }}>
+                                  {s ? s.display_name : sno.slice(0, 16)}
+                                </span>
+                              );
+                            })}
+                            <button
+                              onClick={() => setExpandedSlot(isExpanded ? null : t.order_no)}
+                              title={isExpanded ? "Close subslot assignment" : "Assign compatible subslots"}
+                              style={{ fontSize: 11, padding: "1px 6px", cursor: "pointer", borderRadius: 4,
+                                background: isExpanded ? "#dbeafe" : "#f0f6ff",
+                                color: isExpanded ? "#1e40af" : "#2255cc",
+                                border: `1px solid ${isExpanded ? "#93c5fd" : "#c8d4f0"}`,
+                                fontWeight: 600, whiteSpace: "nowrap" }}
+                            >
+                              {isExpanded ? "▲ Close" : (assignedSubslots.size > 0 ? "✏ Edit" : "+ Assign")}
+                            </button>
+                          </div>
+                        )}
+                        {isSubslot && usedBySlots.size > 0 && (
+                          <span style={{ fontSize: 10, color: "#666" }}>
+                            Used by {usedBySlots.size} slot{usedBySlots.size !== 1 ? "s" : ""}
+                          </span>
+                        )}
+                        {t.family === 'Scalance' && t.port_config && (() => {
+                          let ports = [];
+                          try { ports = JSON.parse(t.port_config); } catch (_) {}
+                          const portList = ports.filter(p => p.type === 'port');
+                          const rj45 = portList.filter(p => p.medium === 'RJ45').length;
+                          const fo   = portList.filter(p => p.medium === 'FO').length;
+                          return (
+                            <span style={{ fontSize: 10, color: '#0369a1' }}>
+                              {portList.length} port{portList.length !== 1 ? 's' : ''}
+                              {rj45 ? ` · ${rj45}×RJ45` : ''}
+                              {fo   ? ` · ${fo}×FO`   : ''}
+                            </span>
+                          );
+                        })()}
+                      </td>
+
+                      <td style={{ ...catTdStyle, textAlign: "center" }}>
+                        <button onClick={() => onDeleteTemplate(t)}
+                          title="Delete from catalogue (only if not used in any station)"
+                          style={miniBtn("#e44", "#fff")}>✕</button>
+                      </td>
+                    </tr>
+                  );
+
+                  // Expand row: shown below the slot row when expanded
+                  if (!isSlot || !isExpanded || candidateSubslots.length === 0) return [mainRow];
+
+                  const expandRow = (
+                    <tr key={`compat-${t.id}`} style={{ background: "#f0f6ff" }}>
+                      <td colSpan={CATALOGUE_COLS.length} style={{ padding: "10px 18px", borderTop: "1px dashed #93c5fd" }}>
+                        <div style={{ fontSize: 12, fontWeight: 600, color: "#1e40af", marginBottom: 8 }}>
+                          Compatible subslots for <span style={{ fontFamily: "monospace" }}>{t.display_name}</span>
+                        </div>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                          {candidateSubslots.map(s => {
+                            const checked = assignedSubslots.has(s.order_no);
+                            return (
+                              <label key={s.order_no} style={{
+                                display: "flex", alignItems: "center", gap: 5, cursor: "pointer",
+                                padding: "4px 10px", borderRadius: 6,
+                                background: checked ? "#dbeafe" : "#fff",
+                                border: `1px solid ${checked ? "#93c5fd" : "#ccd"}`,
+                                fontSize: 12,
+                              }}>
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={e => {
+                                    if (e.target.checked) onAddCompat(t.order_no, s.order_no);
+                                    else onRemoveCompat(t.order_no, s.order_no);
+                                  }}
+                                  style={{ accentColor: "#2255cc", cursor: "pointer" }}
+                                />
+                                <span style={{ fontWeight: checked ? 600 : 400, color: checked ? "#1e40af" : "#333" }}>
+                                  {s.display_name}
+                                </span>
+                                <span style={{ fontSize: 10, color: "#888", fontFamily: "monospace" }}>
+                                  {s.order_no.length > 20 ? s.order_no.slice(0, 18) + "…" : s.order_no}
+                                </span>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+
+                  return [mainRow, expandRow];
+                })}
               </tbody>
             </table>
           </div>
@@ -796,6 +2178,7 @@ function CataloguePanel({ templates, onTemplatesChanged, onDeleteTemplate }) {
       {showImport && (
         <CfgImportModal
           file={showImport}
+          sigTypes={allSigTypes}
           onClose={() => setShowImport(false)}
           onDone={() => { setShowImport(false); onTemplatesChanged?.(); }}
         />
@@ -807,7 +2190,7 @@ function CataloguePanel({ templates, onTemplatesChanged, onDeleteTemplate }) {
 // ── CFG Import Modal ───────────────────────────────────────────────────────────
 const ACTION_LABELS = { new: "Add", conflict: "Skip", skip: "Skip", error: "—" };
 
-function CfgImportModal({ file, onClose, onDone }) {
+function CfgImportModal({ file, sigTypes, onClose, onDone }) {
   const [stage,      setStage]      = useState("parsing");
   const [parseErr,   setParseErr]   = useState("");
   const [warning,    setWarning]    = useState("");
@@ -847,11 +2230,14 @@ function CfgImportModal({ file, onClose, onDone }) {
       const ioAddress = prev[idx]?.ioAddress;
       return prev.map((c, i) => {
         if (i === idx) return { ...c, family, familySource: 'manual' };
-        // Propagate to background subslots in the same station
-        if (c.isBackground && c.ioAddress === ioAddress) return { ...c, family, familySource: 'manual' };
+        // Propagate to all entries in the same station (background IFACE heads + visible subslots)
+        if (c.ioAddress === ioAddress) return { ...c, family, familySource: 'manual' };
         return c;
       });
     });
+  }
+  function setSignalType(idx, signal_type) {
+    setCandidates(prev => prev.map((c, i) => i === idx ? { ...c, signal_type } : c));
   }
   // Group header: toggle only visible New rows in the group; never auto-check Exists or background
   function toggleGroupNew(ioAddress, toCheck) {
@@ -891,8 +2277,10 @@ function CfgImportModal({ file, onClose, onDone }) {
         input_bytes: c.input_bytes, output_bytes: c.output_bytes,
         in_addr_fmt: c.in_addr_fmt, out_addr_fmt: c.out_addr_fmt,
         param_template: c.param_template, version: c.version,
-        gsdml_file: null, dap_id: null,
+        gsdml_file: c.gsdml_file || null, dap_id: c.dap_id || null,
         hw_category: c.hw_category || null,
+        subslot_defaults: c.subslot_defaults || null,
+        port_config: c.port_config || null,
         action: deriveAction(c),
       });
 
@@ -936,7 +2324,7 @@ function CfgImportModal({ file, onClose, onDone }) {
   };
   const modal = {
     background: "#fff", borderRadius: 10, boxShadow: "0 8px 40px rgba(0,0,0,0.18)",
-    width: "min(900px, 96vw)", maxHeight: "90vh", display: "flex", flexDirection: "column",
+    width: "min(1200px, 98vw)", maxHeight: "90vh", display: "flex", flexDirection: "column",
     overflow: "hidden",
   };
   const hdr = {
@@ -1020,12 +2408,14 @@ function CfgImportModal({ file, onClose, onDone }) {
                 </div>
                 <CfgImportTable
                   candidates={candidates}
+                  sigTypes={sigTypes}
                   allNewChecked={allNewChecked}
                   someNewChecked={someNewChecked}
                   onToggleAllNew={toggleAllNew}
                   onToggleGroupNew={toggleGroupNew}
                   onSetChecked={setChecked}
                   onSetFamily={setFamily}
+                  onSetSignalType={setSignalType}
                 />
                 </>
               )}
@@ -1195,7 +2585,45 @@ function CatalogueDeleteModal({ target, onClose, onConfirm }) {
 // Group header checkbox: hollow-green partial state when mixing checked-New +
 // unchecked-Conflict (the typical first-open state). Never auto-checks Conflict
 // rows — overwriting requires explicit per-row intent.
-function CfgImportTable({ candidates, allNewChecked, someNewChecked, onToggleAllNew, onToggleGroupNew, onSetChecked, onSetFamily }) {
+// Column definitions for CfgImportTable: key, label, defaultW (px), align, noResize flag
+const IMPORT_COLS = [
+  { key: "check",    label: null,        defaultW: 36,  align: "center" },
+  { key: "slot",     label: "Slot",      defaultW: 80,  align: "left"   },
+  { key: "category", label: "Category",  defaultW: 72,  align: "center" },
+  { key: "orderNo",  label: "Order No",  defaultW: 280, align: "left"   },
+  { key: "name",     label: "Name",      defaultW: 200, align: "left"   },
+  { key: "family",   label: "Family",    defaultW: 112, align: "left"   },
+  { key: "sig",      label: "Sig",       defaultW: 60,  align: "center" },
+  { key: "in",       label: "In",        defaultW: 44,  align: "center" },
+  { key: "out",      label: "Out",       defaultW: 44,  align: "center" },
+  { key: "ver",      label: "Ver",       defaultW: 56,  align: "left"   },
+  { key: "status",   label: "Status",    defaultW: 72,  align: "center" },
+];
+
+function CfgImportTable({ candidates, sigTypes, allNewChecked, someNewChecked, onToggleAllNew, onToggleGroupNew, onSetChecked, onSetFamily, onSetSignalType }) {
+  const effectiveSigTypes = sigTypes && sigTypes.length ? sigTypes : SIG_TYPES;
+
+  const [colWidths, setColWidths] = useState(() => IMPORT_COLS.map(c => c.defaultW));
+  const dragRef = useRef(null);
+
+  function startResize(e, colIdx) {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = colWidths[colIdx];
+    const onMove = ev => {
+      const newW = Math.max(36, startW + (ev.clientX - startX));
+      setColWidths(prev => prev.map((w, i) => i === colIdx ? newW : w));
+    };
+    const onUp = () => {
+      dragRef.current = null;
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+    dragRef.current = { colIdx, startX, startW };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  }
+
   // Build ordered group list from visible (non-background) entries only,
   // but keep global indices intact so onSetChecked(i) maps to the right candidate.
   const visibleWithIdx = candidates.map((c, i) => ({ c, i })).filter(({ c }) => !c.isBackground);
@@ -1206,29 +2634,95 @@ function CfgImportTable({ candidates, allNewChecked, someNewChecked, onToggleAll
     if (!seen.has(c.ioAddress)) { seen.add(c.ioAddress); groupOrder.push(c.ioAddress); }
   }
 
+  // Within each ioAddress group, build a slot → subslots hierarchy.
+  // Subslot entries are matched to parent slot by extracting the slot number from slotInfo.
+  // e.g. "Slot 3 / Subslot 1" → parent is the entry with slotInfo "Slot 3"
+  function buildSlotTree(groupEntries) {
+    // Separate by category: station heads, plain slots, subslots
+    const heads     = groupEntries.filter(({ c }) => c.hw_category === 'station');
+    const slots     = groupEntries.filter(({ c }) => c.hw_category === 'slot');
+    const subslots  = groupEntries.filter(({ c }) => c.hw_category === 'subslot');
+
+    // Build a map: slot number string → list of subslot entries
+    const subslotsBySlot = new Map();
+    for (const entry of subslots) {
+      const m = entry.c.slotInfo && entry.c.slotInfo.match(/^Slot\s+(\d+)/i);
+      if (m) {
+        const slotKey = m[1];
+        if (!subslotsBySlot.has(slotKey)) subslotsBySlot.set(slotKey, []);
+        subslotsBySlot.get(slotKey).push(entry);
+      }
+    }
+
+    // Subslots with no matching slot parent (orphan) — render at end
+    const orphanSubslots = subslots.filter(entry => {
+      const m = entry.c.slotInfo && entry.c.slotInfo.match(/^Slot\s+(\d+)/i);
+      if (!m) return true;
+      const slotKey = m[1];
+      return !slots.some(({ c }) => {
+        const sm = c.slotInfo && c.slotInfo.match(/^Slot\s+(\d+)$/i);
+        return sm && sm[1] === slotKey;
+      });
+    });
+
+    // Ordered: heads → slots (each followed by their subslots) → orphan subslots
+    const ordered = [];
+    for (const head of heads) ordered.push({ ...head, isSubslotChild: false });
+    for (const slot of slots) {
+      ordered.push({ ...slot, isSubslotChild: false });
+      const m = slot.c.slotInfo && slot.c.slotInfo.match(/^Slot\s+(\d+)$/i);
+      if (m) {
+        const children = subslotsBySlot.get(m[1]) || [];
+        for (const child of children) ordered.push({ ...child, isSubslotChild: true });
+      }
+    }
+    for (const orphan of orphanSubslots) ordered.push({ ...orphan, isSubslotChild: true });
+    return ordered;
+  }
+
+  const totalW = colWidths.reduce((s, w) => s + w, 0);
+
   return (
-    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+    <div style={{ overflowX: "auto", width: "100%" }}>
+    <table style={{ borderCollapse: "collapse", fontSize: 12, tableLayout: "fixed", width: totalW }}>
+      <colgroup>
+        {IMPORT_COLS.map((col, i) => <col key={col.key} style={{ width: colWidths[i] }} />)}
+      </colgroup>
       <thead>
         <tr style={{ background: "#f4f6fb" }}>
-          <th style={{ ...thStyle, width: 28, textAlign: "center" }}>
-            {/* Global header: controls New rows only; hollow-green when mixed */}
-            <HierarchyCheckbox
-              checked={allNewChecked}
-              partial={!allNewChecked && someNewChecked}
-              onChange={v => onToggleAllNew(v)}
-              title="Check/uncheck all New rows"
-            />
-          </th>
-          <th style={{ ...thStyle, textAlign: "left" }}>Slot</th>
-          <th style={{ ...thStyle, textAlign: "center" }}>Category</th>
-          <th style={{ ...thStyle, textAlign: "left" }}>Order No</th>
-          <th style={{ ...thStyle, textAlign: "left" }}>Name</th>
-          <th style={{ ...thStyle, textAlign: "left" }}>Family</th>
-          <th style={{ ...thStyle, textAlign: "center" }}>Sig</th>
-          <th style={{ ...thStyle, textAlign: "center" }}>In</th>
-          <th style={{ ...thStyle, textAlign: "center" }}>Out</th>
-          <th style={{ ...thStyle, textAlign: "left" }}>Ver</th>
-          <th style={{ ...thStyle, textAlign: "center" }}>Status</th>
+          {IMPORT_COLS.map((col, i) => (
+            <th key={col.key} style={{
+              ...thStyle,
+              textAlign: col.align,
+              position: "relative",
+              userSelect: "none",
+              overflow: "hidden",
+              padding: "8px 16px 8px 8px",
+            }}>
+              {col.key === "check" ? (
+                <HierarchyCheckbox
+                  checked={allNewChecked}
+                  partial={!allNewChecked && someNewChecked}
+                  onChange={v => onToggleAllNew(v)}
+                  title="Check/uncheck all New rows"
+                />
+              ) : (
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "block" }}>
+                  {col.label}
+                </span>
+              )}
+              {i < IMPORT_COLS.length - 1 && (
+                <div
+                  onMouseDown={e => startResize(e, i)}
+                  style={{
+                    position: "absolute", right: 0, top: 0, bottom: 0, width: 5,
+                    cursor: "col-resize",
+                    background: "transparent",
+                  }}
+                />
+              )}
+            </th>
+          ))}
         </tr>
       </thead>
       <tbody>
@@ -1244,6 +2738,8 @@ function CfgImportTable({ candidates, allNewChecked, someNewChecked, onToggleAll
           const headLabel       = headEntry ? headEntry.c.display_name : '';
           const showHeader      = groupEntries.length > 1;
 
+          const orderedEntries = buildSlotTree(groupEntries);
+
           return (
             <React.Fragment key={ioAddr}>
               {showHeader && (
@@ -1258,7 +2754,7 @@ function CfgImportTable({ candidates, allNewChecked, someNewChecked, onToggleAll
                       />
                     )}
                   </td>
-                  <td colSpan={10} style={{ ...catTdStyle, fontWeight: 600, fontSize: 11,
+                  <td colSpan={IMPORT_COLS.length - 1} style={{ ...catTdStyle, fontWeight: 600, fontSize: 11,
                       color: "#334", letterSpacing: "0.02em", paddingLeft: 8 }}>
                     IO Station {ioAddr}
                     {headLabel && <span style={{ fontWeight: 400, color: "#668", marginLeft: 8 }}>{headLabel}</span>}
@@ -1274,7 +2770,7 @@ function CfgImportTable({ candidates, allNewChecked, someNewChecked, onToggleAll
                 </tr>
               )}
 
-              {groupEntries.map(({ c, i }, rowIdx) => {
+              {orderedEntries.map(({ c, i, isSubslotChild }, rowIdx) => {
                 const isErr      = c.status === 'error';
                 const isConflict = c.status === 'conflict';
                 const isChecked  = c.checked;
@@ -1284,13 +2780,20 @@ function CfgImportTable({ candidates, allNewChecked, someNewChecked, onToggleAll
                 if (isErr) rowBg = "#fff8f8";
                 else if (isConflict && isChecked) rowBg = "#fffbe6";
                 else if (!isConflict && isChecked) rowBg = "#f0fbf2";
+                // Subslot children get a slightly different background to visually separate
+                if (isSubslotChild && !isErr && !isChecked) rowBg = "#fafbfe";
+                if (isSubslotChild && isChecked && !isConflict) rowBg = "#eaf7ec";
+                if (isSubslotChild && isChecked && isConflict) rowBg = "#fffae0";
 
                 const rowOpacity = (!isErr && !isChecked) ? 0.45 : 1;
-                const indent     = showHeader;
+                // Indentation levels: station group header → indent=1, subslot child → indent=2
+                const indentLevel = isSubslotChild ? (showHeader ? 2 : 1) : (showHeader ? 1 : 0);
+                const checkPL  = indentLevel === 2 ? 32 : indentLevel === 1 ? 20 : 6;
+                const slotPL   = indentLevel === 2 ? 32 : indentLevel === 1 ? 20 : 8;
 
                 return (
                   <tr key={c.order_no + i} style={{ background: rowBg, opacity: rowOpacity }}>
-                    <td style={{ ...catTdStyle, textAlign: "center", paddingLeft: indent ? 20 : 6 }}>
+                    <td style={{ ...catTdStyle, textAlign: "center", paddingLeft: checkPL }}>
                       {!isErr && (
                         isConflict ? (
                           // Amber-tinted checkbox for Exists rows — visual cue that checking = overwrite
@@ -1312,16 +2815,17 @@ function CfgImportTable({ candidates, allNewChecked, someNewChecked, onToggleAll
                       )}
                     </td>
                     <td style={{ ...catTdStyle, color: "#668", fontSize: 11, whiteSpace: "nowrap",
-                        paddingLeft: indent ? 20 : 8 }}>
+                        paddingLeft: slotPL }}>
+                      {isSubslotChild && <span style={{ color: "#aab", marginRight: 4 }}>↳</span>}
                       {c.slotInfo || "—"}
                     </td>
                     <td style={{ ...catTdStyle, textAlign: "center" }}>
                       <CategoryBadge category={c.hw_category} />
                     </td>
                     <td style={{ ...catTdStyle, fontFamily: "monospace", fontSize: 11 }} title={c.order_no}>
-                      {c.order_no.length > 28 ? c.order_no.slice(0, 26) + "…" : c.order_no}
+                      {c.order_no}
                     </td>
-                    <td style={{ ...catTdStyle }}>
+                    <td style={{ ...catTdStyle }} title={c.display_name}>
                       {isErr
                         ? <span style={{ color: "#c00" }}>⚠ {c.parseError || "Parse error"}</span>
                         : c.display_name}
@@ -1360,7 +2864,28 @@ function CfgImportTable({ candidates, allNewChecked, someNewChecked, onToggleAll
                       )}
                     </td>
                     <td style={{ ...catTdStyle, textAlign: "center" }}>
-                      {c.signal_type && <span style={sigBadge(c.signal_type)}>{c.signal_type}</span>}
+                      {isErr ? (
+                        <span style={{ color: "#aaa" }}>—</span>
+                      ) : (
+                        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2 }}>
+                          <select
+                            value={c.signal_type || ''}
+                            onChange={e => onSetSignalType(i, e.target.value)}
+                            style={{
+                              fontSize: 10, padding: "1px 3px", border: "1px solid #ccd",
+                              borderRadius: 3, background: "#fff", cursor: "pointer",
+                              fontWeight: 700, color: sigBadge(c.signal_type).color,
+                            }}
+                          >
+                            {effectiveSigTypes.map(st => (
+                              <option key={st} value={st}>{st}</option>
+                            ))}
+                          </select>
+                          <span style={{ fontSize: 9, color: "#aaa", textTransform: "uppercase", letterSpacing: "0.03em" }}>
+                            sig type
+                          </span>
+                        </div>
+                      )}
                     </td>
                     <td style={{ ...catTdStyle, textAlign: "center", fontFamily: "monospace" }}>{c.input_bytes || 0}</td>
                     <td style={{ ...catTdStyle, textAlign: "center", fontFamily: "monospace" }}>{c.output_bytes || 0}</td>
@@ -1386,6 +2911,7 @@ function CfgImportTable({ candidates, allNewChecked, someNewChecked, onToggleAll
         })}
       </tbody>
     </table>
+    </div>
   );
 }
 
@@ -1431,42 +2957,26 @@ function ConfigurationPanel({
   onCopyStation, onDeleteStation,
   onBulkDelete, onBulkApprove,
   onOpenAddSlot, onCancelAddSlot, onModuleSelect, onSetNewSlot, onCommitAddSlot,
-  onDeleteSlot, onSaveSlotPip, onSaveSlotPotentialGroup,
+  onDeleteSlot, onSaveSlotPip, onSaveSlotPotentialGroup, onSaveSlotPaProfile, onSaveSlotSubslotProfile,
   onGenerate,
   isEditing, onStartEdit, onChangeEdit, onCommitEdit, onCancelEdit,
 }) {
   const canGenerate = baselineOk && stations.some(s => s.slots.length > 0);
   const nSelected   = selectedAddrs.size;
   const allSelected = stations.length > 0 && selectedAddrs.size === stations.length;
-  const [selectedStationAddr, setSelectedStationAddr] = useState(null);
-  const [activeSlot, setActiveSlot] = useState(null);
+  const [configureAddr, setConfigureAddr] = useState(null); // address of station open in modal
   const [genMenuOpen, setGenMenuOpen] = useState(false);
   const [selectMode, setSelectMode] = useState(false); // drives Mode A / B / C
 
-  const selectedStation = stations.find(s => s.address === selectedStationAddr) || null;
+  // Always derive the live station object from current stations so the modal never shows stale slots
+  const configureStation = configureAddr != null ? (stations.find(s => s.address === configureAddr) || null) : null;
 
-  // Clear slot panel when switching stations
-  useEffect(() => { setActiveSlot(null); }, [selectedStationAddr]);
-
-  // Keep selection valid if stations reload
+  // Close modal if its station was deleted
   useEffect(() => {
-    if (selectedStationAddr != null && !stations.find(s => s.address === selectedStationAddr)) {
-      setSelectedStationAddr(null);
+    if (configureAddr != null && !stations.find(s => s.address === configureAddr)) {
+      setConfigureAddr(null);
     }
   }, [stations]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const handleSlotClick = (station, slot) => {
-    if (!slot || slot.slot === 0) return;
-    // For CFU_PA stations, slot 2 (PA Master) is AUTOCREATED with no user signals — skip it
-    const imSlot  = station.slots.find(s => s.slot === 0);
-    const imTpl   = imSlot ? templates.find(t => t.order_no === imSlot.orderNo) : null;
-    const isCfuPa = imTpl && imTpl.family === 'CFU_PA';
-    if (isCfuPa && slot.slot === 2) return;
-    const key = `${station.address}-${slot.slot}`;
-    const activeKey = activeSlot ? `${activeSlot.stationAddr}-${activeSlot.slot}` : null;
-    if (key === activeKey) { setActiveSlot(null); return; }
-    setActiveSlot({ stationAddr: station.address, slot: slot.slot, orderNo: slot.orderNo, name: slot.name });
-  };
 
   return (
     <div>
@@ -1543,7 +3053,7 @@ function ConfigurationPanel({
       {addingStation && (
         <div style={{ background: "#f0f6ff", border: "1px solid #c0d4f0", borderRadius: 8,
                       padding: "14px 16px", marginBottom: 16, display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
-          <Field label="IM Type — Slot 0" width={320}>
+          <Field label="Device Type" width={320}>
             <select
               value={newStation.imOrderNo}
               onChange={e => {
@@ -1553,7 +3063,12 @@ function ConfigurationPanel({
               style={{ ...inputSx, width: "100%", fontFamily: "monospace", fontSize: 12 }}
             >
               <option value="">— select Interface Module —</option>
-              {templates.filter(t => t.signal_type === "INFRA" && !t.order_no.startsWith("V1_1:")).map(t => (
+              {templates.filter(t => (
+                // INFRA: ET200SP/CFU_PA heads — exclude old GSDML-path/SCALANCE entries that have no port_config
+                (t.signal_type === "INFRA" && t.family !== 'SCALANCE' && t.family !== 'GSDML') ||
+                // New-style Scalance: MLFB as order_no, port_config populated
+                t.family === 'Scalance'
+              ) && t.hw_category === 'station' && !t.order_no.startsWith("V1_1:")).map(t => (
                 <option key={t.id} value={t.order_no}>
                   {t.order_no} — {t.display_name}
                 </option>
@@ -1599,11 +3114,8 @@ function ConfigurationPanel({
         </div>
       )}
 
-      {/* Main area: station list + detail + signal panels */}
-      <div style={{ display: "flex", gap: 16, alignItems: "flex-start" }}>
-
-        {/* Station list table — fixed natural width, never shrinks when detail panel opens */}
-        <div style={{ flex: "0 0 auto", minWidth: 0, overflowX: "auto" }}>
+      {/* Main area: station list */}
+      <div style={{ overflowX: "auto" }}>
 
           {/* ── Table toolbar: Mode A / B / C ─────────────────────────── */}
           {/* Row 1: always visible */}
@@ -1703,12 +3215,13 @@ function ConfigurationPanel({
                   <th style={{ ...thStyle, padding: "6px 12px" }}>Order Number</th>
                   <th style={{ ...thStyle, padding: "6px 12px" }}>IP Address</th>
                   <th style={{ ...thStyle, textAlign: "center", padding: "6px 12px" }}>Node</th>
+                  <th style={{ ...thStyle, width: 100, padding: "6px 12px" }}></th>
                 </tr>
               </thead>
               <tbody>
                 {stations.map((station, si) => {
                   const isSelected = selectedAddrs.has(station.address);
-                  const isOpen = station.address === selectedStationAddr;
+                  const isConfiguring = configureStation?.address === station.address;
                   const imSlot = station.slots.find(s => s.slot === 0);
                   const imOrderNo = imSlot ? imSlot.orderNo : "—";
                   const imTpl = templates.find(t => t.order_no === (imSlot ? imSlot.orderNo : null));
@@ -1716,11 +3229,9 @@ function ConfigurationPanel({
                   return (
                     <tr
                       key={station.address}
-                      onClick={() => setSelectedStationAddr(isOpen ? null : station.address)}
                       style={{
-                        cursor: "pointer",
-                        background: isOpen ? "#EEEDFE" : isSelected ? "#f0f4ff" : si % 2 === 0 ? "#fff" : "#f7f9fc",
-                        borderLeft: isOpen ? "3px solid #2255cc" : "3px solid transparent",
+                        background: isConfiguring ? "#EEEDFE" : isSelected ? "#f0f4ff" : si % 2 === 0 ? "#fff" : "#f7f9fc",
+                        borderLeft: isConfiguring ? "3px solid #2255cc" : "3px solid transparent",
                       }}
                     >
                       {selectMode && (
@@ -1736,10 +3247,10 @@ function ConfigurationPanel({
                         </td>
                       )}
                       <td style={{ ...tdStyle, textAlign: "center", fontWeight: 700, fontFamily: "monospace",
-                                   color: isOpen ? "#2255cc" : "#226", padding: "5px 12px" }}>
+                                   color: isConfiguring ? "#2255cc" : "#226", padding: "5px 12px" }}>
                         {station.address}
                       </td>
-                      <td style={{ ...tdStyle, fontWeight: 600, color: isOpen ? "#2255cc" : "#224", padding: "5px 12px" }}>
+                      <td style={{ ...tdStyle, fontWeight: 600, color: isConfiguring ? "#2255cc" : "#224", padding: "5px 12px" }}>
                         {station.name || `Station_${station.address}`}
                       </td>
                       <td style={{ ...tdStyle, padding: "5px 12px" }}>
@@ -1766,59 +3277,22 @@ function ConfigurationPanel({
                             : `PROFINET IO system (${no})`;
                         })()}
                       </td>
+                      <td style={{ ...tdStyle, textAlign: "center", padding: "5px 8px" }}
+                          onClick={e => e.stopPropagation()}>
+                        <button
+                          onClick={() => setConfigureAddr(isConfiguring ? null : station.address)}
+                          style={{ ...btnStyle, fontSize: 12, padding: "4px 14px",
+                                   background: isConfiguring ? "#2255cc" : "#f0f4ff",
+                                   color:      isConfiguring ? "#fff"    : "#2255cc",
+                                   border: "1px solid #99b8f4" }}
+                        >{isConfiguring ? "Close" : "Configure"}</button>
+                      </td>
                     </tr>
                   );
                 })}
               </tbody>
             </table>
           )}
-        </div>
-
-        {/* Right pane: detail + signal panels — always occupies the remaining whitespace */}
-        <div style={{ flex: 1, minWidth: 0, display: "flex", gap: 16, alignItems: "flex-start" }}>
-          {selectedStation && (
-            <StationDetailPanel
-              station={selectedStation}
-              templates={templates}
-              addrMap={addrMap}
-              pipMappings={baselineInfo?.pipMappings || []}
-              addingSlot={addingSlot}
-              newSlot={newSlot}
-              editing={editing}
-              editVal={editVal}
-              activeSlot={activeSlot}
-              onSlotClick={handleSlotClick}
-              onCopyStation={onCopyStation}
-              onDeleteStation={onDeleteStation}
-              onOpenAddSlot={onOpenAddSlot}
-              onCancelAddSlot={onCancelAddSlot}
-              onModuleSelect={onModuleSelect}
-              onSetNewSlot={onSetNewSlot}
-              onCommitAddSlot={onCommitAddSlot}
-              onDeleteSlot={onDeleteSlot}
-              onSaveSlotPip={onSaveSlotPip}
-              onSaveSlotPotentialGroup={onSaveSlotPotentialGroup}
-              isEditing={isEditing}
-              onStartEdit={onStartEdit}
-              onChangeEdit={onChangeEdit}
-              onCommitEdit={onCommitEdit}
-              onCancelEdit={onCancelEdit}
-            />
-          )}
-
-          {activeSlot && (
-            <SlotSignalPanel
-              key={`${activeSlot.stationAddr}-${activeSlot.slot}`}
-              importId={importId}
-              stationAddr={activeSlot.stationAddr}
-              slot={activeSlot.slot}
-              slotName={activeSlot.name}
-              orderNo={activeSlot.orderNo}
-              templates={templates}
-              onClose={() => setActiveSlot(null)}
-            />
-          )}
-        </div>
       </div>
 
       {cfgs.length > 0 && (
@@ -1829,6 +3303,39 @@ function ConfigurationPanel({
           Signals: {cfgs[0].stats?.signals ?? "?"}
         </div>
       )}
+
+      {/* ── Slot Config Modal ── */}
+      {configureStation && (
+        <SlotConfigModal
+          importId={importId}
+          station={configureStation}
+          templates={templates}
+          addrMap={addrMap}
+          pipMappings={baselineInfo?.pipMappings || []}
+          addingSlot={addingSlot}
+          newSlot={newSlot}
+          editing={editing}
+          editVal={editVal}
+          onCopyStation={onCopyStation}
+          onDeleteStation={onDeleteStation}
+          onOpenAddSlot={onOpenAddSlot}
+          onCancelAddSlot={onCancelAddSlot}
+          onModuleSelect={onModuleSelect}
+          onSetNewSlot={onSetNewSlot}
+          onCommitAddSlot={onCommitAddSlot}
+          onDeleteSlot={onDeleteSlot}
+          onSaveSlotPip={onSaveSlotPip}
+          onSaveSlotPotentialGroup={onSaveSlotPotentialGroup}
+          onSaveSlotPaProfile={onSaveSlotPaProfile}
+          onSaveSlotSubslotProfile={onSaveSlotSubslotProfile}
+          isEditing={isEditing}
+          onStartEdit={onStartEdit}
+          onChangeEdit={onChangeEdit}
+          onCommitEdit={onCommitEdit}
+          onCancelEdit={onCancelEdit}
+          onClose={() => setConfigureAddr(null)}
+        />
+      )}
     </div>
   );
 }
@@ -1838,7 +3345,7 @@ function StationDetailPanel({
   station, templates, addrMap, pipMappings, addingSlot, newSlot, editing, editVal, activeSlot,
   onSlotClick, onCopyStation, onDeleteStation,
   onOpenAddSlot, onCancelAddSlot, onModuleSelect, onSetNewSlot, onCommitAddSlot,
-  onDeleteSlot, onSaveSlotPip, onSaveSlotPotentialGroup,
+  onDeleteSlot, onSaveSlotPip, onSaveSlotPotentialGroup, onSaveSlotPaProfile, onSaveSlotSubslotProfile,
   isEditing, onStartEdit, onChangeEdit, onCommitEdit, onCancelEdit,
 }) {
   const addSlotRow = addingSlot === station.address;
@@ -1846,10 +3353,39 @@ function StationDetailPanel({
 
   // Determine station family by looking up the IM (slot 0) template.
   const imSlot = station.slots.find(s => s.slot === 0);
-  const imTpl  = imSlot ? templates.find(t => t.order_no === imSlot.orderNo) : null;
-  const stationFamily  = imTpl ? imTpl.family : null;
-  const isEt200Station = stationFamily ? stationFamily.startsWith("ET200") : false;
-  const isCfuPaStation = stationFamily === 'CFU_PA';
+  let imTpl = imSlot ? templates.find(t => t.order_no === imSlot.orderNo) : null;
+
+  // Fallback: station was created with GSDML path as order_no (e.g. pre-refactor or imported from CFG directly).
+  // Detect by pattern and try to find a matching Scalance template by gsdml_file.
+  const isGsdmlOrderNo = imSlot && imSlot.orderNo && /^GSDML-.*\.xml<DAP/.test(imSlot.orderNo);
+  if (isGsdmlOrderNo && (!imTpl || imTpl.family !== 'Scalance')) {
+    const gsdmlFile = imSlot.orderNo.replace(/<DAP[\s\S]*/, '').trim(); // "GSDML-V2.42-....xml"
+    const byGsdml = templates.find(t => t.family === 'Scalance' && t.gsdml_file === gsdmlFile);
+    if (byGsdml) imTpl = byGsdml;
+  }
+
+  const stationFamily    = imTpl ? imTpl.family : (isGsdmlOrderNo ? 'Scalance' : null);
+  const isEt200Station   = stationFamily ? stationFamily.startsWith("ET200") : false;
+  const isCfuPaStation   = stationFamily === 'CFU_PA';
+  // isGsdmlOrderNo covers old stations created before MLFB refactor (slot 0 order_no is a GSDML path).
+  // 'SCALANCE' (uppercase) comes from old FAMILY_RULES — treat it the same as the new 'Scalance'.
+  const isScalanceStation = isGsdmlOrderNo || stationFamily === 'Scalance' || stationFamily === 'SCALANCE';
+
+  // Parse port_config for Scalance stations
+  let scalancePorts = [];
+  if (isScalanceStation && imTpl && imTpl.port_config) {
+    try { scalancePorts = JSON.parse(imTpl.port_config); } catch (_) {}
+  }
+
+  // Parse port_config for ET200 / CFU stations — stored at catalogue import time.
+  // These are SLOT 0 port subslots (subslot ≥ 2); subslot 1 = PN-IO interface (skip).
+  let imPorts = [];
+  if (!isScalanceStation && imTpl && imTpl.port_config) {
+    try {
+      const parsed = JSON.parse(imTpl.port_config);
+      imPorts = parsed.filter(p => p.subslot >= 2);
+    } catch (_) {}
+  }
 
   return (
     <div style={{ flex: 1, minWidth: 0, border: "1px solid #c8d4f0", borderRadius: 8, overflow: "hidden", background: "#f8f9ff" }}>
@@ -1904,7 +3440,7 @@ function StationDetailPanel({
           </div>
         </div>
         <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
-          {!addSlotRow && (
+          {!addSlotRow && !isScalanceStation && (
             <button onClick={() => onOpenAddSlot(station.address)}
               style={{ ...btnStyle, fontSize: 12, padding: "4px 12px", color: "#2255cc" }}>
               + Add Slot
@@ -1922,8 +3458,69 @@ function StationDetailPanel({
         </div>
       </div>
 
-      {/* Slot table */}
-      <div style={{ padding: "12px 16px", overflowX: "auto" }}>
+      {/* Scalance port list — PCS7-style view (read-only) */}
+      {isScalanceStation && (
+        <div style={{ padding: "12px 16px" }}>
+          <table style={{ ...tableStyle, fontSize: 13 }}>
+            <thead>
+              <tr>
+                {["Module", "Order Number", "I Address", "Q Address", "Diagnostic Address"].map(h => (
+                  <th key={h} style={thStyle}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {/* Slot 0 — device head (DAP) */}
+              <tr style={{ background: "#dde8ff" }}>
+                <td style={{ ...tdStyle, fontWeight: 700 }}>
+                  {/* Prefer module_name from hw_signals (always set), fall back to template display_name */}
+                  {imSlot ? imSlot.name : (imTpl ? imTpl.display_name : "—")}
+                </td>
+                <td style={{ ...tdStyle, fontFamily: "monospace", fontSize: 11 }}>
+                  {imTpl ? imTpl.order_no : "—"}
+                </td>
+                <td style={{ ...tdStyle, color: "#aaa", textAlign: "center" }}>—</td>
+                <td style={{ ...tdStyle, color: "#aaa", textAlign: "center" }}>—</td>
+                <td style={{ ...tdStyle, color: "#aaa", textAlign: "center" }}>—</td>
+              </tr>
+              {/* Subslots from port_config (PN-IO interface + ports) */}
+              {scalancePorts.map((p, i) => (
+                <tr key={p.subslot} style={{ background: i % 2 === 0 ? "#fff" : "#f7f9fc" }}>
+                  <td style={{ ...tdStyle, paddingLeft: 24 }}>
+                    {p.name}
+                    {p.medium && (
+                      <span style={{
+                        marginLeft: 6, fontSize: 9, padding: "1px 5px", borderRadius: 3,
+                        background: p.medium === 'FO' ? "#fef3c7" : "#e0f2fe",
+                        color: p.medium === 'FO' ? "#92400e" : "#0369a1",
+                        fontWeight: 600, verticalAlign: "middle",
+                      }}>{p.medium}</span>
+                    )}
+                    <span style={{ marginLeft: 6, fontSize: 9, color: "#aaa", background: "#f0f0f0",
+                                   borderRadius: 3, padding: "1px 4px", verticalAlign: "middle" }}>
+                      AUTO
+                    </span>
+                  </td>
+                  <td style={{ ...tdStyle, color: "#aaa", textAlign: "center" }}>—</td>
+                  <td style={{ ...tdStyle, color: "#aaa", textAlign: "center" }}>—</td>
+                  <td style={{ ...tdStyle, color: "#aaa", textAlign: "center" }}>—</td>
+                  <td style={{ ...tdStyle, color: "#aaa", textAlign: "center" }}>—</td>
+                </tr>
+              ))}
+              {scalancePorts.length === 0 && (
+                <tr>
+                  <td colSpan={5} style={{ ...tdStyle, color: "#aaa", fontStyle: "italic" }}>
+                    No port config — re-import template from .cfg to populate ports
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Slot table (ET200 / CFU_PA / other) */}
+      {!isScalanceStation && <div style={{ padding: "12px 16px", overflowX: "auto" }}>
         <table style={{ ...tableStyle, fontSize: 13 }}>
           <thead>
             <tr>
@@ -1942,8 +3539,6 @@ function StationDetailPanel({
               // For CFU_PA PA device slots (≥3), look up signal_type to label subslots correctly
               const isPaDevSlot = isCfuPaStation && slot && slot.slot >= 3;
               const paSlotTpl = isPaDevSlot ? templates.find(t => t.order_no === slot.orderNo) : null;
-              const paSignalType = paSlotTpl ? (paSlotTpl.signal_type || 'AI').toUpperCase() : 'AI';
-              const ss1Label = paSignalType === 'AO' ? 'SP (short)' : 'Analog Input (AI)short';
 
               const mainRow = (
               <tr key={`slot-${slot ? slot.slot : sli}`}
@@ -2079,7 +3674,39 @@ function StationDetailPanel({
               </tr>
               );
 
-              // CFU_PA PA device slots (≥3): append two read-only subslot rows
+              // Slot 0 (IM module) for ET200/CFU stations: append port sub-rows from baseline CFG
+              if (slot && slot.slot === 0 && !isScalanceStation && imPorts.length > 0) {
+                const portSsTdBase = {
+                  ...tdStyle, fontSize: 11, color: "#666",
+                  paddingTop: 2, paddingBottom: 2,
+                  borderTop: "1px dashed #ddd", background: "#f0f6ff",
+                };
+                const portRows = imPorts.map((port, pi) => (
+                  <tr key={`im-port-${port.subslot}`} style={{ background: pi % 2 === 0 ? "#f0f6ff" : "#e8f0ff", cursor: "default" }}>
+                    <td style={{ ...portSsTdBase, textAlign: "center", color: "#2255cc", fontWeight: 600 }}>
+                      <span style={{ paddingLeft: 12 }}>↳ 0.{port.subslot}</span>
+                    </td>
+                    <td style={{ ...portSsTdBase, fontFamily: "monospace" }}>
+                      <span style={{ fontSize: 10, padding: "1px 5px", borderRadius: 3,
+                                     background: "#dbeafe", color: "#1d4ed8", fontWeight: 600 }}>
+                        PORT
+                      </span>
+                    </td>
+                    <td style={{ ...portSsTdBase }}>
+                      {port.label || `Port ${pi + 1}`}
+                    </td>
+                    <td style={{ ...portSsTdBase, color: "#aaa" }}>—</td>
+                    <td style={{ ...portSsTdBase, textAlign: "center", color: "#aaa" }}>—</td>
+                    <td style={{ ...portSsTdBase, textAlign: "center", color: "#aaa" }}>—</td>
+                    {isEt200Station && <td style={{ ...portSsTdBase, textAlign: "center", color: "#aaa" }}>—</td>}
+                    <td style={{ ...portSsTdBase, textAlign: "center", color: "#aaa" }}>—</td>
+                    <td style={{ ...portSsTdBase, textAlign: "center" }}></td>
+                  </tr>
+                ));
+                return [mainRow, ...portRows];
+              }
+
+              // CFU_PA PA device slots (≥3): append function subslot rows + service row
               if (!isPaDevSlot || slot === null) return [mainRow];
 
               const ssRowStyle = {
@@ -2096,39 +3723,102 @@ function StationDetailPanel({
                 borderTop: "1px dashed #ddd",
               };
 
-              const subslot1 = (
-                <tr key={`ss1-${slot.slot}`} style={ssRowStyle}>
-                  <td style={{ ...ssTdBase, textAlign: "center", color: "#9979cc", fontWeight: 600 }}>
-                    <span style={{ paddingLeft: 12 }}>↳ SS1</span>
-                  </td>
-                  <td style={{ ...ssTdBase, fontFamily: "monospace" }}>
-                    <span style={{ color: "#9979cc" }}>{ss1Label}</span>
-                  </td>
-                  <td style={{ ...ssTdBase, color: "#9979cc" }}>Signal data (process image)</td>
-                  <td style={{ ...ssTdBase, textAlign: "center" }}>—</td>
-                  <td style={{ ...ssTdBase, textAlign: "center" }}>—</td>
-                  <td style={{ ...ssTdBase, textAlign: "center" }}>—</td>
-                  <td style={{ ...ssTdBase, textAlign: "center" }}></td>
-                </tr>
-              );
+              // Number of function subslots: from template channel_count (min 1)
+              const funcCount = paSlotTpl && (paSlotTpl.channel_count || 0) > 1
+                ? paSlotTpl.channel_count : 1;
+              const serviceSubslotNo = funcCount + 1;
 
-              const subslot2 = (
-                <tr key={`ss2-${slot.slot}`} style={{ ...ssRowStyle, background: "#ede8ff" }}>
+              // PA subslot profile options from catalogue
+              const paSubslots = templates.filter(t => t.hw_category === 'subslot' && t.family === stationFamily);
+              // Build per-subslot lookup: subslotNo → { paProfile }
+              const subslotLookup = new Map((slot.subslots || []).map(ss => [ss.subslotNo, ss]));
+
+              // Build function subslot rows — each SS has its own independent profile selector
+              const slotAddrs = addrMap && addrMap[`${station.address}:${slot.slot}`];
+              const ssAddrList = slotAddrs && slotAddrs.subslotAddrs ? slotAddrs.subslotAddrs : [];
+              const ssAddrMap  = new Map(ssAddrList.map(a => [a.subslotNo, a]));
+
+              const funcRows = Array.from({ length: funcCount }, (_, fi) => {
+                const ssNo = fi + 1;
+                const ssData = subslotLookup.get(ssNo);
+                const ssProfile = ssData ? ssData.paProfile : null;
+                const ssLocked = !!ssProfile;
+                const ssProfileTpl = ssProfile ? paSubslots.find(t => t.order_no === ssProfile) : null;
+                const ssAddr = ssAddrMap.get(ssNo);
+                return (
+                  <tr key={`ss${ssNo}-${slot.slot}`}
+                    style={{ ...ssRowStyle, cursor: "pointer" }}
+                    onClick={() => onSlotClick(station, slot)}>
+                    <td style={{ ...ssTdBase, textAlign: "center", color: "#9979cc", fontWeight: 600 }}>
+                      <span style={{ paddingLeft: 12 }}>↳ {slot.slot}.{ssNo}</span>
+                    </td>
+                    <td style={{ ...ssTdBase, fontFamily: "monospace" }} onClick={e => e.stopPropagation()}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                        <input
+                          type="checkbox"
+                          checked={ssLocked}
+                          onChange={e => {
+                            if (!e.target.checked) onSaveSlotSubslotProfile(station.address, slot.slot, ssNo, null);
+                          }}
+                          title={ssLocked ? "Uncheck to change profile" : "Select a profile first"}
+                          style={{ cursor: "pointer", accentColor: "#9979cc", margin: 0, flexShrink: 0 }}
+                        />
+                        {ssLocked ? (
+                          <span style={{ color: "#9979cc", fontFamily: "monospace", fontSize: 11 }}>{ssProfile}</span>
+                        ) : (
+                          <select
+                            value=""
+                            onChange={e => { if (e.target.value) onSaveSlotSubslotProfile(station.address, slot.slot, ssNo, e.target.value); }}
+                            onClick={e => e.stopPropagation()}
+                            title={`Select PA profile for ${slot.slot}.${ssNo}`}
+                            style={{
+                              fontSize: 11, border: "1px solid #c8a8f0", borderRadius: 3,
+                              padding: "2px 4px", background: "#faf8ff",
+                              color: "#9979cc", cursor: "pointer", fontFamily: "monospace",
+                            }}
+                          >
+                            <option value="">— select —</option>
+                            {paSubslots.map(t => (
+                              <option key={t.order_no} value={t.order_no}>{t.order_no}</option>
+                            ))}
+                          </select>
+                        )}
+                      </div>
+                    </td>
+                    <td style={{ ...ssTdBase }}>
+                      {ssProfileTpl
+                        ? <span style={{ color: "#9979cc", fontSize: 11 }}>{ssProfileTpl.display_name}</span>
+                        : <span style={{ color: "#ccc", fontSize: 11 }}>—</span>
+                      }
+                    </td>
+                    <td style={{ ...ssTdBase, color: "#9979cc" }}>Signal data (process image)</td>
+                    <td style={{ ...ssTdBase, textAlign: "right", fontFamily: "monospace", paddingRight: 8,
+                        color: ssAddr ? "#1a5c1a" : "#ccc" }}>
+                      {ssAddr ? ssAddr.inputAddr : "—"}
+                    </td>
+                    <td style={{ ...ssTdBase, textAlign: "center", color: "#ccc" }}>—</td>
+                    <td style={{ ...ssTdBase, textAlign: "center" }}></td>
+                  </tr>
+                );
+              });
+
+              const serviceRow = (
+                <tr key={`ss${serviceSubslotNo}-${slot.slot}`} style={{ ...ssRowStyle, background: "#ede8ff" }}>
                   <td style={{ ...ssTdBase, textAlign: "center", color: "#7755aa", fontWeight: 600 }}>
-                    <span style={{ paddingLeft: 12 }}>↳ SS2</span>
+                    <span style={{ paddingLeft: 12 }}>↳ {slot.slot}.{serviceSubslotNo}</span>
                   </td>
                   <td style={{ ...ssTdBase, fontFamily: "monospace" }}>
                     <span style={{ color: "#7755aa" }}>_S7H_NORM_PDM_BUB_MODULE_CT</span>
                   </td>
+                  <td style={{ ...ssTdBase }}></td>
                   <td style={{ ...ssTdBase, color: "#7755aa" }}>Service (AUTOCREATED)</td>
-                  <td style={{ ...ssTdBase, textAlign: "center" }}>—</td>
                   <td style={{ ...ssTdBase, textAlign: "center" }}>—</td>
                   <td style={{ ...ssTdBase, textAlign: "center" }}>—</td>
                   <td style={{ ...ssTdBase, textAlign: "center" }}></td>
                 </tr>
               );
 
-              return [mainRow, subslot1, subslot2];
+              return [mainRow, ...funcRows, serviceRow];
             })}
 
             {/* Inline add-slot form */}
@@ -2140,15 +3830,18 @@ function StationDetailPanel({
                     min={isCfuPaStation ? 3 : 1}
                     style={{ ...inputSx, width: 48, textAlign: "center" }} placeholder="#" />
                 </td>
-                <td style={{ ...tdStyle }} colSpan={2}>
+                <td style={{ ...tdStyle }}>
                   <select value={newSlot.moduleOrderNo} onChange={e => onModuleSelect(e.target.value)}
                     style={{ ...inputSx, width: "100%", fontFamily: "monospace", fontSize: 11 }}>
                     <option value="">— select module —</option>
                     {templates
                       .filter(t => {
                         if (t.order_no.startsWith("V1_1:") || t.order_no.includes("PLACEHOLDER")) return false;
-                        // CFU_PA stations: show only PA slot-level profiles
-                        if (isCfuPaStation) return t.family === 'CFU_PA' && t.hw_category === 'slot' && t.signal_type === 'PA';
+                        // CFU_PA stations: show only PA slot-level profiles.
+                        // Accept signal_type='PA' (newly parsed) OR META\ prefix (already-stored rows that
+                        // were imported before the parser forced signal_type='PA').
+                        if (isCfuPaStation) return t.family === 'CFU_PA' && t.hw_category === 'slot' &&
+                          (t.signal_type === 'PA' || /^META[/\\]/i.test(t.order_no));
                         return true;
                       })
                       .map(t => (
@@ -2158,6 +3851,14 @@ function StationDetailPanel({
                       ))
                     }
                   </select>
+                </td>
+                <td style={{ ...tdStyle }}>
+                  <input
+                    value={newSlot.moduleName}
+                    onChange={e => onSetNewSlot(p => ({ ...p, moduleName: e.target.value }))}
+                    style={{ ...inputSx, width: "100%", borderColor: newSlot.moduleName.trim() ? undefined : "#e88" }}
+                    placeholder="module name *"
+                  />
                 </td>
                 <td style={{ ...tdStyle, textAlign: "center", color: "#bbb" }}>—</td>
                 {isEt200Station && (
@@ -2176,7 +3877,7 @@ function StationDetailPanel({
             )}
           </tbody>
         </table>
-      </div>
+      </div>}
     </div>
   );
 }
@@ -2349,6 +4050,137 @@ function UploadCard({ label, ok, okLabel, btnLabel, onBtn, accept, inputRef, onC
   );
 }
 
+// ── Slot Config Modal ─────────────────────────────────────────────────────────
+// Full-screen overlay: left half = StationDetailPanel, right half = SlotSignalPanel.
+// Opens when user clicks "Configure" on a slot row. Closes via the × button.
+function SlotConfigModal({
+  importId, station, templates, addrMap, pipMappings,
+  addingSlot, newSlot, editing, editVal,
+  onCopyStation, onDeleteStation,
+  onOpenAddSlot, onCancelAddSlot, onModuleSelect, onSetNewSlot, onCommitAddSlot,
+  onDeleteSlot, onSaveSlotPip, onSaveSlotPotentialGroup, onSaveSlotPaProfile, onSaveSlotSubslotProfile,
+  isEditing, onStartEdit, onChangeEdit, onCommitEdit, onCancelEdit,
+  initialSlot, // { slot, orderNo, name } to open immediately
+  onClose,
+}) {
+  const [activeSlot, setActiveSlot] = useState(initialSlot || null);
+
+  const handleSlotClick = (st, slot) => {
+    if (!slot || slot.slot === 0) return;
+    const imSlot = st.slots.find(s => s.slot === 0);
+    const imTpl  = imSlot ? templates.find(t => t.order_no === imSlot.orderNo) : null;
+    if (imTpl && imTpl.family === 'CFU_PA' && slot.slot === 2) return;
+    const key     = `${st.address}-${slot.slot}`;
+    const activeKey = activeSlot ? `${activeSlot.stationAddr}-${activeSlot.slot}` : null;
+    if (key === activeKey) { setActiveSlot(null); return; }
+    setActiveSlot({ stationAddr: st.address, slot: slot.slot, orderNo: slot.orderNo, name: slot.name });
+  };
+
+  return (
+    <div style={{
+      position: "fixed", inset: 0, zIndex: 1000,
+      background: "rgba(20,30,60,0.45)",
+      display: "flex", alignItems: "stretch",
+    }}
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div style={{
+        margin: "auto",
+        width: "95vw", height: "90vh",
+        background: "#f0f4ff",
+        borderRadius: 12,
+        boxShadow: "0 8px 40px rgba(10,20,80,0.25)",
+        display: "flex",
+        flexDirection: "column",
+        overflow: "hidden",
+      }}>
+        {/* Modal header */}
+        <div style={{
+          display: "flex", alignItems: "center", gap: 12,
+          padding: "10px 18px",
+          background: "#dde8ff", borderBottom: "1px solid #c8d4f0",
+          flexShrink: 0,
+        }}>
+          <span style={{ fontWeight: 700, fontSize: 15, color: "#224", flex: 1 }}>
+            Configure — {station.name || `Station_${station.address}`}
+            <span style={{ fontWeight: 400, fontSize: 12, color: "#669", marginLeft: 12, fontFamily: "monospace" }}>
+              Addr {station.address} · {station.ip || "—"}
+            </span>
+          </span>
+          <button onClick={onClose}
+            style={{ background: "none", border: "none", cursor: "pointer",
+                     fontSize: 22, color: "#667", lineHeight: 1, padding: "0 4px" }}
+            title="Close"
+          >×</button>
+        </div>
+
+        {/* Body: two halves side-by-side */}
+        <div style={{ flex: 1, display: "flex", gap: 0, overflow: "hidden" }}>
+
+          {/* Left 70%: slot table */}
+          <div style={{ flex: 7, minWidth: 0, overflowY: "auto", padding: 16,
+                        borderRight: "1px solid #c8d4f0" }}>
+            <StationDetailPanel
+              station={station}
+              templates={templates}
+              addrMap={addrMap}
+              pipMappings={pipMappings}
+              addingSlot={addingSlot}
+              newSlot={newSlot}
+              editing={editing}
+              editVal={editVal}
+              activeSlot={activeSlot}
+              onSlotClick={handleSlotClick}
+              onCopyStation={onCopyStation}
+              onDeleteStation={onDeleteStation}
+              onOpenAddSlot={onOpenAddSlot}
+              onCancelAddSlot={onCancelAddSlot}
+              onModuleSelect={onModuleSelect}
+              onSetNewSlot={onSetNewSlot}
+              onCommitAddSlot={onCommitAddSlot}
+              onDeleteSlot={onDeleteSlot}
+              onSaveSlotPip={onSaveSlotPip}
+              onSaveSlotPotentialGroup={onSaveSlotPotentialGroup}
+              onSaveSlotPaProfile={onSaveSlotPaProfile}
+              onSaveSlotSubslotProfile={onSaveSlotSubslotProfile}
+              isEditing={isEditing}
+              onStartEdit={onStartEdit}
+              onChangeEdit={onChangeEdit}
+              onCommitEdit={onCommitEdit}
+              onCancelEdit={onCancelEdit}
+            />
+          </div>
+
+          {/* Right 30%: channel signal panel */}
+          <div style={{ flex: 3, minWidth: 0, overflowY: "auto", background: "#f8f9ff" }}>
+            {activeSlot ? (
+              <SlotSignalPanel
+                key={`${activeSlot.stationAddr}-${activeSlot.slot}`}
+                importId={importId}
+                stationAddr={activeSlot.stationAddr}
+                slot={activeSlot.slot}
+                slotName={activeSlot.name}
+                orderNo={activeSlot.orderNo}
+                templates={templates}
+                onClose={() => setActiveSlot(null)}
+              />
+            ) : (
+              <div style={{
+                height: "100%", display: "flex", alignItems: "center",
+                justifyContent: "center", color: "#aaa", fontSize: 13,
+                flexDirection: "column", gap: 8,
+              }}>
+                <span style={{ fontSize: 32, opacity: 0.3 }}>↖</span>
+                Click a slot row to assign signal names
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Slot Signal Panel ─────────────────────────────────────────────────────────
 function SlotSignalPanel({ importId, stationAddr, slot, slotName, orderNo, templates, onClose }) {
   const [channels, setChannels] = useState([]);
@@ -2357,9 +4189,12 @@ function SlotSignalPanel({ importId, stationAddr, slot, slotName, orderNo, templ
   const [drafts,   setDrafts]   = useState({});   // { [ch]: { tag, description } }
 
   const tpl = templates.find(t => t.order_no === orderNo);
-  const ioType    = tpl ? tpl.signal_type : null;
-  const isPaSlot  = ioType === 'PA';
-  const isMixed   = ioType === 'MIXED';
+  const ioType      = tpl ? tpl.signal_type : null;
+  const isPaSlot    = ioType === 'PA';
+  const isMixed     = ioType === 'MIXED';
+  // Multi-function PA profiles (Analyzer etc.): channel = 0-based function index, not PA bus address
+  const funcCount   = tpl && (tpl.channel_count || 0) > 1 ? tpl.channel_count : 1;
+  const isPaMulti   = isPaSlot && funcCount > 1;
 
   useEffect(() => {
     setLoading(true);
@@ -2381,7 +4216,9 @@ function SlotSignalPanel({ importId, stationAddr, slot, slotName, orderNo, templ
     setSaving(ch);
     try {
       const d = drafts[ch] ?? {};
-      const newCh = isPaSlot && d.paAddr != null ? d.paAddr : ch;
+      // PA single-function: channel key = PA bus address (user-editable).
+      // PA multi-function: channel key = function index (fixed, not a bus address).
+      const newCh = (isPaSlot && !isPaMulti && d.paAddr != null) ? d.paAddr : ch;
       // For MIXED slots use the per-channel signal_type stored on the channel row
       const chRow = channels.find(r => r.channel === ch);
       const saveType = isMixed ? (chRow ? chRow.signal_type : null) : ioType;
@@ -2390,9 +4227,8 @@ function SlotSignalPanel({ importId, stationAddr, slot, slotName, orderNo, templ
         description: d.description ?? "",
         signal_type: saveType,
       });
-      // If the PA bus address changed (channel key changed), delete the old channel row
-      if (isPaSlot && newCh !== ch) {
-        // The backend upsert creates a new row at newCh; old row at ch has no data
+      // If the PA bus address changed (channel key changed), clear the old channel row
+      if (isPaSlot && !isPaMulti && newCh !== ch) {
         await patchSlotChannel(importId, stationAddr, slot, ch, { tag: "", description: "", signal_type: saveType });
       }
       setChannels(prev => prev.map(r => r.channel === ch
@@ -2410,10 +4246,10 @@ function SlotSignalPanel({ importId, stationAddr, slot, slotName, orderNo, templ
 
   return (
     <div style={{
-      width: 380, flexShrink: 0,
+      width: "100%",
       border: "1px solid #c8d4f0", borderRadius: 8,
       background: "#f8f9ff", overflow: "hidden",
-      alignSelf: "flex-start", position: "sticky", top: 0,
+      height: "100%",
     }}>
       {/* Header */}
       <div style={{
@@ -2426,9 +4262,14 @@ function SlotSignalPanel({ importId, stationAddr, slot, slotName, orderNo, templ
             {ioDot(ioType)}{slotName}
           </div>
           <div style={{ fontSize: 11, color: "#669", fontFamily: "monospace", marginTop: 2 }}>{orderNo}</div>
-          {isPaSlot && (
+          {isPaSlot && !isPaMulti && (
             <div style={{ fontSize: 10, color: "#6a1b9a", marginTop: 2 }}>
               PA Device — set PA bus address (0-126) as the channel number
+            </div>
+          )}
+          {isPaMulti && (
+            <div style={{ fontSize: 10, color: "#6a1b9a", marginTop: 2 }}>
+              {funcCount} PA functions — assign signal tags per subslot
             </div>
           )}
         </div>
@@ -2448,7 +4289,7 @@ function SlotSignalPanel({ importId, stationAddr, slot, slotName, orderNo, templ
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
             <thead>
               <tr>
-                {[isPaSlot ? "PA Addr" : "Ch", "IO Type", "Signal Name", "Description", ""].map(h => (
+                {[isPaMulti ? "Function" : (isPaSlot ? "PA Addr" : "Ch"), "IO Type", "Signal Name", "Description", ""].map(h => (
                   <th key={h} style={{
                     padding: "6px 10px", fontSize: 11, fontWeight: 700,
                     textTransform: "uppercase", letterSpacing: "0.04em",
@@ -2465,12 +4306,14 @@ function SlotSignalPanel({ importId, stationAddr, slot, slotName, orderNo, templ
                   const ch = row.channel;
                   const draft = drafts[ch] || { tag: "", description: "", paAddr: ch };
                   const dirty = draft.tag !== (row.tag || "") || draft.description !== (row.description || "")
-                             || (isPaSlot && (draft.paAddr ?? ch) !== ch);
+                             || (isPaSlot && !isPaMulti && (draft.paAddr ?? ch) !== ch);
                   const displayType = isMixed ? row.signal_type : ioType;
                   return (
                     <tr key={ch} style={{ background: i % 2 === 0 ? "#fff" : "#f5f7ff" }}>
                       <td style={{ padding: "5px 10px", fontWeight: 700, color: "#446", textAlign: "center", whiteSpace: "nowrap" }}>
-                        {isPaSlot ? (
+                        {isPaMulti ? (
+                          <span style={{ color: "#6a1b9a", fontSize: 11, fontWeight: 600 }}>Fn {ch + 1}</span>
+                        ) : isPaSlot ? (
                           <input
                             type="number"
                             min={0} max={126}

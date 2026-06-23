@@ -1,0 +1,341 @@
+/* ── MRP Topology View ─────────────────────────────────────────────────────── */
+
+.mrp-topology {
+  display: flex;
+  flex-direction: column;
+  height: 640px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #f8fafc;
+  font-family: inherit;
+}
+
+.mrp-topology--empty {
+  align-items: center;
+  justify-content: center;
+  color: #6b7280;
+  font-size: 14px;
+  font-style: italic;
+}
+
+/* ── Toolbar ─────────────────────────────────────────────────────────────── */
+
+.mrp-topology__toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  background: #1e293b;
+  color: #f1f5f9;
+  flex-shrink: 0;
+}
+
+.mrp-topology__toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.mrp-topology__toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mrp-topology__title {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
+.mrp-topology__ring-badge {
+  background: #f59e0b;
+  color: #1c1917;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+
+.mrp-toolbar-btn {
+  padding: 4px 12px;
+  background: transparent;
+  border: 1px solid #475569;
+  border-radius: 4px;
+  color: #cbd5e1;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.mrp-toolbar-btn:hover {
+  background: #334155;
+  color: #f1f5f9;
+}
+
+.mrp-toolbar-btn--active {
+  background: #2563eb;
+  border-color: #2563eb;
+  color: #fff;
+}
+
+/* ── Legend ──────────────────────────────────────────────────────────────── */
+
+.mrp-topology__legend {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 5px 14px;
+  background: #f1f5f9;
+  border-bottom: 1px solid #e2e8f0;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.mrp-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: #475569;
+}
+
+.mrp-legend-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.mrp-legend-line {
+  display: inline-block;
+  width: 22px;
+  height: 2px;
+  background: #64748b;
+  flex-shrink: 0;
+}
+
+.mrp-legend-line--ring {
+  background: #f97316;
+  border-top: 2px dashed #f97316;
+  height: 0;
+}
+
+.mrp-legend-clear {
+  margin-left: auto;
+  background: none;
+  border: 1px solid #94a3b8;
+  color: #64748b;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.mrp-legend-clear:hover {
+  background: #e2e8f0;
+}
+
+/* ── Canvas ──────────────────────────────────────────────────────────────── */
+
+.mrp-topology__canvas {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+/* ── Device Node ─────────────────────────────────────────────────────────── */
+
+.mrp-node {
+  width: 190px;
+  min-height: 80px;
+  border-radius: 6px;
+  border: 2px solid var(--node-border, #1f2937);
+  background: #fff;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.12);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  position: relative;
+  transition: box-shadow 0.15s;
+}
+
+.mrp-node--selected,
+.mrp-node:hover {
+  box-shadow: 0 0 0 3px #93c5fd, 0 2px 8px rgba(0,0,0,0.18);
+}
+
+.mrp-node--ring {
+  border-style: solid;
+}
+
+.mrp-node--ring::after {
+  content: "";
+  position: absolute;
+  inset: -5px;
+  border: 2px dashed #f97316;
+  border-radius: 9px;
+  pointer-events: none;
+  opacity: 0.6;
+}
+
+/* Header */
+.mrp-node__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 8px;
+  border-radius: 4px 4px 0 0;
+  gap: 4px;
+}
+
+.mrp-node__name {
+  font-weight: 700;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+}
+
+.mrp-node__badge {
+  font-size: 9px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 6px;
+  color: #fff;
+  white-space: nowrap;
+  flex-shrink: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+/* Body — two port columns */
+.mrp-node__body {
+  display: flex;
+  justify-content: space-between;
+  padding: 4px 0;
+  min-height: 40px;
+}
+
+.mrp-node__ports {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 2px 0;
+}
+
+.mrp-node__ports--left {
+  align-items: flex-start;
+  padding-left: 4px;
+}
+
+.mrp-node__ports--right {
+  align-items: flex-end;
+  padding-right: 4px;
+}
+
+.mrp-node__port {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.mrp-node__port:hover {
+  background: #f1f5f9;
+}
+
+.mrp-node__port--rhs {
+  flex-direction: row-reverse;
+}
+
+.mrp-node__port-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.mrp-node__port--on .mrp-node__port-dot {
+  background: #16a34a;
+  box-shadow: 0 0 3px #4ade80;
+}
+
+.mrp-node__port--off .mrp-node__port-dot {
+  background: #d1d5db;
+}
+
+.mrp-node__port-label {
+  font-size: 10px;
+  color: #475569;
+  white-space: nowrap;
+  max-width: 62px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Suppress React Flow default handle styling (we render our own dots) */
+.mrp-topology__canvas .react-flow__handle {
+  background: transparent;
+  border: none;
+  min-width: unset;
+  min-height: unset;
+  border-radius: 0;
+}
+
+/* Ring indicator dot (top-right corner) */
+.mrp-node__ring-indicator {
+  position: absolute;
+  top: 4px;
+  right: -10px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #f59e0b;
+  border: 1px solid #fff;
+  box-shadow: 0 0 4px #f59e0b;
+}
+
+/* ── Edge Tooltip ────────────────────────────────────────────────────────── */
+
+.mrp-edge-tooltip {
+  background: #1e293b;
+  color: #f1f5f9;
+  font-size: 11px;
+  line-height: 1.5;
+  padding: 6px 10px;
+  border-radius: 5px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.28);
+  white-space: nowrap;
+  z-index: 9999;
+  pointer-events: none;
+}
+
+/* ── React Flow overrides ────────────────────────────────────────────────── */
+
+.mrp-topology__canvas .react-flow__controls {
+  bottom: 10px;
+  left: 10px;
+}
+
+.mrp-topology__canvas .react-flow__minimap {
+  bottom: 10px;
+  right: 10px;
+  border-radius: 6px;
+  overflow: hidden;
+  border: 1px solid #e2e8f0;
+}
+
+.mrp-topology__canvas .react-flow__background {
+  background: #f8fafc;
+}
+
+/* Suppress React Flow default node selected ring (we style ourselves) */
+.mrp-topology__canvas .react-flow__node.selected > div {
+  box-shadow: none;
+}

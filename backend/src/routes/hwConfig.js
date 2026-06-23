@@ -25,6 +25,29 @@ router.get('/utils/hex-to-ip', (req, res) => {
   res.json({ hex: hex.trim().toUpperCase(), ip });
 });
 
+// ── Signal Types ──────────────────────────────────────────────────────────────
+
+// GET /signal-types  — return all signal types ordered by sort_order
+router.get('/signal-types', (_req, res) => {
+  try {
+    const db   = getDb();
+    const rows = db.prepare('SELECT name FROM hw_signal_types ORDER BY sort_order, name').all();
+    res.json(rows.map(r => r.name));
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// POST /signal-types  — add a new custom signal type (idempotent)
+router.post('/signal-types', (req, res) => {
+  try {
+    const name = (req.body.name || '').trim().toUpperCase();
+    if (!name) return err(res, 400, 'name required');
+    const db = getDb();
+    db.prepare('INSERT OR IGNORE INTO hw_signal_types (name) VALUES (?)').run(name);
+    const rows = db.prepare('SELECT name FROM hw_signal_types ORDER BY sort_order, name').all();
+    res.json(rows.map(r => r.name));
+  } catch (e) { err(res, 500, e.message); }
+});
+
 // ── Module Templates ──────────────────────────────────────────────────────────
 
 router.get('/module-templates', (_req, res) => {
@@ -41,7 +64,7 @@ router.post('/module-templates', (req, res) => {
     const {
       order_no, display_name, family, signal_type, channel_count = 0,
       input_bytes = 0, output_bytes = 0, in_addr_fmt, out_addr_fmt,
-      param_template, version, gsdml_file, dap_id, hw_category,
+      param_template, version, gsdml_file, dap_id, hw_category, subslot_defaults, port_config,
     } = req.body;
     if (!order_no || !display_name || !family) return err(res, 400, 'order_no, display_name, family required');
 
@@ -50,21 +73,21 @@ router.post('/module-templates', (req, res) => {
       db.prepare(`UPDATE hw_module_templates SET
         display_name=?, family=?, signal_type=?, channel_count=?,
         input_bytes=?, output_bytes=?, in_addr_fmt=?, out_addr_fmt=?,
-        param_template=?, version=?, gsdml_file=?, dap_id=?, hw_category=?
+        param_template=?, version=?, gsdml_file=?, dap_id=?, hw_category=?, subslot_defaults=?, port_config=?
         WHERE order_no=?`).run(
         display_name, family, signal_type, channel_count,
         input_bytes, output_bytes, in_addr_fmt, out_addr_fmt,
-        param_template, version, gsdml_file, dap_id, hw_category || null, order_no
+        param_template, version, gsdml_file, dap_id, hw_category || null, subslot_defaults || null, port_config || null, order_no
       );
       res.json({ id: existing.id, updated: true });
     } else {
       const r = db.prepare(`INSERT INTO hw_module_templates
         (order_no, display_name, family, signal_type, channel_count, input_bytes, output_bytes,
-         in_addr_fmt, out_addr_fmt, param_template, version, gsdml_file, dap_id, hw_category)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+         in_addr_fmt, out_addr_fmt, param_template, version, gsdml_file, dap_id, hw_category, subslot_defaults, port_config)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
         order_no, display_name, family, signal_type, channel_count,
         input_bytes, output_bytes, in_addr_fmt, out_addr_fmt,
-        param_template, version, gsdml_file, dap_id, hw_category || null
+        param_template, version, gsdml_file, dap_id, hw_category || null, subslot_defaults || null, port_config || null
       );
       res.status(201).json({ id: r.lastInsertRowid });
     }
@@ -148,13 +171,13 @@ router.post('/module-templates/bulk-upsert', (req, res) => {
 
     const insSql = db.prepare(`INSERT INTO hw_module_templates
       (order_no, display_name, family, signal_type, channel_count, input_bytes, output_bytes,
-       in_addr_fmt, out_addr_fmt, param_template, version, gsdml_file, dap_id, hw_category)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+       in_addr_fmt, out_addr_fmt, param_template, version, gsdml_file, dap_id, hw_category, subslot_defaults, port_config)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
 
     const updSql = db.prepare(`UPDATE hw_module_templates SET
       display_name=?, family=?, signal_type=?, channel_count=?,
       input_bytes=?, output_bytes=?, in_addr_fmt=?, out_addr_fmt=?,
-      param_template=?, version=?, gsdml_file=?, dap_id=?, hw_category=?
+      param_template=?, version=?, gsdml_file=?, dap_id=?, hw_category=?, subslot_defaults=?, port_config=?
       WHERE order_no=?`);
 
     const upsert = db.transaction((devices) => {
@@ -167,7 +190,7 @@ router.post('/module-templates/bulk-upsert', (req, res) => {
           d.display_name, d.family, d.signal_type || null, d.channel_count || 0,
           d.input_bytes || 0, d.output_bytes || 0, d.in_addr_fmt || null, d.out_addr_fmt || null,
           d.param_template || null, d.version || null, d.gsdml_file || null, d.dap_id || null,
-          d.hw_category || null,
+          d.hw_category || null, d.subslot_defaults || null, d.port_config || null,
         ];
 
         if (existing) {
@@ -365,7 +388,7 @@ router.get('/imports/:id/stations', (req, res) => {
 
     const signals = db.prepare(
       `SELECT station_address, station_name, ip_address, router_address, slot, module_order_no, module_name,
-              subsystem_no, pip_no, potential_group, COUNT(*) AS signal_count
+              subsystem_no, pip_no, potential_group, pa_profile, COUNT(*) AS signal_count
        FROM hw_signals
        WHERE hw_import_id=? AND module_order_no != 'PLACEHOLDER'
        GROUP BY station_address, slot, module_order_no
@@ -377,6 +400,20 @@ router.get('/imports/:id/stations', (req, res) => {
               MAX(COALESCE(approved,0)) AS approved
        FROM hw_signals WHERE hw_import_id=? GROUP BY station_address ORDER BY station_address`
     ).all(importId);
+
+    // Load per-subslot profiles
+    const subslotRows = db.prepare(
+      `SELECT station_address, slot, subslot_no, pa_profile
+       FROM hw_slot_subslots WHERE hw_import_id=? ORDER BY station_address, slot, subslot_no`
+    ).all(importId);
+
+    // Build subslot map: Map<"addr:slot", [{subslotNo, paProfile}]>
+    const subslotMap = new Map();
+    for (const r of subslotRows) {
+      const key = `${r.station_address}:${r.slot}`;
+      if (!subslotMap.has(key)) subslotMap.set(key, []);
+      subslotMap.get(key).push({ subslotNo: r.subslot_no, paProfile: r.pa_profile || null });
+    }
 
     const stationMap = new Map();
     for (const r of allAddrs) {
@@ -399,6 +436,8 @@ router.get('/imports/:id/stations', (req, res) => {
         signalCount:    row.signal_count,
         pipNo:          row.pip_no != null ? row.pip_no : null,
         potentialGroup: row.potential_group != null ? row.potential_group : null,
+        paProfile:      row.pa_profile != null ? row.pa_profile : null,
+        subslots:       subslotMap.get(`${row.station_address}:${row.slot}`) || [],
       });
     }
 
@@ -416,7 +455,7 @@ router.get('/imports/:id/preview-addresses', (req, res) => {
 
     const signals = db.prepare(
       `SELECT station_address, station_name, ip_address, router_address, subsystem_no,
-              slot, module_order_no, pip_no
+              slot, module_order_no, pip_no, pa_profile
        FROM hw_signals
        WHERE hw_import_id=? AND module_order_no != 'PLACEHOLDER'
        ORDER BY station_address, slot`
@@ -424,6 +463,17 @@ router.get('/imports/:id/preview-addresses', (req, res) => {
 
     const tplRows    = db.prepare('SELECT * FROM hw_module_templates').all();
     const templateMap = new Map(tplRows.map(t => [t.order_no, t]));
+
+    // Load per-subslot PA profile assignments
+    const subslotRows = db.prepare(
+      'SELECT station_address, slot, subslot_no, pa_profile FROM hw_slot_subslots WHERE hw_import_id=? ORDER BY station_address, slot, subslot_no'
+    ).all(importId);
+    const subslotMap = new Map();
+    for (const r of subslotRows) {
+      const key = `${r.station_address}:${r.slot}`;
+      if (!subslotMap.has(key)) subslotMap.set(key, []);
+      subslotMap.get(key).push({ subslotNo: r.subslot_no, paProfile: r.pa_profile || null });
+    }
 
     const stations = new Map();
     for (const sig of signals) {
@@ -435,6 +485,8 @@ router.get('/imports/:id/preview-addresses', (req, res) => {
       if (!stations.get(addr).slots.has(sig.slot)) {
         stations.get(addr).slots.set(sig.slot, {
           slot: sig.slot, orderNo: sig.module_order_no, pipNo: sig.pip_no != null ? sig.pip_no : null,
+          paProfile: sig.pa_profile || null,
+          subslots: subslotMap.get(`${addr}:${sig.slot}`) || [],
           channels: [],
         });
       }
@@ -449,12 +501,16 @@ router.get('/imports/:id/preview-addresses', (req, res) => {
 
     allocateAddresses(stations, templateMap, maxIn, maxOut);
 
-    // Return flat map: { "<stationAddr>:<slot>": { inputAddr, outputAddr } }
+    // Return flat map: { "<stationAddr>:<slot>": { inputAddr, outputAddr, subslotAddrs? } }
     const result = {};
     for (const [stAddr, station] of stations) {
       for (const [slotNo, slot] of station.slots) {
         if (slot.inputAddr != null || slot.outputAddr != null) {
-          result[`${stAddr}:${slotNo}`] = { inputAddr: slot.inputAddr, outputAddr: slot.outputAddr };
+          result[`${stAddr}:${slotNo}`] = {
+            inputAddr:    slot.inputAddr,
+            outputAddr:   slot.outputAddr,
+            subslotAddrs: slot.subslotAddrs || null,
+          };
         }
       }
     }
@@ -538,6 +594,8 @@ router.patch('/imports/:id/stations/:addr', (req, res) => {
 
     vals.push(importId, addr);
     db.prepare(`UPDATE hw_signals SET ${sets.join(', ')} WHERE hw_import_id=? AND station_address=?`).run(...vals);
+    // Invalidate cached generated CFG so next download reflects the updated values
+    db.prepare('DELETE FROM hw_generated_cfgs WHERE hw_import_id=?').run(importId);
     res.json({ ok: true });
   } catch (e) { err(res, 500, e.message); }
 });
@@ -561,6 +619,7 @@ router.patch('/imports/:id/stations/:addr/slots/:slot', (req, res) => {
     db.prepare(
       `UPDATE hw_signals SET ${sets.join(', ')} WHERE hw_import_id=? AND station_address=? AND slot=?`
     ).run(...vals);
+    db.prepare('DELETE FROM hw_generated_cfgs WHERE hw_import_id=?').run(importId);
     res.json({ ok: true });
   } catch (e) { err(res, 500, e.message); }
 });
@@ -599,6 +658,52 @@ router.patch('/imports/:id/stations/:addr/slots/:slot/pip', (req, res) => {
   } catch (e) { err(res, 500, e.message); }
 });
 
+// PATCH /imports/:id/stations/:addr/slots/:slot/pa-profile — set PA subslot-1 profile for a CFU_PA device slot
+router.patch('/imports/:id/stations/:addr/slots/:slot/pa-profile', (req, res) => {
+  try {
+    const db       = getDb();
+    const importId = parseInt(req.params.id,   10);
+    const addr     = parseInt(req.params.addr, 10);
+    const slot     = parseInt(req.params.slot, 10);
+    const { paProfile } = req.body;
+
+    // Validate against catalogue: must be a known subslot template in the same CFU_PA family
+    const known = db.prepare(
+      "SELECT order_no FROM hw_module_templates WHERE order_no=? AND hw_category='subslot' AND family='CFU_PA'"
+    ).get(paProfile);
+    const val = (paProfile && known) ? paProfile : null;
+    db.prepare(
+      'UPDATE hw_signals SET pa_profile=? WHERE hw_import_id=? AND station_address=? AND slot=?'
+    ).run(val, importId, addr, slot);
+    res.json({ ok: true });
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// PATCH /imports/:id/stations/:addr/slots/:slot/subslots/:ssNo/pa-profile — set per-subslot PA profile
+router.patch('/imports/:id/stations/:addr/slots/:slot/subslots/:ssNo/pa-profile', (req, res) => {
+  try {
+    const db       = getDb();
+    const importId = parseInt(req.params.id,   10);
+    const addr     = parseInt(req.params.addr, 10);
+    const slot     = parseInt(req.params.slot, 10);
+    const ssNo     = parseInt(req.params.ssNo, 10);
+    const { paProfile } = req.body;
+
+    const known = paProfile
+      ? db.prepare("SELECT order_no FROM hw_module_templates WHERE order_no=? AND hw_category='subslot' AND family='CFU_PA'").get(paProfile)
+      : null;
+    const val = (paProfile && known) ? paProfile : null;
+
+    db.prepare(
+      `INSERT INTO hw_slot_subslots (hw_import_id, station_address, slot, subslot_no, pa_profile)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(hw_import_id, station_address, slot, subslot_no) DO UPDATE SET pa_profile=excluded.pa_profile`
+    ).run(importId, addr, slot, ssNo, val);
+
+    res.json({ ok: true });
+  } catch (e) { err(res, 500, e.message); }
+});
+
 // ── Manual station / slot management ─────────────────────────────────────────
 
 // POST /imports/:id/stations — add a station manually
@@ -622,26 +727,29 @@ router.post('/imports/:id/stations', (req, res) => {
     const stationName = name || `Station_${addr}`;
     const subsysNo    = subsystemNo ?? 100;
 
-    // Look up the IM template to detect CFU_PA family
+    // Look up the IM template to detect family-specific auto-slots
     const imTpl = db.prepare('SELECT family FROM hw_module_templates WHERE order_no=?').get(imOrderNo);
-    const isCfuPa = imTpl && imTpl.family === 'CFU_PA';
+    const isCfuPa   = imTpl && imTpl.family === 'CFU_PA';
+    const isScalance = imTpl && imTpl.family === 'Scalance';
 
     const insSignal = db.prepare(`INSERT INTO hw_signals
       (hw_import_id, station_address, station_name, ip_address, slot, module_order_no, module_name, subsystem_no)
       VALUES (?,?,?,?,?,?,?,?)`);
 
     const insertStation = db.transaction(() => {
-      // Slot 0 = Interface Module (IM) — defines the station type
+      // Slot 0 = station head — always inserted (holds IP, name, subsystem)
       insSignal.run(importId, addr, stationName, ip || null, 0, imOrderNo, imName || imOrderNo, subsysNo);
 
       if (isCfuPa) {
-        // Slot 1 — DIQ8 (always present on CFU_PA, digital DI+DQ for the field termination unit)
+        // Slot 1 — DIQ8 (always present on CFU_PA)
         insSignal.run(importId, addr, stationName, ip || null, 1,
           '_S7H_HSP_CFU_PA_V2_0_DI8_DQ8_CT', 'DIQ8 DC24V/0.5A', subsysNo);
-        // Slot 2 — PA Master (always present on CFU_PA, AUTOCREATED infrastructure block)
+        // Slot 2 — PA Master (always present on CFU_PA, AUTOCREATED)
         insSignal.run(importId, addr, stationName, ip || null, 2,
           '_S7H_HSP_CFU_PA_V2_0_PA_MASTER_CT', 'PROFIBUS PA Master', subsysNo);
       }
+      // Scalance: only slot 0 (the device head). Ports are AUTOCREATED subslots under slot 0,
+      // derived from port_config on the template at generation time — no separate hw_signals rows.
     });
     insertStation();
 
@@ -685,6 +793,15 @@ router.post('/imports/:id/stations/:addr/copy', (req, res) => {
        slot, channel, module_order_no, module_name, tag, description, signal_type, subsystem_no, router_address, potential_group)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
 
+    const srcSubslots = db.prepare(
+      'SELECT slot, subslot_no, pa_profile FROM hw_slot_subslots WHERE hw_import_id=? AND station_address=?'
+    ).all(importId, srcAddr);
+
+    const insSubslot = db.prepare(
+      `INSERT OR IGNORE INTO hw_slot_subslots (hw_import_id, station_address, slot, subslot_no, pa_profile)
+       VALUES (?, ?, ?, ?, ?)`
+    );
+
     const copy = db.transaction(() => {
       for (const r of srcRows) {
         ins.run(
@@ -692,6 +809,9 @@ router.post('/imports/:id/stations/:addr/copy', (req, res) => {
           r.slot, r.channel, r.module_order_no, r.module_name,
           r.tag, r.description, r.signal_type, r.subsystem_no, r.router_address, r.potential_group ?? null
         );
+      }
+      for (const r of srcSubslots) {
+        insSubslot.run(importId, newAddr, r.slot, r.subslot_no, r.pa_profile);
       }
     });
     copy();
@@ -707,6 +827,7 @@ router.delete('/imports/:id/stations/:addr', (req, res) => {
     const importId = parseInt(req.params.id,   10);
     const addr     = parseInt(req.params.addr, 10);
     db.prepare('DELETE FROM hw_signals WHERE hw_import_id=? AND station_address=?').run(importId, addr);
+    db.prepare('DELETE FROM hw_slot_subslots WHERE hw_import_id=? AND station_address=?').run(importId, addr);
     res.json({ ok: true });
   } catch (e) { err(res, 500, e.message); }
 });
@@ -787,6 +908,7 @@ router.delete('/imports/:id/stations/:addr/slots/:slot', (req, res) => {
     const addr     = parseInt(req.params.addr, 10);
     const slot     = parseInt(req.params.slot, 10);
     db.prepare('DELETE FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=?').run(importId, addr, slot);
+    db.prepare('DELETE FROM hw_slot_subslots WHERE hw_import_id=? AND station_address=? AND slot=?').run(importId, addr, slot);
     res.json({ ok: true });
   } catch (e) { err(res, 500, e.message); }
 });
@@ -823,14 +945,22 @@ router.get('/imports/:id/stations/:addr/slots/:slot/channels', (req, res) => {
     }
 
     // Build a full channel list: existing rows + empty placeholders for gaps.
-    // For MIXED slots (DIQ8): channels 0..(half-1) are DI, channels half..(count-1) are DO.
+    // MIXED (DIQ8): channels 0..(half-1) are DI, channels half..(count-1) are DO.
+    // PA slots with channel_count > 1: each channel is one PA function subslot.
     const isMixed = slotSignalType === 'MIXED';
     const halfCount = isMixed ? Math.floor(channelCount / 2) : 0;
     const byChannel = new Map(existing.map(r => [r.channel, r]));
     const channels = [];
     for (let ch = 0; ch < channelCount; ch++) {
       const row = byChannel.get(ch);
-      const defaultType = isMixed ? (ch < halfCount ? 'DI' : 'DO') : null;
+      let defaultType;
+      if (isMixed) {
+        defaultType = ch < halfCount ? 'DI' : 'DO';
+      } else if (slotSignalType === 'PA' || slotSignalType === 'AI' || slotSignalType === 'AO') {
+        defaultType = slotSignalType;
+      } else {
+        defaultType = null;
+      }
       channels.push({
         channel:     ch,
         id:          row ? row.id          : null,
@@ -925,6 +1055,17 @@ router.post('/imports/:id/generate', async (req, res) => {
     const signals = db.prepare(signalQuery).all(...queryParams);
     if (signals.length === 0) return err(res, 400, 'No signals or modules configured — add modules in Configuration');
 
+    // Load per-subslot profiles for all stations in this import
+    const subslotRows = db.prepare(
+      'SELECT station_address, slot, subslot_no, pa_profile FROM hw_slot_subslots WHERE hw_import_id=? ORDER BY station_address, slot, subslot_no'
+    ).all(importId);
+    const subslotMap = new Map();
+    for (const r of subslotRows) {
+      const key = `${r.station_address}:${r.slot}`;
+      if (!subslotMap.has(key)) subslotMap.set(key, []);
+      subslotMap.get(key).push({ subslotNo: r.subslot_no, paProfile: r.pa_profile || null });
+    }
+
     const stations = new Map();
     for (const sig of signals) {
       const addr = sig.station_address;
@@ -949,6 +1090,8 @@ router.post('/imports/:id/generate', async (req, res) => {
           name:           sig.module_name,
           pipNo:          sig.pip_no != null ? sig.pip_no : null,
           potentialGroup: sig.potential_group != null ? sig.potential_group : null,
+          paProfile:      sig.pa_profile || null,
+          subslots:       subslotMap.get(`${addr}:${sig.slot}`) || [],
           channels:       [],
         });
       }
@@ -1002,6 +1145,45 @@ router.get('/imports/:id/cfgs/:cfgId/download', (req, res) => {
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="HW_Config_${cfgId}.cfg"`);
     res.send(row.cfg_text);
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// ── Slot ↔ Subslot compatibility ─────────────────────────────────────────────
+
+// GET /slot-compat
+// Returns all rows: [{ id, slot_order_no, subslot_order_no, is_default }]
+router.get('/slot-compat', (req, res) => {
+  try {
+    const db = getDb();
+    const rows = db.prepare('SELECT id, slot_order_no, subslot_order_no, is_default FROM hw_slot_subslot_compat ORDER BY slot_order_no, subslot_order_no').all();
+    res.json(rows);
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// POST /slot-compat
+// Body: { slot_order_no, subslot_order_no, is_default? }
+router.post('/slot-compat', (req, res) => {
+  try {
+    const db = getDb();
+    const { slot_order_no, subslot_order_no, is_default = 0 } = req.body;
+    if (!slot_order_no || !subslot_order_no) return err(res, 400, 'slot_order_no and subslot_order_no required');
+    const r = db.prepare(
+      'INSERT OR IGNORE INTO hw_slot_subslot_compat (slot_order_no, subslot_order_no, is_default) VALUES (?,?,?)'
+    ).run(slot_order_no, subslot_order_no, is_default ? 1 : 0);
+    res.status(201).json({ id: r.lastInsertRowid, inserted: r.changes > 0 });
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// DELETE /slot-compat
+// Body: { slot_order_no, subslot_order_no }
+router.delete('/slot-compat', (req, res) => {
+  try {
+    const db = getDb();
+    const { slot_order_no, subslot_order_no } = req.body;
+    if (!slot_order_no || !subslot_order_no) return err(res, 400, 'slot_order_no and subslot_order_no required');
+    db.prepare('DELETE FROM hw_slot_subslot_compat WHERE slot_order_no=? AND subslot_order_no=?')
+      .run(slot_order_no, subslot_order_no);
+    res.json({ ok: true });
   } catch (e) { err(res, 500, e.message); }
 });
 

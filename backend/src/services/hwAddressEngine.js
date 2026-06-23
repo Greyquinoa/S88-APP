@@ -36,6 +36,7 @@ function isAnalog(tpl) {
  */
 const PA_GSD_FALLBACK_BYTES = 5;
 
+
 /**
  * Allocate process image byte addresses for all new stations, replicating PCS7's
  * sequential packing strategy. Allocation is GLOBAL across the entire import —
@@ -95,33 +96,63 @@ function allocateAddresses(stations, templateMap, baseInput, baseOutput) {
       let inFmt    = null;
       let outFmt   = null;
 
-      if (tpl) {
-        inBytes  = tpl.input_bytes  || 0;
-        outBytes = tpl.output_bytes || 0;
+      if (tpl && tpl.signal_type === 'PA' && (tpl.input_bytes || 0) === 0 && isGsdPaPath(slot.orderNo)) {
+        // GSD-referenced PA device slot (META\...): bytes come from per-subslot profile assignments.
+        // Each function subslot (1..channel_count) gets its own address block.
+        const funcCount = (tpl.channel_count || 0) > 0 ? tpl.channel_count : 1;
+        const ssMap = new Map((slot.subslots || []).map(ss => [ss.subslotNo, ss.paProfile]));
+        analog = true;
+        slot.subslotAddrs = [];
+        for (let ssNo = 1; ssNo <= funcCount; ssNo++) {
+          const profile  = ssMap.get(ssNo) || slot.paProfile || null;
+          const pTpl     = profile ? templateMap.get(profile) : null;
+          const ssBytes  = pTpl ? (pTpl.input_bytes || PA_GSD_FALLBACK_BYTES) : PA_GSD_FALLBACK_BYTES;
+          const ssAddr   = ptr.anaIn;
+          ptr.anaIn += ssBytes;
+          inBytes   += ssBytes;
+          slot.subslotAddrs.push({ subslotNo: ssNo, inputAddr: ssAddr, bytes: ssBytes });
+        }
+      } else if (tpl) {
+        // Standard module: multiply template bytes by channel_count for multi-channel PA slots.
+        const funcCount = (isAnalog(tpl) && tpl.signal_type !== 'MIXED' && (tpl.channel_count || 0) > 1)
+          ? tpl.channel_count : 1;
+        inBytes  = (tpl.input_bytes  || 0) * funcCount;
+        outBytes = (tpl.output_bytes || 0) * funcCount;
         analog   = isAnalog(tpl);
         inFmt    = tpl.in_addr_fmt  || null;
         outFmt   = tpl.out_addr_fmt || null;
       } else if (isGsdPaPath(slot.orderNo)) {
-        // GSD-referenced PA device: use fallback byte count, analog space.
-        inBytes = PA_GSD_FALLBACK_BYTES;
+        // GSD-referenced PA device with no catalogue template: fallback byte count.
+        if (slot.paProfile) {
+          const profileTpl = templateMap.get(slot.paProfile);
+          inBytes = profileTpl ? (profileTpl.input_bytes || PA_GSD_FALLBACK_BYTES) : PA_GSD_FALLBACK_BYTES;
+        } else {
+          inBytes = PA_GSD_FALLBACK_BYTES;
+        }
         analog  = true;
-        // addr_fmt reconstructed at generation time from slot.inputAddr
       }
 
-      if (inBytes > 0) {
-        const key = analog ? 'anaIn' : 'digIn';
-        slot.inputAddr = ptr[key];
-        ptr[key] += inBytes;                     // strict sequential, no gap
-      } else {
-        slot.inputAddr = null;
-      }
-
-      if (outBytes > 0) {
-        const key = analog ? 'anaOut' : 'digOut';
-        slot.outputAddr = ptr[key];
-        ptr[key] += outBytes;                    // strict sequential, no gap
-      } else {
+      if (slot.subslotAddrs) {
+        // Per-subslot PA: ptr already advanced inside the loop above.
+        // Slot-level inputAddr = first subslot's start address (for display / baseline tracking).
+        slot.inputAddr  = slot.subslotAddrs.length > 0 ? slot.subslotAddrs[0].inputAddr : null;
         slot.outputAddr = null;
+      } else {
+        if (inBytes > 0) {
+          const key = analog ? 'anaIn' : 'digIn';
+          slot.inputAddr = ptr[key];
+          ptr[key] += inBytes;                   // strict sequential, no gap
+        } else {
+          slot.inputAddr = null;
+        }
+
+        if (outBytes > 0) {
+          const key = analog ? 'anaOut' : 'digOut';
+          slot.outputAddr = ptr[key];
+          ptr[key] += outBytes;                  // strict sequential, no gap
+        } else {
+          slot.outputAddr = null;
+        }
       }
     }
   }
