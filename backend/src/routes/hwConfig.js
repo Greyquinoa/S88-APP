@@ -3,11 +3,12 @@
 const express = require('express');
 const multer  = require('multer');
 const { getDb } = require('../db');
-const { parseCfg }           = require('../services/cfgParser');
+const { parseCfg, parseCfgDevices } = require('../services/cfgParser');
 const { parseHwExcel }       = require('../services/hwExcelParser');
 const { allocateAddresses, findTemplate } = require('../services/hwAddressEngine');
 const { generateCfg, hexToIp } = require('../services/cfgGenerator');
 const { parseCfgForCatalogue } = require('../services/cfgCatalogueParser');
+const { parseMrpConfig } = require('../services/mrpCfgParser');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
@@ -343,6 +344,171 @@ router.post('/project/:id/upload-baseline', upload.single('baseline'), async (re
   } catch (e) { err(res, 500, e.message); }
 });
 
+// POST /api/hw-config/imports/:id/backfill-from-cfg
+// Accepts a generated CFG file upload and populates hw_signals + hw_slot_subslots
+// from its device blocks — a full round-trip import without needing an Excel sheet.
+router.post('/imports/:id/backfill-from-cfg', upload.single('cfg'), (req, res) => {
+  try {
+    const db       = getDb();
+    const importId = parseInt(req.params.id, 10);
+    const hwImport = db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
+    if (!hwImport) return err(res, 404, 'HW import not found');
+    if (!req.file)  return err(res, 400, 'No CFG file uploaded');
+
+    const cfgText = req.file.buffer.toString('utf8');
+    const devices = parseCfgDevices(cfgText);
+    if (devices.length === 0) {
+      const lines   = cfgText.split(/\r?\n/);
+      const ioLines = lines.filter(l => /IOSUBSYSTEM/.test(l)).slice(0, 3);
+      return err(res, 400, `No IO devices found in uploaded CFG. Sample IOSUBSYSTEM lines: ${JSON.stringify(ioLines)}`);
+    }
+
+    // Load template catalogue so we can resolve signal_type from order_no
+    const tplRows = db.prepare('SELECT order_no, signal_type FROM hw_module_templates').all();
+    const tplMap  = new Map(tplRows.map(t => [t.order_no, t]));
+
+    const insertSignal = db.prepare(`
+      INSERT INTO hw_signals
+        (hw_import_id, station_address, station_name, ip_address, router_address,
+         subsystem_no, slot, module_order_no, module_name, signal_type,
+         pip_no, potential_group, tag, description)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+
+    const insertSubslot = db.prepare(`
+      INSERT OR REPLACE INTO hw_slot_subslots
+        (hw_import_id, station_address, slot, subslot_no, pa_profile)
+      VALUES (?,?,?,?,?)`);
+
+    let stationCount = 0;
+    let slotCount    = 0;
+
+    db.transaction(() => {
+      // Clear existing signal rows for this import so backfill is idempotent
+      db.prepare('DELETE FROM hw_signals WHERE hw_import_id=?').run(importId);
+      db.prepare('DELETE FROM hw_slot_subslots WHERE hw_import_id=?').run(importId);
+
+      for (const dev of devices) {
+        stationCount++;
+
+        // Slot 0 = IM/interface module — insert a row so the grid can resolve
+        // Device Family and Order Number.
+        // For GSDML-based devices the header orderNo is the GSDML filename which
+        // won't match the catalogue.  Use mlfbNo (from the SLOT 0 MLFB field)
+        // as the effective key instead — it holds the real Siemens order number.
+        const slot0OrderNo = (dev.mlfbNo && !tplMap.has(dev.orderNo))
+          ? dev.mlfbNo
+          : dev.orderNo;
+        insertSignal.run(
+          importId,
+          dev.address, dev.name, dev.ip, dev.routerAddress,
+          dev.subsystemNo, 0,
+          slot0OrderNo, dev.name,
+          null, null, null, null, null,
+        );
+
+        for (const slot of dev.slots) {
+          // Server module (193-6PA00-0AA0) is auto-added by the generator on every
+          // export — skip it on import so it is never stored as a configurable slot.
+          if ((slot.orderNo || '').includes('193-6PA00-0AA0')) continue;
+
+          const tpl        = tplMap.get(slot.orderNo);
+          const signalType = tpl ? tpl.signal_type : null;
+
+          if (slot.symbols.length === 0) {
+            // No SYMBOL lines — insert one representative row for the slot
+            insertSignal.run(
+              importId,
+              dev.address, dev.name, dev.ip, dev.routerAddress,
+              dev.subsystemNo, slot.slot,
+              slot.orderNo, slot.name,
+              signalType,
+              slot.pipNo, slot.potentialGroup,
+              null, null,
+            );
+            slotCount++;
+          } else {
+            // Insert one row per SYMBOL (channel-level tag data)
+            for (const sym of slot.symbols) {
+              insertSignal.run(
+                importId,
+                dev.address, dev.name, dev.ip, dev.routerAddress,
+                dev.subsystemNo, slot.slot,
+                slot.orderNo, slot.name,
+                signalType,
+                slot.pipNo, slot.potentialGroup,
+                sym.tag || null, sym.description || null,
+              );
+            }
+            slotCount++;
+          }
+
+          // PA subslots — pass orderNo as pa_profile so CFU_PA function type round-trips
+          for (const ss of slot.subslots) {
+            insertSubslot.run(importId, dev.address, slot.slot, ss.subslotNo, ss.orderNo || null);
+          }
+        }
+      }
+    })();
+
+    // ── Also backfill MRP roles + port links if the uploaded CFG has them ────────
+    // Reuses the same parser as the standalone MRP import. Non-destructive: if the
+    // CFG has no MRP-configured devices (e.g. a plain baseline), the existing MRP
+    // config is left untouched.
+    let mrpDevices = 0;
+    try {
+      const parsed = parseCfg(cfgText);
+      const { domainName, stationName, roles, links } = parseMrpConfig(cfgText, parsed);
+      const activeRoles = roles.filter(r => r.mrpRole !== 0);
+      if (activeRoles.length > 0) {
+        const fieldbusNo = activeRoles.find(r => r.subsystemNo != null)?.subsystemNo ?? null;
+        db.transaction(() => {
+          const existing = db.prepare(
+            'SELECT id FROM mrp_configs WHERE hw_import_id=? ORDER BY id DESC LIMIT 1'
+          ).get(importId);
+          let configId;
+          if (existing) {
+            db.prepare(
+              `UPDATE mrp_configs SET domain_name=?, fieldbus_no=?, station_name=?, updated_at=datetime('now') WHERE id=?`
+            ).run(domainName, fieldbusNo, stationName || '', existing.id);
+            configId = existing.id;
+          } else {
+            configId = db.prepare(
+              'INSERT INTO mrp_configs (hw_import_id, domain_name, fieldbus_no, station_name) VALUES (?,?,?,?)'
+            ).run(importId, domainName, fieldbusNo, stationName || '').lastInsertRowid;
+          }
+
+          db.prepare('DELETE FROM mrp_device_roles WHERE mrp_config_id=?').run(configId);
+          const insRole = db.prepare(
+            'INSERT INTO mrp_device_roles (mrp_config_id, device_alias, io_address, subsystem_no, mrp_role, mrp_instances, ring_port_1, ring_port_2) VALUES (?,?,?,?,?,?,?,?)'
+          );
+          for (const r of roles) {
+            insRole.run(configId, r.alias, r.ioAddress, r.subsystemNo,
+              r.mrpRole, r.mrpRole === 3 ? 1 : 0, r.ringPort1 ?? null, r.ringPort2 ?? null);
+          }
+
+          db.prepare('DELETE FROM mrp_port_links WHERE mrp_config_id=?').run(configId);
+          const insLink = db.prepare(
+            `INSERT INTO mrp_port_links
+               (mrp_config_id, from_device, from_iface_subslot, from_port_subslot,
+                to_device, to_iface_subslot, to_port_subslot)
+             VALUES (?,?,?,?,?,?,?)`
+          );
+          for (const l of links) {
+            insLink.run(configId, l.fromDevice, l.fromIfaceSubslot, l.fromPortSubslot,
+              l.toDevice, l.toIfaceSubslot, l.toPortSubslot);
+          }
+        })();
+        mrpDevices = activeRoles.length;
+      }
+    } catch (e) {
+      // Don't fail the whole import if MRP parsing hits an edge case.
+      console.warn('[backfill-from-cfg] MRP parse skipped:', e.message);
+    }
+
+    res.json({ ok: true, stations: stationCount, slots: slotCount, mrpDevices });
+  } catch (e) { err(res, 500, e.message); }
+});
+
 // POST /api/hw-config/imports/:id/upload-iolist
 router.post('/imports/:id/upload-iolist', upload.single('iolist'), async (req, res) => {
   try {
@@ -415,8 +581,26 @@ router.get('/imports/:id/stations', (req, res) => {
       subslotMap.get(key).push({ subslotNo: r.subslot_no, paProfile: r.pa_profile || null });
     }
 
+    // Resolve orderNo + family per station from slot 0 row
+    const tplRows = db.prepare('SELECT order_no, family, display_name FROM hw_module_templates').all();
+    const tplMap  = new Map(tplRows.map(t => [t.order_no, t]));
+
+    const slot0Rows = db.prepare(
+      `SELECT station_address, module_order_no FROM hw_signals
+       WHERE hw_import_id=? AND slot=0 GROUP BY station_address`
+    ).all(importId);
+    const slot0Map = new Map();
+    for (const r of slot0Rows) {
+      const orderNo = r.module_order_no;
+      // Family comes from catalogue only — no prefix guessing
+      const tpl    = tplMap.get(orderNo);
+      const family = tpl?.family || null;
+      slot0Map.set(r.station_address, { orderNo, family });
+    }
+
     const stationMap = new Map();
     for (const r of allAddrs) {
+      const s0 = slot0Map.get(r.station_address) || {};
       stationMap.set(r.station_address, {
         address:       r.station_address,
         name:          r.station_name,
@@ -424,6 +608,8 @@ router.get('/imports/:id/stations', (req, res) => {
         routerAddress: r.router_address || null,
         subsystemNo:   r.subsystem_no,
         approved:      !!r.approved,
+        orderNo:       s0.orderNo || null,
+        family:        s0.family  || null,
         slots:         [],
       });
     }

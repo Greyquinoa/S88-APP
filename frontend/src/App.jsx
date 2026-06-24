@@ -13,6 +13,7 @@ import {
 } from "./api.js";
 import StepIOImport from "./StepIOImport.jsx";
 import StepHWConfig from "./StepHWConfig.jsx";
+import InstancesGrid from "./InstancesGrid.tsx";
 
 const STEPS = ["Projects", "IO Import", "Library", "Unit Types", "Hierarchy", "Instances", "HW Config", "Generate"];
 const DEFAULT_ON_OPTIONAL = ["MV_Rate"];
@@ -2977,14 +2978,8 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
   });
   const showRolePane = libType === "EquipmentModule" || libType === "EquipmentPhase";
 
-  // Detect duplicate instance names across ALL instances (not just this tab)
-  const nameCounts = {};
-  for (const i of instances) { nameCounts[i.instanceName] = (nameCounts[i.instanceName] || 0) + 1; }
-  const duplicateNames = new Set(Object.keys(nameCounts).filter(n => nameCounts[n] > 1));
   const selectedInst = showRolePane ? tabInstances.find(i => i.id === selectedId) : null;
   const selectedProfile = selectedInst ? cmtProfiles.find(p => p.id === selectedInst.profileId) : null;
-  const colHeader = "32px 32px 160px 1fr 80px 110px 1fr 32px";
-  const HEADERS   = ["#", "", "Type", "Instance Name", "Sample ms", "User Project", "Folder", ""];
 
   // Auto-select first row when list changes and nothing is selected
   useEffect(() => {
@@ -3008,56 +3003,21 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
 
   return (
     <div style={{ display: "flex", flex: 1, overflow: "hidden", minHeight: 0 }}>
-      {/* List pane */}
+      {/* List pane — AG Grid */}
       <div style={{ flex: showRolePane ? "0 0 62%" : 1, display: "flex", flexDirection: "column",
           borderRight: showRolePane ? "0.5px solid var(--color-border-tertiary)" : "none", overflow: "hidden" }}>
-        {/* Duplicate name warning */}
-        {duplicateNames.size > 0 && (
-          <div style={{ padding: "6px 10px", background: "#FEF3C7", borderBottom: "0.5px solid #FCD34D",
-              fontSize: 11, color: "#92400E", flexShrink: 0, display: "flex", alignItems: "center", gap: 6 }}>
-            <i className="ti ti-alert-triangle" />
-            Duplicate instance names detected: {[...duplicateNames].join(", ")} — each instance name must be unique.
-          </div>
-        )}
-
-        {/* Column headers */}
-        <div style={{ display: "grid", gridTemplateColumns: colHeader,
-            padding: "5px 10px", gap: 4, background: "var(--color-background-secondary)",
-            borderBottom: "0.5px solid var(--color-border-tertiary)", flexShrink: 0 }}>
-          {HEADERS.map((h, i) => (
-            <div key={i} style={{ fontSize: 10, color: "var(--color-text-secondary)", fontWeight: 500,
-                textTransform: "uppercase", letterSpacing: "0.04em" }}>{h}</div>
-          ))}
-        </div>
-
-        {/* Rows */}
-        <div style={{ overflowY: "auto", flex: 1 }}>
-          {tabInstances.length === 0 ? (
-            <div style={{ padding: "2rem", textAlign: "center", color: "var(--color-text-secondary)", fontSize: 12,
-                border: "1.5px dashed var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)",
-                margin: "1rem" }}>
-              No {label} instances yet — click Add below
-            </div>
-          ) : tabInstances.map((inst, idx) => {
-            const profile = cmtProfiles.find(p => p.id === inst.profileId);
-            return (
-              <InstanceRow key={inst.id} inst={inst} idx={idx} total={tabInstances.length}
-                profile={profile} cmtProfiles={cmtProfiles} userProjects={userProjects}
-                folderOptions={folderOptions} hasHierarchy={hasHierarchy}
-                updateInstance={updateInstance} removeInstance={removeInstance}
-                isSelected={inst.id === selectedId}
-                isDuplicateName={duplicateNames.has(inst.instanceName)}
-                onSelect={id => setSelectedId(id === selectedId ? null : id)} />
-            );
-          })}
-        </div>
-
-        {/* Add button */}
-        <div style={{ padding: "8px 10px", borderTop: "0.5px solid var(--color-border-tertiary)", flexShrink: 0 }}>
-          <Btn onClick={() => addInstance(libType)}>
-            <i className="ti ti-plus" /> Add {label} instance
-          </Btn>
-        </div>
+        <InstancesGrid
+          libType={libType}
+          rowData={tabInstances}
+          cmtProfiles={cmtProfiles}
+          userProjects={userProjects}
+          folderOptions={folderOptions}
+          onRowUpdate={(id, field, value) => updateInstance(id, field, value)}
+          onRowDelete={(id) => removeInstance(id)}
+          onRowAdd={() => addInstance(libType)}
+          onRowSelect={showRolePane ? (id) => setSelectedId(id === selectedId ? null : id) : undefined}
+          selectedId={selectedId}
+        />
       </div>
 
       {/* Role panel — only for EM / EPH */}

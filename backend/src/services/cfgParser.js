@@ -314,4 +314,196 @@ function collectBlock(lines, startLine) {
   return { text: collected.join('\n'), nextLine: i };
 }
 
-module.exports = { parseCfg };
+// ─────────────────────────────────────────────────────────────────────────────
+// parseCfgDevices — extract every IO device from a CFG file into a structured
+// list that can be written directly into hw_signals + hw_slot_subslots.
+//
+// Returns an array of station objects:
+// [
+//   {
+//     subsystemNo:   number,       // IOSUBSYSTEM number (100, 101, …)
+//     address:       number,       // IOADDRESS
+//     name:          string,       // device name from header line
+//     orderNo:       string,       // module order number (version prefix stripped)
+//     ip:            string|null,  // hex→dotted from IPADDRESS in SLOT 0 block
+//     routerAddress: string|null,
+//     slots: [
+//       {
+//         slot:           number,
+//         orderNo:        string,
+//         name:           string,
+//         pipNo:          number|null,   // 5th field of ADDRESS line (0 = unassigned)
+//         potentialGroup: string|null,   // POTENTIAL_GROUP value
+//         symbols: [{ channel: number, tag: string, description: string }],
+//         subslots: [{ subslotNo: number, orderNo: string, name: string }],
+//       }
+//     ]
+//   }
+// ]
+//
+// Slots 0 (IM interface) and its auto-created sub-slots (port/iface) are skipped
+// because they are not stored as hw_signals rows — only functional module slots
+// (slot ≥ 1) are included.
+// ─────────────────────────────────────────────────────────────────────────────
+function parseCfgDevices(text) {
+  const lines = text.split(/\r?\n/);
+  const stations = new Map(); // addr → station object
+
+  // Regex for device header lines:
+  //   IOSUBSYSTEM <no>, IOADDRESS <addr>, "orderNo" ["ver"], "name"
+  //   IOSUBSYSTEM <no>, IOADDRESS <addr>, SLOT <s>, "orderNo" ["ver"], "name"
+  //   IOSUBSYSTEM <no>, IOADDRESS <addr>, SLOT <s>, SUBSLOT <ss>, "orderNo" ["ver"], "name"
+  const devRe    = /^IOSUBSYSTEM\s+(\d+),\s*IOADDRESS\s+(\d+),\s*"([^"]+)"(?:\s+"[^"]*")?,\s*"([^"]+)"/;
+  const slotRe   = /^IOSUBSYSTEM\s+(\d+),\s*IOADDRESS\s+(\d+),\s*SLOT\s+(\d+),\s*"([^"]+)"(?:\s+"[^"]*")?,\s*"([^"]+)"/;
+  const subslotRe= /^IOSUBSYSTEM\s+(\d+),\s*IOADDRESS\s+(\d+),\s*SLOT\s+(\d+),\s*SUBSLOT\s+(\d+),\s*"([^"]+)"(?:\s+"[^"]*")?,\s*"([^"]+)"/;
+
+  // Strip version prefix from order number: "V1_1:6ES7 193-6PA00-0AA0" → "6ES7 193-6PA00-0AA0"
+  // Also handle "DEFAULT:..." form used for port/iface subslots
+  const stripVersion = (raw) => raw.replace(/^[A-Za-z0-9_]+:/, '');
+
+  let i = 0;
+
+  // Skip everything before the first device IOSUBSYSTEM line
+  while (i < lines.length) {
+    const l = lines[i].trimEnd();
+    if (/^IOSUBSYSTEM\s+\d+,\s*IOADDRESS\s+\d+/.test(l)) break;
+    i++;
+  }
+
+  while (i < lines.length) {
+    const l = lines[i].trimEnd();
+
+    // ── Sub-slot line ──────────────────────────────────────────────────────
+    const ssm = l.match(subslotRe);
+    if (ssm) {
+      const [, , addr, slotNo, subslotNo, rawOrder, name] = ssm;
+      const addrN   = parseInt(addr, 10);
+      const slotN   = parseInt(slotNo, 10);
+      const subN    = parseInt(subslotNo, 10);
+      const orderNo = stripVersion(rawOrder);
+      // Skip DEFAULT: port/iface subslots (they are AUTOCREATED infrastructure)
+      const isPort = /DEFAULT:/i.test(rawOrder) || /^_S7H_/.test(rawOrder);
+      if (!isPort) {
+        const st   = stations.get(addrN);
+        const slot = st && st.slots.find(s => s.slot === slotN);
+        if (slot) {
+          slot.subslots.push({ subslotNo: subN, orderNo, name });
+        }
+      }
+      // Collect the block to extract IP from slot 0 subslot 0/1
+      const block = collectBlock(lines, i);
+      // Extract IP from slot 0 IPADDRESS field (hex string)
+      if (slotN === 0) {
+        const ipM = block.text.match(/\bIPADDRESS\s+"([0-9A-Fa-f]{8})"/);
+        const rtM = block.text.match(/\bROUTERADDRESS\s+"([0-9A-Fa-f]{8})"/);
+        const st  = stations.get(addrN);
+        if (st) {
+          if (ipM && !st.ip) {
+            st.ip = hexToIp(ipM[1]);
+          }
+          if (rtM && !st.routerAddress) {
+            st.routerAddress = hexToIp(rtM[1]);
+          }
+        }
+      }
+      i = block.nextLine;
+      continue;
+    }
+
+    // ── Slot line ──────────────────────────────────────────────────────────
+    const sm = l.match(slotRe);
+    if (sm) {
+      const [, , addr, slotNo, rawOrder, name] = sm;
+      const addrN   = parseInt(addr, 10);
+      const slotN   = parseInt(slotNo, 10);
+      const orderNo = stripVersion(rawOrder);
+
+      // Collect the block to extract pip, potentialGroup, symbols
+      const block = collectBlock(lines, i);
+      i = block.nextLine;
+
+      // Slot 0 = IM/interface module — extract IP + MLFB then skip (not a hw_signals row)
+      if (slotN === 0) {
+        const ipM = block.text.match(/\bIPADDRESS\s+"([0-9A-Fa-f]{8})"/);
+        const rtM = block.text.match(/\bROUTERADDRESS\s+"([0-9A-Fa-f]{8})"/);
+        const mlM = block.text.match(/\bMLFB\s+"([^"]+)"/);
+        const st  = stations.get(addrN);
+        if (st) {
+          if (ipM && !st.ip)            st.ip            = hexToIp(ipM[1]);
+          if (rtM && !st.routerAddress) st.routerAddress = hexToIp(rtM[1]);
+          if (mlM && !st.mlfbNo)        st.mlfbNo        = mlM[1].trim();
+        }
+        continue;
+      }
+
+      const st = stations.get(addrN);
+      if (!st) continue;
+
+      // PIP: 5th field (index 4) of ADDRESS line  → "start, bit, length, subidx, pip, flag"
+      let pipNo = null;
+      const addrLineM = block.text.match(/\bADDRESS\s+\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*(\d+)/);
+      if (addrLineM) {
+        const p = parseInt(addrLineM[1], 10);
+        if (p > 0) pipNo = p;
+      }
+
+      // POTENTIAL_GROUP
+      let potentialGroup = null;
+      const pgM = block.text.match(/\bPOTENTIAL_GROUP\s*,\s*"([^"]*)"/);
+      if (pgM && pgM[1]) potentialGroup = pgM[1];
+
+      // SYMBOL lines: SYMBOL  I/Q/... , <byte_offset>, "tag", "description"
+      const symbols = [];
+      const symRe = /^SYMBOL\s+\S+\s*,\s*(\d+)\s*,\s*"([^"]*)"\s*,\s*"([^"]*)"/gm;
+      for (const sm2 of block.text.matchAll(symRe)) {
+        symbols.push({
+          channel:     parseInt(sm2[1], 10),
+          tag:         sm2[2],
+          description: sm2[3],
+        });
+      }
+
+      st.slots.push({ slot: slotN, orderNo, name, pipNo, potentialGroup, symbols, subslots: [] });
+      continue;
+    }
+
+    // ── Device header line ─────────────────────────────────────────────────
+    const dm = l.match(devRe);
+    if (dm) {
+      const [, subsysNo, addr, rawOrder, name] = dm;
+      const addrN     = parseInt(addr, 10);
+      const subsysN   = parseInt(subsysNo, 10);
+      // Do NOT strip the version prefix here — for CFU_PA/GSDML devices the
+      // prefix (e.g. "V_2_0_PA:") is part of the catalogue order_no key.
+      // Regular ET200SP device headers never carry a prefix, so no change there.
+      const orderNo   = rawOrder;
+
+      if (!stations.has(addrN)) {
+        stations.set(addrN, {
+          subsystemNo:   subsysN,
+          address:       addrN,
+          name,
+          orderNo,
+          ip:            null,
+          routerAddress: null,
+          mlfbNo:        null,   // filled from SLOT 0 MLFB field (GSDML devices)
+          slots:         [],
+        });
+      }
+      // Collect and skip the device-level block (no useful data for hw_signals at this level)
+      const block = collectBlock(lines, i);
+      i = block.nextLine;
+      continue;
+    }
+
+    i++;
+  }
+
+  return [...stations.values()];
+}
+
+function hexToIp(hex) {
+  return [0, 2, 4, 6].map(i => parseInt(hex.slice(i, i + 2), 16)).join('.');
+}
+
+module.exports = { parseCfg, parseCfgDevices };

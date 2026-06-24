@@ -3,6 +3,7 @@ import MRPTopologyView from "./MRPTopologyView.jsx";
 import {
   listHwImports, uploadHwBaseline, uploadHwIoList,
   getHwStations, getHwAddressPreview, generateHwCfg, listHwCfgs, hwCfgDownloadUrl,
+  backfillFromCfg,
   updateHwStation, updateHwSlot,
   listHwModuleTemplates,
   addHwStation, deleteHwStation, addHwSlot, deleteHwSlot,
@@ -19,6 +20,7 @@ import {
 } from "./api.js";
 
 import StepController from "./StepController.jsx";
+import HwConfigGrid from "./HwConfigGrid.tsx";
 
 
 export default function StepHWConfig({ projectId }) {
@@ -63,8 +65,9 @@ export default function StepHWConfig({ projectId }) {
   // Signal types — loaded from DB; user-extensible
   const [sigTypes, setSigTypes] = useState([]);
 
-  const baselineRef = useRef();
-  const ioListRef   = useRef();
+  const baselineRef     = useRef();
+  const ioListRef       = useRef();
+  const cfgBackfillRef  = useRef();
 
   useEffect(() => {
     listHwModuleTemplates().then(setTemplates).catch(() => {});
@@ -149,6 +152,22 @@ export default function StepHWConfig({ projectId }) {
       await loadCfgs(importId);
       setHwTab("config");
     } catch (err) { setError(err.message); }
+    finally { setLoading(""); }
+  }
+
+  async function handleBackfillFromCfg(file) {
+    if (!importId) { setError("Upload a baseline CFG first."); return; }
+    if (!file)     { setError("No CFG file selected."); return; }
+    setLoading("Reading device data from CFG…");
+    setError("");
+    try {
+      const result = await backfillFromCfg(importId, file);
+      setIoListOk(true);
+      setIoListInfo({ stationCount: result.stations, signalCount: result.slots });
+      await loadStations(importId);
+      await loadCfgs(importId);
+      setHwTab("config");
+    } catch (e) { setError(e.message); }
     finally { setLoading(""); }
   }
 
@@ -475,6 +494,17 @@ export default function StepHWConfig({ projectId }) {
               if (!importId) { setError("Upload a baseline CFG first."); return; }
               ioListRef.current.click();
             }}
+            cfgBackfillRef={cfgBackfillRef}
+            onBackfillFromCfg={() => {
+              if (!importId) { setError("Upload a baseline CFG first."); return; }
+              cfgBackfillRef.current.value = "";
+              cfgBackfillRef.current.click();
+            }}
+            onCfgBackfillChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) handleBackfillFromCfg(file);
+            }}
+            loading={loading}
           />
         )}
 
@@ -588,6 +618,7 @@ export default function StepHWConfig({ projectId }) {
                 onToggleSelect={toggleSelectStation}
                 onToggleSelectAll={toggleSelectAll}
                 onClearSelection={() => setSelectedAddrs(new Set())}
+                onSetSelectedAddrs={setSelectedAddrs}
                 onSetNewStation={setNewStation}
                 onStartAddStation={() => {
                   if (!importId) { setError("Upload a baseline CFG first."); return; }
@@ -1159,13 +1190,8 @@ function MrpPanel({ importId, fieldbuses, stations, controllers, templates }) {
       if (cfg) {
         setDomainName(cfg.domain_name || "mrpdomain-1");
         if (cfg.fieldbus_no != null) setFieldbusNo(cfg.fieldbus_no);
-        const rMap = new Map();
-        for (const r of cfg.roles || []) {
-          rMap.set(r.device_alias, { role: r.mrp_role, mrpInstances: r.mrp_instances, ringPort1: r.ring_port_1 ?? null, ringPort2: r.ring_port_2 ?? null });
-        }
-        setRoles(rMap);
         // DB stores cfgAlias for CPU (e.g. "PN-IO-X8") and raw alias without #N for
-        // switch sub-rows (e.g. "S2"). The UI links Map is keyed by display alias
+        // switch sub-rows (e.g. "S2"). The UI keys roles AND links by display alias
         // (e.g. "AS01 (Fieldbus)") and sub-row alias (e.g. "S2#0"). Reverse-map here.
 
         // 1. CPU: cfgAlias → UI display alias (mirrors devices useMemo label logic)
@@ -1184,20 +1210,28 @@ function MrpPanel({ importId, fieldbuses, stations, controllers, templates }) {
           }
         }
 
-        // 2. Switch sub-rows: "rawAlias:portSubslot" → "rawAlias#N"
+        // 2. Switch sub-rows: "rawAlias:portSubslot" → "rawAlias#N".
+        // Built from the grid's own device list (derived from the backfilled stations)
+        // so it works even when the baseline CFG stored in the DB has no IO devices.
+        // The CFG-parser port list (pm) is merged first as a fallback for any device
+        // not yet present in the grid; grid entries override it (same key, same value).
         const portSubslotToRowAlias = new Map();
-        for (const d of (devData.devices || [])) {
-          if (d.ioAddress != null) {
-            const physPorts = (pm[`addr:${d.ioAddress}`] || []).filter(p => /port/i.test(p.label || ''));
-            const ringCount = Math.max(1, Math.floor(physPorts.length / 2));
-            if (ringCount > 1) {
-              for (let i = 0; i < ringCount; i++) {
-                for (const p of physPorts.slice(i * 2, i * 2 + 2)) {
-                  portSubslotToRowAlias.set(`${d.alias}:${p.subslot}`, `${d.alias}#${i}`);
-                }
-              }
+        const addSubRows = (alias, physPorts) => {
+          const ringCount = Math.max(1, Math.floor(physPorts.length / 2));
+          if (ringCount <= 1) return;
+          for (let i = 0; i < ringCount; i++) {
+            for (const p of physPorts.slice(i * 2, i * 2 + 2)) {
+              portSubslotToRowAlias.set(`${alias}:${p.subslot}`, `${alias}#${i}`);
             }
           }
+        };
+        for (const d of (devData.devices || [])) {
+          if (d.ioAddress != null) {
+            addSubRows(d.alias, (pm[`addr:${d.ioAddress}`] || []).filter(p => /port/i.test(p.label || '')));
+          }
+        }
+        for (const d of devices) {
+          addSubRows(d.alias, (d.ports ?? []).filter(p => /port/i.test(p.label || '')));
         }
 
         function dbAliasToUi(dbDevice, portSubslot) {
@@ -1206,6 +1240,16 @@ function MrpPanel({ importId, fieldbuses, stations, controllers, templates }) {
           if (rowKey) return rowKey;
           return cfgAliasToUi.get(plain) ?? plain;
         }
+
+        // Roles — reverse-map each saved role onto its grid row key. For switches the
+        // ring port picks which sub-row (#N) the role belongs to; CPU/IO devices map
+        // by their display alias.
+        const rMap = new Map();
+        for (const r of cfg.roles || []) {
+          const uiKey = dbAliasToUi(r.device_alias, r.ring_port_1 ?? r.ring_port_2);
+          rMap.set(uiKey, { role: r.mrp_role, mrpInstances: r.mrp_instances, ringPort1: r.ring_port_1 ?? null, ringPort2: r.ring_port_2 ?? null });
+        }
+        setRoles(rMap);
 
         const lMap = new Map();
         for (const l of cfg.links || []) {
@@ -1219,7 +1263,7 @@ function MrpPanel({ importId, fieldbuses, stations, controllers, templates }) {
       }
       setLoading("");
     }).catch(e => { setError(e.message); setLoading(""); });
-  }, [importId]);
+  }, [importId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Derive the subnet name for the currently selected fieldbus so screen 2 can
   // filter devices to only those connected to that network.
@@ -1354,7 +1398,7 @@ function MrpPanel({ importId, fieldbuses, stations, controllers, templates }) {
       <h3 style={{ margin: "0 0 16px 0", fontSize: 16, fontWeight: 600 }}>MRP Ring Configuration</h3>
 
       <div style={mrpSt.tabs}>
-        {["1. Domain & Fieldbus", "2. Device Roles", "3. Port Connections", "4. Topology View"].map((label, idx) => (
+        {["1. Domain & Fieldbus", "2. Device Roles", "3. Port Connections"].map((label, idx) => (
           <button key={idx}
             style={{ ...mrpSt.tab, ...(screen === idx + 1 ? mrpSt.tabActive : {}) }}
             onClick={() => setScreen(idx + 1)}
@@ -1606,24 +1650,6 @@ function MrpPanel({ importId, fieldbuses, stations, controllers, templates }) {
         </div>
       )}
 
-      {/* ── Screen 4: Topology View ─────────────────────────────────── */}
-      {screen === 4 && (
-        <div style={mrpSt.section}>
-          <p style={mrpSt.hint}>
-            Interactive network topology. Click a node or link to highlight connections.
-            Hover a link to see port details. Switch between Hierarchy and Ring layouts using the toolbar.
-          </p>
-          <MRPTopologyView
-            devices={devices}
-            links={links}
-            roles={roles}
-            domainName={domainName}
-          />
-          <div style={{ ...mrpSt.row, marginTop: 16 }}>
-            <button style={mrpSt.btnSecondary} onClick={() => setScreen(3)}>← Back</button>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -1757,8 +1783,9 @@ function NavPanel({ hwTab, setHwTab, controllers, selectedId, onSelect }) {
 // ── Import Panel ───────────────────────────────────────────────────────────────
 function ImportPanel({
   baselineOk, baselineInfo, ioListOk, ioListInfo, importId,
-  baselineRef, ioListRef,
+  baselineRef, ioListRef, cfgBackfillRef,
   onBaselineChange, onIoListChange, onBaselineBtn, onIoListBtn,
+  onBackfillFromCfg, onCfgBackfillChange, loading,
 }) {
   return (
     <div>
@@ -1784,11 +1811,63 @@ function ImportPanel({
         />
       </div>
 
+      {/* Divider with OR label */}
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
+        <div style={{ flex: 1, height: 1, background: "var(--color-border-tertiary, #e5e7eb)" }} />
+        <span style={{ fontSize: 12, color: "var(--color-text-secondary, #6b7280)", fontWeight: 500 }}>OR</span>
+        <div style={{ flex: 1, height: 1, background: "var(--color-border-tertiary, #e5e7eb)" }} />
+      </div>
+
+      {/* Import from CFG option */}
+      <div style={{
+        display: "flex", alignItems: "center", gap: 16,
+        padding: "14px 18px",
+        background: baselineOk ? "var(--color-background-secondary, #f5f5f5)" : "#f9fafb",
+        border: `1px solid ${baselineOk ? "var(--color-border-secondary, rgba(0,0,0,.2))" : "#e5e7eb"}`,
+        borderRadius: "var(--border-radius-lg, 12px)",
+        opacity: baselineOk ? 1 : 0.5,
+      }}>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 3, color: "var(--color-text-primary, #1a1a1a)" }}>
+            2. Import device list from CFG
+          </div>
+          <div style={{ fontSize: 12, color: "var(--color-text-secondary, #6b7280)", lineHeight: 1.5 }}>
+            Select a previously generated CFG file to restore station, module, IP,
+            PIP, POTENTIAL_GROUP and tag data — no Excel sheet needed.
+            {!baselineOk && " Upload a baseline CFG first."}
+          </div>
+        </div>
+        <input
+          ref={cfgBackfillRef}
+          type="file"
+          accept=".cfg"
+          style={{ display: "none" }}
+          onChange={onCfgBackfillChange}
+        />
+        <button
+          onClick={onBackfillFromCfg}
+          disabled={!baselineOk || !!loading}
+          style={{
+            ...btnStyle,
+            background: baselineOk ? "#0C447C" : "#e5e7eb",
+            color: baselineOk ? "#fff" : "#9ca3af",
+            border: "none",
+            padding: "8px 18px",
+            fontSize: 13,
+            flexShrink: 0,
+            opacity: !baselineOk || !!loading ? 0.6 : 1,
+            cursor: !baselineOk || !!loading ? "not-allowed" : "pointer",
+          }}
+        >
+          {loading && loading.includes("Reading") ? "Reading…" : "Select & Import CFG"}
+        </button>
+      </div>
+
       {ioListInfo && (
-        <div style={{ marginBottom: 20, fontSize: 13, color: "#444",
+        <div style={{ marginTop: 20, fontSize: 13, color: "#444",
                       background: "#f5fff5", border: "1px solid #9d9", borderRadius: 6, padding: "8px 14px" }}>
-          IO List imported — <strong>{ioListInfo.stationCount}</strong> station{ioListInfo.stationCount !== 1 ? "s" : ""},{" "}
-          <strong>{ioListInfo.signalCount}</strong> signal rows.{" "}
+          Device data imported — <strong>{ioListInfo.stationCount}</strong> station{ioListInfo.stationCount !== 1 ? "s" : ""},{" "}
+          <strong>{ioListInfo.signalCount}</strong> slot{ioListInfo.signalCount !== 1 ? "s" : ""}.{" "}
           <span style={{ color: "#2255cc", cursor: "pointer", textDecoration: "underline" }}
                 onClick={() => {}}>
             Switch to Configuration tab to review and generate.
@@ -2952,7 +3031,7 @@ function ConfigurationPanel({
   importId, baselineOk, baselineInfo, controllerTagName, stations, addrMap, templates, fieldbuses, cfgs, loading,
   addingStation, newStation, addingSlot, newSlot,
   editing, editVal,
-  selectedAddrs, onToggleSelect, onToggleSelectAll, onClearSelection,
+  selectedAddrs, onToggleSelect, onToggleSelectAll, onClearSelection, onSetSelectedAddrs,
   onSetNewStation, onStartAddStation, onCancelAddStation, onCommitAddStation,
   onCopyStation, onDeleteStation,
   onBulkDelete, onBulkApprove,
@@ -2966,7 +3045,6 @@ function ConfigurationPanel({
   const allSelected = stations.length > 0 && selectedAddrs.size === stations.length;
   const [configureAddr, setConfigureAddr] = useState(null); // address of station open in modal
   const [genMenuOpen, setGenMenuOpen] = useState(false);
-  const [selectMode, setSelectMode] = useState(false); // drives Mode A / B / C
 
   // Always derive the live station object from current stations so the modal never shows stale slots
   const configureStation = configureAddr != null ? (stations.find(s => s.address === configureAddr) || null) : null;
@@ -3117,40 +3195,17 @@ function ConfigurationPanel({
       {/* Main area: station list */}
       <div style={{ overflowX: "auto" }}>
 
-          {/* ── Table toolbar: Mode A / B / C ─────────────────────────── */}
-          {/* Row 1: always visible */}
+          {/* ── Table toolbar ──────────────────────────────────────────── */}
           <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 6 }}>
             <button
               onClick={onStartAddStation}
               disabled={!baselineOk}
               style={{ ...btnStyle, opacity: baselineOk ? 1 : 0.4 }}
             >+ Add Station</button>
-
-            {/* Mode A — [Select] */}
-            {!selectMode && stations.length > 0 && (
-              <button
-                onClick={() => setSelectMode(true)}
-                style={{ ...btnStyle, color: "#2255cc", background: "#f0f4ff", border: "1px solid #99b8f4" }}
-              >Select</button>
-            )}
-
-            {/* Mode B/C — [Select All] [Cancel] */}
-            {selectMode && (
-              <>
-                <button
-                  onClick={onToggleSelectAll}
-                  style={{ ...btnStyle, fontSize: 13, color: "#2255cc", background: "#f0f4ff", border: "1px solid #99b8f4" }}
-                >Select All</button>
-                <button
-                  onClick={() => { setSelectMode(false); onClearSelection(); }}
-                  style={{ ...btnStyle, fontSize: 13, color: "#555", background: "#fff", border: "1px solid #ccd" }}
-                >Cancel</button>
-              </>
-            )}
           </div>
 
-          {/* Row 2: Mode C action bar — only when ≥1 row checked */}
-          {selectMode && nSelected > 0 && (
+          {/* Action bar — appears as soon as ≥1 row is checked in the grid */}
+          {nSelected > 0 && (
             <div style={{
               display: "flex", gap: 10, alignItems: "center", marginBottom: 8,
               background: "#e8eeff",
@@ -3172,10 +3227,6 @@ function ConfigurationPanel({
                 />
                 {nSelected} of {stations.length} selected
               </label>
-              <button
-                onClick={onClearSelection}
-                style={{ ...btnStyle, fontSize: 12, padding: "3px 12px", color: "#555", background: "#fff", border: "1px solid #c4cce8" }}
-              >Clear</button>
               <div style={{ height: 20, width: 1, background: "#b0bce0", margin: "0 2px" }} />
               <button
                 onClick={() => onBulkApprove(true)}
@@ -3205,93 +3256,14 @@ function ConfigurationPanel({
               No stations yet.<br />Upload an Excel IO list or click "+ Add Station".
             </div>
           ) : (
-            <table style={{ ...tableStyle }}>
-              <thead>
-                <tr>
-                  {selectMode && <th style={{ ...thStyle, width: 32, textAlign: "center", padding: "6px 8px" }}></th>}
-                  <th style={{ ...thStyle, textAlign: "center", padding: "6px 12px" }}>Device Number</th>
-                  <th style={{ ...thStyle, padding: "6px 12px" }}>Device Name</th>
-                  <th style={{ ...thStyle, padding: "6px 12px" }}>Device Family</th>
-                  <th style={{ ...thStyle, padding: "6px 12px" }}>Order Number</th>
-                  <th style={{ ...thStyle, padding: "6px 12px" }}>IP Address</th>
-                  <th style={{ ...thStyle, textAlign: "center", padding: "6px 12px" }}>Node</th>
-                  <th style={{ ...thStyle, width: 100, padding: "6px 12px" }}></th>
-                </tr>
-              </thead>
-              <tbody>
-                {stations.map((station, si) => {
-                  const isSelected = selectedAddrs.has(station.address);
-                  const isConfiguring = configureStation?.address === station.address;
-                  const imSlot = station.slots.find(s => s.slot === 0);
-                  const imOrderNo = imSlot ? imSlot.orderNo : "—";
-                  const imTpl = templates.find(t => t.order_no === (imSlot ? imSlot.orderNo : null));
-                  const deviceFamily = imTpl ? imTpl.family : "—";
-                  return (
-                    <tr
-                      key={station.address}
-                      style={{
-                        background: isConfiguring ? "#EEEDFE" : isSelected ? "#f0f4ff" : si % 2 === 0 ? "#fff" : "#f7f9fc",
-                        borderLeft: isConfiguring ? "3px solid #2255cc" : "3px solid transparent",
-                      }}
-                    >
-                      {selectMode && (
-                        <td style={{ ...tdStyle, textAlign: "center", padding: "5px 8px" }}
-                            onClick={e => { e.stopPropagation(); onToggleSelect(station.address); }}>
-                          <input
-                            type="checkbox"
-                            checked={isSelected}
-                            onChange={() => onToggleSelect(station.address)}
-                            onClick={e => e.stopPropagation()}
-                            style={{ cursor: "pointer" }}
-                          />
-                        </td>
-                      )}
-                      <td style={{ ...tdStyle, textAlign: "center", fontWeight: 700, fontFamily: "monospace",
-                                   color: isConfiguring ? "#2255cc" : "#226", padding: "5px 12px" }}>
-                        {station.address}
-                      </td>
-                      <td style={{ ...tdStyle, fontWeight: 600, color: isConfiguring ? "#2255cc" : "#224", padding: "5px 12px" }}>
-                        {station.name || `Station_${station.address}`}
-                      </td>
-                      <td style={{ ...tdStyle, padding: "5px 12px" }}>
-                        {deviceFamily !== "—" ? (
-                          <span style={{ background: "#eef0f8", color: "#446", borderRadius: 4,
-                                         padding: "2px 8px", fontSize: 11, fontWeight: 600 }}>
-                            {deviceFamily}
-                          </span>
-                        ) : "—"}
-                      </td>
-                      <td style={{ ...tdStyle, fontFamily: "monospace", fontSize: 11, color: "#556", padding: "5px 12px" }}>
-                        {imOrderNo}
-                      </td>
-                      <td style={{ ...tdStyle, fontFamily: "monospace", fontSize: 12, color: "#447", padding: "5px 12px" }}>
-                        {station.ip || "—"}
-                      </td>
-                      <td style={{ ...tdStyle, color: "#669", padding: "5px 12px" }}>
-                        {(() => {
-                          const no = station.subsystemNo;
-                          if (no == null) return "—";
-                          const fb = fieldbuses.find(f => String(f.INT_DP_Subsystem) === String(no));
-                          return fb
-                            ? `${fb.T50_Fieldbus_Name}: PROFINET IO system (${no})`
-                            : `PROFINET IO system (${no})`;
-                        })()}
-                      </td>
-                      <td style={{ ...tdStyle, textAlign: "center", padding: "5px 8px" }}
-                          onClick={e => e.stopPropagation()}>
-                        <button
-                          onClick={() => setConfigureAddr(isConfiguring ? null : station.address)}
-                          style={{ ...btnStyle, fontSize: 12, padding: "4px 14px",
-                                   background: isConfiguring ? "#2255cc" : "#f0f4ff",
-                                   color:      isConfiguring ? "#fff"    : "#2255cc",
-                                   border: "1px solid #99b8f4" }}
-                        >{isConfiguring ? "Close" : "Configure"}</button>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+            <HwConfigGrid
+              stations={stations}
+              templates={templates}
+              fieldbuses={fieldbuses}
+              configureAddr={configureAddr}
+              onConfigure={(addr) => setConfigureAddr(configureAddr === addr ? null : addr)}
+              onSelectionChanged={(addrs) => onSetSelectedAddrs(addrs)}
+            />
           )}
       </div>
 

@@ -2,12 +2,14 @@
 // Completely separate from existing hw-config routes; no shared state.
 'use strict';
 const express = require('express');
+const multer  = require('multer');
 const { getDb } = require('../db');
 const { parseCfg } = require('../services/cfgParser');
-const { extractMrpDevices } = require('../services/mrpCfgParser');
+const { extractMrpDevices, parseMrpConfig } = require('../services/mrpCfgParser');
 const { applyMrp } = require('../services/mrpApplier');
 
 const router = express.Router();
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 function err(res, code, msg) { return res.status(code).json({ error: msg }); }
 
 // ── GET /api/mrp/:importId/devices ───────────────────────────────────────────
@@ -209,6 +211,90 @@ router.post('/:importId/apply', (req, res) => {
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${mrpConfig.stationName}_mrp.cfg"`);
     res.send(patched);
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// ── POST /api/mrp/:importId/import-from-cfg ───────────────────────────────────
+// Accept a configured CFG file, parse MRP roles + port links from it,
+// and save them as the MRP config for this import (same as POST /config).
+router.post('/:importId/import-from-cfg', upload.single('cfg'), (req, res) => {
+  try {
+    if (!req.file) return err(res, 400, 'No CFG file uploaded');
+    const db       = getDb();
+    const importId = parseInt(req.params.importId, 10);
+    const hwImport = db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
+    if (!hwImport) return err(res, 404, 'HW import not found');
+
+    const cfgText = req.file.buffer.toString('utf8');
+    const parsed  = parseCfg(cfgText);
+    const { domainName, stationName, roles, links } = parseMrpConfig(cfgText, parsed);
+
+    console.log(`[MRP Import] Parsed ${roles.length} devices from CFG:`);
+    for (const r of roles) {
+      console.log(`  - ${r.alias}: role=${r.mrpRole}, ringPort1=${r.ringPort1}, ringPort2=${r.ringPort2}`);
+    }
+
+    // Require at least one participating device
+    const activeRoles = roles.filter(r => r.mrpRole !== 0);
+    if (activeRoles.length === 0) {
+      return err(res, 400, 'No MRP-configured devices found in CFG (all roles are 0 / Off)');
+    }
+
+    // Infer fieldbusNo from the first active device that has a subsystemNo
+    const fieldbusNo = activeRoles.find(r => r.subsystemNo != null)?.subsystemNo ?? null;
+
+    const save = db.transaction(() => {
+      const existing = db.prepare(
+        'SELECT id FROM mrp_configs WHERE hw_import_id=? ORDER BY id DESC LIMIT 1'
+      ).get(importId);
+      let configId;
+      if (existing) {
+        db.prepare(
+          `UPDATE mrp_configs SET domain_name=?, fieldbus_no=?, station_name=?, updated_at=datetime('now') WHERE id=?`
+        ).run(domainName, fieldbusNo, stationName || '', existing.id);
+        configId = existing.id;
+      } else {
+        const r = db.prepare(
+          'INSERT INTO mrp_configs (hw_import_id, domain_name, fieldbus_no, station_name) VALUES (?,?,?,?)'
+        ).run(importId, domainName, fieldbusNo, stationName || '');
+        configId = r.lastInsertRowid;
+      }
+
+      db.prepare('DELETE FROM mrp_device_roles WHERE mrp_config_id=?').run(configId);
+      const insRole = db.prepare(
+        'INSERT INTO mrp_device_roles (mrp_config_id, device_alias, io_address, subsystem_no, mrp_role, mrp_instances, ring_port_1, ring_port_2) VALUES (?,?,?,?,?,?,?,?)'
+      );
+      for (const r of roles) {
+        insRole.run(configId, r.alias, r.ioAddress, r.subsystemNo,
+          r.mrpRole, r.mrpRole === 3 ? 1 : 0, r.ringPort1 ?? null, r.ringPort2 ?? null);
+        console.log(`[MRP Import] Saved role: alias=${r.alias}, ring_port_1=${r.ringPort1}, ring_port_2=${r.ringPort2}`);
+      }
+
+      db.prepare('DELETE FROM mrp_port_links WHERE mrp_config_id=?').run(configId);
+      const insLink = db.prepare(
+        `INSERT INTO mrp_port_links
+           (mrp_config_id, from_device, from_iface_subslot, from_port_subslot,
+            to_device, to_iface_subslot, to_port_subslot)
+         VALUES (?,?,?,?,?,?,?)`
+      );
+      for (const l of links) {
+        insLink.run(configId, l.fromDevice, l.fromIfaceSubslot, l.fromPortSubslot,
+          l.toDevice, l.toIfaceSubslot, l.toPortSubslot);
+      }
+
+      return configId;
+    });
+
+    const configId = save();
+    res.json({
+      ok: true,
+      configId,
+      domainName,
+      stationName,
+      devices:  roles.length,
+      active:   activeRoles.length,
+      links:    links.length,
+    });
   } catch (e) { err(res, 500, e.message); }
 });
 

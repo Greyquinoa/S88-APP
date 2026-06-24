@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useCallback } from "react";
-import { listHwImports, listHwControllers, listHwFieldbuses, mrpGetDevices, mrpGetConfig, mrpSaveConfig, mrpDownloadCfg } from "./api.js";
+import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { listHwImports, listHwControllers, listHwFieldbuses, mrpGetDevices, mrpGetConfig, mrpSaveConfig, mrpDownloadCfg, mrpImportFromCfg } from "./api.js";
 import MRPTopologyView from "./MRPTopologyView.jsx";
 
 // MRP role definitions
@@ -11,6 +11,378 @@ const ROLES = [
 
 function roleLabel(v) {
   return ROLES.find(r => r.value === v)?.label ?? "Off";
+}
+
+// ─── Screen 3 wrapper (handles fullscreen) ────────────────────────────────────
+
+function Screen3PortConnections({
+  ringDevices, links, allPortDevices, roles, ringIssues,
+  saving, saved, canDownload, downloading,
+  setLink, handleSave, handleDownload, onBack, onNext,
+}) {
+  const [fullscreen, setFullscreen] = useState(false);
+
+  useEffect(() => {
+    if (!fullscreen) return;
+    const onKey = (e) => { if (e.key === "Escape") setFullscreen(false); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [fullscreen]);
+
+  const outer = fullscreen
+    ? { position: "fixed", inset: 0, zIndex: 9999, background: "#fff", display: "flex", flexDirection: "column", overflow: "hidden" }
+    : { background: "#fff", borderRadius: 8, border: "1px solid #e2e8f0", padding: 0, display: "flex", flexDirection: "column" };
+
+  return (
+    <div style={outer}>
+      {/* Toolbar */}
+      <div style={s3.toolbar}>
+        <span style={{ fontSize: 13, fontWeight: 600, color: "#f1f5f9" }}>Port Connections</span>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button style={s3.toolbarBtn} onClick={() => setFullscreen(f => !f)}
+            title={fullscreen ? "Exit fullscreen (Esc)" : "Open fullscreen"}>
+            {fullscreen ? "⊠ Exit Fullscreen" : "⛶ Fullscreen"}
+          </button>
+        </div>
+      </div>
+
+      {/* Body: form left, diagram right */}
+      <div style={{ display: "flex", flex: 1, minHeight: 0, overflow: "hidden" }}>
+
+        {/* Left: form */}
+        <div style={{ ...s3.formPane, overflowY: "auto" }}>
+          <p style={styles.hint}>
+            For each ring port (first port pair), select which device and port it connects to.
+            Both ports must be connected.
+          </p>
+
+          {ringDevices.length === 0 && (
+            <div style={styles.notice}>No devices have MRP roles assigned. Go back to Device Roles.</div>
+          )}
+
+          {ringDevices.map(dev => (
+            <div key={dev.alias} style={styles.devCard}>
+              <div style={styles.devHeader}>
+                <b>{dev.alias}</b>
+                <span style={styles.badge}>{roleLabel(roles.get(dev.alias)?.role ?? 0)}</span>
+              </div>
+
+              {(dev.ports || []).slice(0, 2).map(port => {
+                const key = `${dev.alias}:${port.subslot}`;
+                const link = links.get(key) || { toDevice: "", toIfaceSubslot: 1, toPortSubslot: 2 };
+                const toDevObj = allPortDevices.find(d => d.alias === link.toDevice);
+                return (
+                  <div key={port.subslot} style={styles.portRow}>
+                    <span style={styles.portLabel}>
+                      {(port.label || `P${port.subslot}`).replace(/\s*RJ45\s*/i, "").trim()}
+                    </span>
+                    <span style={styles.arrow}>→</span>
+                    <select
+                      style={styles.selectSm}
+                      value={link.toDevice}
+                      onChange={e => {
+                        const newDev = allPortDevices.find(d => d.alias === e.target.value);
+                        setLink(dev.alias, port.subslot, "toDevice", e.target.value);
+                        if (newDev?.ports?.[0]) {
+                          setLink(dev.alias, port.subslot, "toIfaceSubslot", newDev.ifaceSubslot ?? 1);
+                          setLink(dev.alias, port.subslot, "toPortSubslot", newDev.ports[0].subslot);
+                        }
+                      }}
+                    >
+                      <option value="">— device —</option>
+                      {allPortDevices.filter(d => d.alias !== dev.alias).map(d => (
+                        <option key={d.alias} value={d.alias}>{d.alias}</option>
+                      ))}
+                    </select>
+                    <select
+                      style={styles.selectSm}
+                      value={link.toPortSubslot}
+                      onChange={e => setLink(dev.alias, port.subslot, "toPortSubslot", parseInt(e.target.value, 10))}
+                      disabled={!link.toDevice}
+                    >
+                      {(toDevObj?.ports || []).map(p => (
+                        <option key={p.subslot} value={p.subslot}>
+                          {(p.label || `P${p.subslot}`).replace(/\s*RJ45\s*/i, "").trim()}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+
+          {ringIssues.length > 0 && (
+            <div style={styles.warn}>
+              <b>Ring validation issues:</b>
+              <ul style={{ margin: "4px 0 0 0", paddingLeft: 20 }}>
+                {ringIssues.map((issue, i) => <li key={i}>{issue}</li>)}
+              </ul>
+            </div>
+          )}
+
+          <div style={styles.row}>
+            <button style={styles.btnSecondary} onClick={onBack}>← Back</button>
+            <button style={saving ? styles.btnDisabled : styles.btnPrimary} onClick={handleSave} disabled={saving}>
+              {saving ? "Saving…" : saved ? "✓ Saved" : "Save Configuration"}
+            </button>
+            <button
+              style={(!canDownload || downloading) ? styles.btnDisabled : styles.btnSuccess}
+              onClick={handleDownload} disabled={!canDownload || downloading}
+              title={!saved ? "Save first" : ringIssues.length > 0 ? "Fix ring issues first" : ""}
+            >
+              {downloading ? "Generating…" : "Generate CFG with MRP"}
+            </button>
+          </div>
+
+          {saved && ringIssues.length === 0 && (
+            <div style={styles.successMsg}>
+              Configuration saved. Click <b>Generate CFG with MRP</b> to download.
+            </div>
+          )}
+        </div>
+
+        {/* Right: diagram */}
+        <div style={s3.diagramPane}>
+          <div style={s3.diagramLabel}>Connection Preview</div>
+          <div style={{ flex: 1, overflowY: "auto", overflowX: "auto", padding: "8px 12px" }}>
+            {ringDevices.length === 0
+              ? <p style={{ color: "#9ca3af", fontSize: 13, textAlign: "center", marginTop: 40 }}>No ring devices configured yet.</p>
+              : <PortConnectionsDiagram ringDevices={ringDevices} links={links} allPortDevices={allPortDevices} />
+            }
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const s3 = {
+  toolbar: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    padding: "8px 14px",
+    background: "#1e293b",
+    color: "#f1f5f9",
+    flexShrink: 0,
+    borderRadius: "8px 8px 0 0",
+  },
+  toolbarBtn: {
+    padding: "4px 12px",
+    background: "transparent",
+    border: "1px solid #475569",
+    borderRadius: 4,
+    color: "#cbd5e1",
+    fontSize: 12,
+    cursor: "pointer",
+  },
+  formPane: {
+    width: 480,
+    minWidth: 380,
+    flexShrink: 0,
+    borderRight: "1px solid #e2e8f0",
+    padding: "16px 20px",
+    overflowY: "auto",
+  },
+  diagramPane: {
+    flex: 1,
+    display: "flex",
+    flexDirection: "column",
+    background: "#f8fafc",
+    minWidth: 0,
+  },
+  diagramLabel: {
+    fontSize: 11,
+    fontWeight: 600,
+    color: "#94a3b8",
+    textTransform: "uppercase",
+    letterSpacing: "0.6px",
+    padding: "8px 12px 4px",
+    borderBottom: "1px solid #e2e8f0",
+    flexShrink: 0,
+  },
+};
+
+// ─── Port Connections Diagram ─────────────────────────────────────────────────
+
+const DIAG = {
+  nodeW:      180,
+  nodeHeaderH: 28,
+  portH:       24,
+  portPadV:     6,
+  colGap:      220, // horizontal gap between left-col right-edge and right-col left-edge
+  rowGap:       20, // vertical gap between device cards
+  sidePad:      40, // canvas left/right margin
+  topPad:       16,
+};
+
+function nodeBodyH(portCount) {
+  return DIAG.portPadV + portCount * DIAG.portH + DIAG.portPadV;
+}
+function nodeH(portCount) {
+  return DIAG.nodeHeaderH + nodeBodyH(portCount);
+}
+// Y centre of port row i inside a node (relative to node top)
+function portCY(portIdx) {
+  return DIAG.nodeHeaderH + DIAG.portPadV + portIdx * DIAG.portH + DIAG.portH / 2;
+}
+
+function PortConnectionsDiagram({ ringDevices, links, allPortDevices }) {
+  // Split devices into two columns (left: even-index, right: odd-index)
+  const leftDevs  = ringDevices.filter((_, i) => i % 2 === 0);
+  const rightDevs = ringDevices.filter((_, i) => i % 2 === 1);
+
+  // Column X positions
+  const leftX  = DIAG.sidePad;
+  const rightX = DIAG.sidePad + DIAG.nodeW + DIAG.colGap;
+
+  // Compute Y positions per device in each column
+  function colYs(devs) {
+    const ys = [];
+    let y = DIAG.topPad;
+    for (const dev of devs) {
+      ys.push(y);
+      y += nodeH((dev.ports || []).slice(0, 2).length) + DIAG.rowGap;
+    }
+    return ys;
+  }
+  const leftYs  = colYs(leftDevs);
+  const rightYs = colYs(rightDevs);
+
+  // Total canvas height
+  const leftH  = leftDevs.reduce((s, d) => s + nodeH((d.ports || []).slice(0, 2).length) + DIAG.rowGap, DIAG.topPad);
+  const rightH = rightDevs.reduce((s, d) => s + nodeH((d.ports || []).slice(0, 2).length) + DIAG.rowGap, DIAG.topPad);
+  const svgH   = Math.max(leftH, rightH, 100) + DIAG.topPad;
+  const svgW   = rightX + DIAG.nodeW + DIAG.sidePad;
+
+  // Build a lookup: alias → { col: "left"|"right", devIdx, nodeY, ports }
+  const devMeta = useMemo(() => {
+    const m = new Map();
+    leftDevs.forEach((d, i)  => m.set(d.alias, { col: "left",  devIdx: i, nodeY: leftYs[i],  dev: d }));
+    rightDevs.forEach((d, i) => m.set(d.alias, { col: "right", devIdx: i, nodeY: rightYs[i], dev: d }));
+    return m;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ringDevices]);
+
+  // Build edge list: { x1, y1, x2, y2, isRing }
+  const edges = useMemo(() => {
+    const seen = new Set();
+    const result = [];
+    for (const [key, val] of links) {
+      if (!val.toDevice) continue;
+      const [fromAlias, ssStr] = key.split(":");
+      const fromSS = parseInt(ssStr, 10);
+      const toAlias = val.toDevice;
+      const toSS    = val.toPortSubslot;
+
+      const edgeKey = [key, `${toAlias}:${toSS}`].sort().join("--");
+      if (seen.has(edgeKey)) continue;
+      seen.add(edgeKey);
+
+      const fromMeta = devMeta.get(fromAlias);
+      const toMeta   = devMeta.get(toAlias);
+      if (!fromMeta || !toMeta) continue;
+
+      const fromPorts = (fromMeta.dev.ports || []).slice(0, 2);
+      const toPorts   = (toMeta.dev.ports   || []).slice(0, 2);
+      const fromPIdx  = fromPorts.findIndex(p => p.subslot === fromSS);
+      const toPIdx    = toPorts.findIndex(p => p.subslot === toSS);
+      if (fromPIdx < 0 || toPIdx < 0) continue;
+
+      // Anchor X: left-col ports connect from the right edge, right-col ports from the left edge
+      const fromX = fromMeta.col === "left"  ? leftX + DIAG.nodeW : rightX;
+      const toX   = toMeta.col   === "right" ? rightX             : leftX + DIAG.nodeW;
+      const fromY = fromMeta.nodeY + portCY(fromPIdx);
+      const toY   = toMeta.nodeY  + portCY(toPIdx);
+
+      result.push({ fromX, fromY, toX, toY });
+    }
+    return result;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [links, devMeta]);
+
+  // Routing: corridor X values outside both columns
+  const leftCorridorX  = leftX - 20;
+  const rightCorridorX = rightX + DIAG.nodeW + 20;
+
+  // Build SVG path for an edge: straight if between left and right col, else routed around via corridor
+  function edgePath(e) {
+    const fromLeft = e.fromX === leftX + DIAG.nodeW; // exits from left column
+    const toRight  = e.toX   === rightX;             // enters right column
+
+    if (fromLeft && toRight) {
+      // Cross connection: straight horizontal middle corridor
+      const midX = leftX + DIAG.nodeW + DIAG.colGap / 2;
+      return `M${e.fromX},${e.fromY} H${midX} V${e.toY} H${e.toX}`;
+    }
+    // Same-side (left→left or right→right): route via side corridor
+    const corridorX = fromLeft ? leftCorridorX : rightCorridorX;
+    return `M${e.fromX},${e.fromY} H${corridorX} V${e.toY} H${e.toX}`;
+  }
+
+  function renderNode(dev, nodeX, nodeY) {
+    const ports = (dev.ports || []).slice(0, 2);
+    const h = nodeH(ports.length);
+    const isLeft = nodeX === leftX;
+    return (
+      <g key={dev.alias} transform={`translate(${nodeX},${nodeY})`}>
+        {/* Card background */}
+        <rect width={DIAG.nodeW} height={h} rx={5} fill="#fff" stroke="#cbd5e1" strokeWidth={1.5} />
+        {/* Header */}
+        <rect width={DIAG.nodeW} height={DIAG.nodeHeaderH} rx={5} fill="#1e293b" />
+        <rect y={DIAG.nodeHeaderH - 5} width={DIAG.nodeW} height={5} fill="#1e293b" />
+        <text x={DIAG.nodeW / 2} y={DIAG.nodeHeaderH / 2 + 1} textAnchor="middle" dominantBaseline="middle"
+          fill="#f1f5f9" fontSize={11} fontWeight={600} fontFamily="inherit">
+          {dev.alias}
+        </text>
+        {/* Ports */}
+        {ports.map((port, pi) => {
+          const cy = portCY(pi);
+          const portKey = `${dev.alias}:${port.subslot}`;
+          const connected = links.has(portKey) && !!links.get(portKey)?.toDevice;
+          const dotX = isLeft ? DIAG.nodeW - 8 : 8;
+          const labelX = isLeft ? DIAG.nodeW - 18 : 18;
+          const anchor = isLeft ? "end" : "start";
+          return (
+            <g key={port.subslot}>
+              <line x1={0} y1={cy} x2={DIAG.nodeW} y2={cy} stroke="#f1f5f9" strokeWidth={1} />
+              <text x={labelX} y={cy} dominantBaseline="middle" textAnchor={anchor}
+                fontSize={10} fill="#475569" fontFamily="inherit">
+                {(port.label || `P${port.subslot}`).replace(/\s*RJ45\s*/i, "").trim()}
+              </text>
+              {/* Port dot at edge (connection point) */}
+              <circle cx={dotX} cy={cy} r={4}
+                fill={connected ? "#16a34a" : "#d1d5db"}
+                stroke="#fff" strokeWidth={1} />
+            </g>
+          );
+        })}
+      </g>
+    );
+  }
+
+  return (
+    <svg width="100%" viewBox={`0 0 ${svgW} ${svgH}`} style={{ display: "block", overflow: "visible" }}>
+      {/* Connection lines — drawn first so they appear behind nodes */}
+      {edges.map((e, i) => (
+        <path key={i} d={edgePath(e)}
+          fill="none" stroke="#2563eb" strokeWidth={1.5}
+          strokeLinejoin="round" markerEnd="url(#arrowhead)" />
+      ))}
+
+      {/* Arrow marker */}
+      <defs>
+        <marker id="arrowhead" markerWidth={8} markerHeight={6} refX={6} refY={3} orient="auto">
+          <polygon points="0 0, 8 3, 0 6" fill="#2563eb" />
+        </marker>
+      </defs>
+
+      {/* Device nodes — drawn on top of lines */}
+      {leftDevs.map((dev, i)  => renderNode(dev, leftX,  leftYs[i]))}
+      {rightDevs.map((dev, i) => renderNode(dev, rightX, rightYs[i]))}
+    </svg>
+  );
 }
 
 export default function StepMRP({ projectId }) {
@@ -34,7 +406,9 @@ export default function StepMRP({ projectId }) {
   const [error,    setError]    = useState("");
   const [saved,    setSaved]    = useState(false);
   const [saving,   setSaving]   = useState(false);
-  const [downloading, setDownloading] = useState(false);
+  const [downloading,  setDownloading]  = useState(false);
+  const [importing,    setImporting]    = useState(false);
+  const cfgImportRef = useRef();
 
   // Load the latest HW import + fieldbuses for this project on mount
   useEffect(() => {
@@ -75,7 +449,7 @@ export default function StepMRP({ projectId }) {
 
           const rMap = new Map();
           for (const r of cfg.roles || []) {
-            rMap.set(r.device_alias, { role: r.mrp_role, mrpInstances: r.mrp_instances });
+            rMap.set(r.device_alias, { role: r.mrp_role, mrpInstances: r.mrp_instances, ringPort1: r.ring_port_1 ?? null, ringPort2: r.ring_port_2 ?? null });
           }
           setRoles(rMap);
 
@@ -121,6 +495,42 @@ export default function StepMRP({ projectId }) {
       return next;
     });
     setSaved(false);
+  }
+
+  async function handleImportFromCfg(file) {
+    if (!file) return;
+    setImporting(true);
+    setError("");
+    try {
+      await mrpImportFromCfg(importId, file);
+      // Reload devices and config from DB so UI reflects imported values
+      const [devData, cfg] = await Promise.all([mrpGetDevices(importId), mrpGetConfig(importId)]);
+      setDevices(devData.devices || []);
+      setStationName(devData.stationName || "");
+      if (cfg) {
+        setDomainName(cfg.domain_name || "mrpdomain-1");
+        setFieldbusNo(cfg.fieldbus_no);
+        const rMap = new Map();
+        for (const r of cfg.roles || []) {
+          rMap.set(r.device_alias, { role: r.mrp_role, mrpInstances: r.mrp_instances, ringPort1: r.ring_port_1 ?? null, ringPort2: r.ring_port_2 ?? null });
+        }
+        setRoles(rMap);
+        const lMap = new Map();
+        for (const l of cfg.links || []) {
+          lMap.set(`${l.from_device}:${l.from_port_subslot}`, {
+            toDevice:       l.to_device,
+            toIfaceSubslot: l.to_iface_subslot,
+            toPortSubslot:  l.to_port_subslot,
+          });
+        }
+        setLinks(lMap);
+      }
+      setSaved(true);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setImporting(false);
+    }
   }
 
   async function handleSave() {
@@ -209,11 +619,28 @@ export default function StepMRP({ projectId }) {
 
   return (
     <div style={styles.container}>
-      <h2 style={styles.heading}>MRP Ring Configuration</h2>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 4 }}>
+        <h2 style={{ ...styles.heading, margin: 0, flex: 1 }}>MRP Ring Configuration</h2>
+        <input
+          ref={cfgImportRef}
+          type="file"
+          accept=".cfg"
+          style={{ display: "none" }}
+          onChange={e => { const f = e.target.files?.[0]; if (f) handleImportFromCfg(f); e.target.value = ""; }}
+        />
+        <button
+          style={importing ? styles.btnDisabled : styles.btnSecondary}
+          disabled={importing}
+          onClick={() => { cfgImportRef.current.value = ""; cfgImportRef.current.click(); }}
+          title="Import MRP roles and port links from a configured CFG file"
+        >
+          {importing ? "Importing…" : "Import from CFG"}
+        </button>
+      </div>
 
       {/* Screen tabs */}
       <div style={styles.tabs}>
-        {["1. Domain & Fieldbus", "2. Device Roles", "3. Port Connections", "4. Topology View"].map((label, idx) => (
+        {["1. Domain & Fieldbus", "2. Device Roles", "3. Port Connections"].map((label, idx) => (
           <button
             key={idx}
             style={{ ...styles.tab, ...(screen === idx + 1 ? styles.tabActive : {}) }}
@@ -369,131 +796,24 @@ export default function StepMRP({ projectId }) {
 
       {/* ── Screen 3: Port Connections ───────────────────────────────── */}
       {screen === 3 && (
-        <div style={styles.section}>
-          <p style={styles.hint}>
-            For each ring port (instance 1 only — the first port pair), select which device and port it
-            connects to. This defines the ring topology. Both ports must be connected.
-          </p>
-
-          {ringDevices.length === 0 && (
-            <div style={styles.notice}>No devices have MRP roles assigned. Go back to Device Roles.</div>
-          )}
-
-          {ringDevices.map(dev => (
-            <div key={dev.alias} style={styles.devCard}>
-              <div style={styles.devHeader}>
-                <b>{dev.alias}</b>
-                <span style={styles.badge}>{roleLabel(roles.get(dev.alias)?.role ?? 0)}</span>
-              </div>
-
-              {(dev.ports || []).slice(0, 2).map(port => {
-                const key = `${dev.alias}:${port.subslot}`;
-                const link = links.get(key) || { toDevice: "", toIfaceSubslot: 1, toPortSubslot: 2 };
-                const toDevObj = allPortDevices.find(d => d.alias === link.toDevice);
-
-                return (
-                  <div key={port.subslot} style={styles.portRow}>
-                    <span style={styles.portLabel}>
-                      Port {port.label || port.subslot} (subslot {port.subslot})
-                    </span>
-                    <span style={styles.arrow}>→ connects to</span>
-
-                    {/* Target device */}
-                    <select
-                      style={styles.selectSm}
-                      value={link.toDevice}
-                      onChange={e => {
-                        const newDev = allPortDevices.find(d => d.alias === e.target.value);
-                        setLink(dev.alias, port.subslot, "toDevice", e.target.value);
-                        if (newDev?.ports?.[0]) {
-                          setLink(dev.alias, port.subslot, "toIfaceSubslot", newDev.ifaceSubslot ?? 1);
-                          setLink(dev.alias, port.subslot, "toPortSubslot",  newDev.ports[0].subslot);
-                        }
-                      }}
-                    >
-                      <option value="">— device —</option>
-                      {allPortDevices.filter(d => d.alias !== dev.alias).map(d => (
-                        <option key={d.alias} value={d.alias}>{d.alias}</option>
-                      ))}
-                    </select>
-
-                    {/* Target port */}
-                    <select
-                      style={styles.selectSm}
-                      value={link.toPortSubslot}
-                      onChange={e => {
-                        setLink(dev.alias, port.subslot, "toPortSubslot", parseInt(e.target.value, 10));
-                      }}
-                      disabled={!link.toDevice}
-                    >
-                      {(toDevObj?.ports || []).map(p => (
-                        <option key={p.subslot} value={p.subslot}>
-                          Port {p.label || p.subslot} (ss {p.subslot})
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                );
-              })}
-            </div>
-          ))}
-
-          {ringIssues.length > 0 && (
-            <div style={styles.warn}>
-              <b>Ring validation issues:</b>
-              <ul style={{ margin: "4px 0 0 0", paddingLeft: 20 }}>
-                {ringIssues.map((issue, i) => <li key={i}>{issue}</li>)}
-              </ul>
-            </div>
-          )}
-
-          <div style={styles.row}>
-            <button style={styles.btnSecondary} onClick={() => setScreen(2)}>← Back</button>
-
-            <button
-              style={saving ? styles.btnDisabled : styles.btnPrimary}
-              onClick={handleSave}
-              disabled={saving}
-            >
-              {saving ? "Saving…" : saved ? "✓ Saved" : "Save Configuration"}
-            </button>
-
-            <button
-              style={(!canDownload || downloading) ? styles.btnDisabled : styles.btnSuccess}
-              onClick={handleDownload}
-              disabled={!canDownload || downloading}
-              title={!saved ? "Save configuration first" : ringIssues.length > 0 ? "Fix ring issues first" : ""}
-            >
-              {downloading ? "Generating…" : "Generate CFG with MRP"}
-            </button>
-          </div>
-
-          {saved && ringIssues.length === 0 && (
-            <div style={styles.successMsg}>
-              Configuration saved. Click <b>Generate CFG with MRP</b> to download the patched .cfg file.
-            </div>
-          )}
-        </div>
+        <Screen3PortConnections
+          ringDevices={ringDevices}
+          links={links}
+          allPortDevices={allPortDevices}
+          roles={roles}
+          ringIssues={ringIssues}
+          saving={saving}
+          saved={saved}
+          canDownload={canDownload}
+          downloading={downloading}
+          setLink={setLink}
+          handleSave={handleSave}
+          handleDownload={handleDownload}
+          onBack={() => setScreen(2)}
+          onNext={() => setScreen(4)}
+        />
       )}
 
-      {/* ── Screen 4: Topology View ──────────────────────────────────── */}
-      {screen === 4 && (
-        <div style={styles.section}>
-          <p style={styles.hint}>
-            Interactive network topology. Click a node or link to highlight connections.
-            Hover a link to see port details. Switch between Hierarchy and Ring layouts.
-          </p>
-          <MRPTopologyView
-            devices={filteredDevices}
-            links={links}
-            roles={roles}
-            domainName={domainName}
-          />
-          <div style={styles.row}>
-            <button style={styles.btnSecondary} onClick={() => setScreen(3)}>← Back</button>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

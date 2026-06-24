@@ -251,6 +251,11 @@ export async function uploadHwIoList(importId, file, sheetName) {
 export async function getHwStations(importId) {
   return request('GET', `/hw-config/imports/${importId}/stations`);
 }
+export async function backfillFromCfg(importId, file) {
+  const fd = new FormData();
+  fd.append('cfg', file);
+  return request('POST', `/hw-config/imports/${importId}/backfill-from-cfg`, fd, true);
+}
 export async function getHwAddressPreview(importId) {
   return request('GET', `/hw-config/imports/${importId}/preview-addresses`);
 }
@@ -360,6 +365,11 @@ export async function mrpGetConfig(importId) {
 }
 export async function mrpSaveConfig(importId, config) {
   return request('POST', `/mrp/${importId}/config`, config);
+}
+export async function mrpImportFromCfg(importId, file) {
+  const fd = new FormData();
+  fd.append('cfg', file);
+  return request('POST', `/mrp/${importId}/import-from-cfg`, fd, true);
 }
 export async function mrpDownloadCfg(importId) {
   const res = await fetch(`${BASE}/mrp/${importId}/apply`, { method: 'POST' });
