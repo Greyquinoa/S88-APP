@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from "react";
 import MRPTopologyView from "./MRPTopologyView.jsx";
+import HwImportReview from "./HwImportReview.jsx";
 import {
-  listHwImports, uploadHwBaseline, uploadHwIoList,
+  listHwImports, uploadHwBaseline, uploadHwIoList, previewHwIoList,
   getHwStations, getHwAddressPreview, generateHwCfg, listHwCfgs, hwCfgDownloadUrl,
   backfillFromCfg,
   updateHwStation, updateHwSlot,
@@ -30,6 +31,7 @@ export default function StepHWConfig({ projectId }) {
   const [baselineInfo, setBaselineInfo] = useState(null);
   const [ioListOk,     setIoListOk]     = useState(false);
   const [ioListInfo,   setIoListInfo]   = useState(null);
+  const [reviewData,   setReviewData]   = useState(null);   // diff payload → opens HwImportReview modal
   const [controllers,  setControllers]  = useState([]);
   const [selectedId,   setSelectedId]   = useState(null);
   const [stations,     setStations]     = useState([]);
@@ -142,17 +144,32 @@ export default function StepHWConfig({ projectId }) {
   async function handleIoListUpload(e) {
     const file = e.target.files[0];
     if (!file || !importId) { setError("Upload a baseline CFG first."); return; }
-    setLoading("Parsing HW IO list…");
+    setLoading("Analysing import file…");
     setError("");
     try {
-      const result = await uploadHwIoList(importId, file);
-      setIoListOk(true);
-      setIoListInfo({ stationCount: result.stationCount, signalCount: result.signalCount });
-      await loadStations(importId);
-      await loadCfgs(importId);
-      setHwTab("config");
+      // If there are already stations in the grid, run delta analysis first
+      if (stations.length > 0) {
+        const diff = await previewHwIoList(importId, file);
+        setReviewData(diff);
+      } else {
+        // First import — no existing data, skip review screen
+        const result = await uploadHwIoList(importId, file);
+        setIoListOk(true);
+        setIoListInfo({ stationCount: result.stationCount, signalCount: result.signalCount });
+        await loadStations(importId);
+        await loadCfgs(importId);
+        setHwTab("config");
+      }
     } catch (err) { setError(err.message); }
     finally { setLoading(""); }
+  }
+
+  async function handleReviewApplied() {
+    setReviewData(null);
+    setIoListOk(true);
+    await loadStations(importId);
+    await loadCfgs(importId);
+    setHwTab("config");
   }
 
   async function handleBackfillFromCfg(file) {
@@ -670,6 +687,19 @@ export default function StepHWConfig({ projectId }) {
           </>
         )}
       </div>
+
+      {/* ── Delta-review modal ──────────────────────────────────────────── */}
+      {reviewData && (
+        <HwImportReview
+          importId={importId}
+          summary={reviewData.summary}
+          items={reviewData.items}
+          parsedRows={reviewData.parsedRows}
+          fileName={reviewData.fileName}
+          onApplied={handleReviewApplied}
+          onClose={() => setReviewData(null)}
+        />
+      )}
     </div>
   );
 }
@@ -1787,8 +1817,39 @@ function ImportPanel({
   onBaselineChange, onIoListChange, onBaselineBtn, onIoListBtn,
   onBackfillFromCfg, onCfgBackfillChange, loading,
 }) {
+  const dlFile = (filename) => {
+    const link = document.createElement('a');
+    link.href = '/' + filename;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
   return (
     <div>
+      <div style={{ marginBottom: 20, padding: "12px 16px", background: "#e3f2fd", border: "1px solid #90caf9", borderRadius: 8 }}>
+        <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8, color: "#1565c0" }}>Downloads</div>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <button
+            onClick={() => dlFile('HW_IMPORT_TEMPLATE.xlsx')}
+            style={{ padding: "8px 16px", background: "#1976d2", color: "#fff", border: "none", borderRadius: 6, fontSize: 13, fontWeight: 600, cursor: "pointer" }}
+            onMouseEnter={(e) => e.target.style.background = "#1565c0"}
+            onMouseLeave={(e) => e.target.style.background = "#1976d2"}
+          >
+            ⬇ Blank Template
+          </button>
+          <button
+            onClick={() => dlFile('HW_TEST_IMPORT.xlsx')}
+            style={{ padding: "8px 16px", background: "#388e3c", color: "#fff", border: "none", borderRadius: 6, fontSize: 13, fontWeight: 600, cursor: "pointer" }}
+            onMouseEnter={(e) => e.target.style.background = "#2e7d32"}
+            onMouseLeave={(e) => e.target.style.background = "#388e3c"}
+          >
+            ⬇ Test File (current config)
+          </button>
+        </div>
+      </div>
+
       <div style={{ display: "flex", gap: 24, marginBottom: 24, flexWrap: "wrap" }}>
         <UploadCard
           label="1. Baseline PCS7 CFG"
@@ -2068,13 +2129,14 @@ function CataloguePanel({ templates, slotCompat, sigTypes, onTemplatesChanged, o
               <tbody>
                 {grouped[family].flatMap((t, i) => {
                   const isSlot    = t.hw_category === 'slot';
+                  const isStation = t.hw_category === 'station';
                   const isSubslot = t.hw_category === 'subslot';
                   const isExpanded = expandedSlot === t.order_no;
                   const rowBg = i % 2 === 0 ? "#fff" : "#f7f9fc";
 
-                  // Subslots compatible with this slot (only relevant for slot rows)
+                  // Subslots compatible with this slot/station
                   const assignedSubslots = compatBySlot[t.order_no] || new Set();
-                  // Slots using this subslot (only relevant for subslot rows)
+                  // Slots/stations using this subslot (only relevant for subslot rows)
                   const usedBySlots = compatBySubslot[t.order_no] || new Set();
                   // Candidate subslots for assignment = same family, hw_category === 'subslot'
                   const candidateSubslots = templates.filter(s => s.hw_category === 'subslot' && s.family === t.family);
@@ -2143,7 +2205,7 @@ function CataloguePanel({ templates, slotCompat, sigTypes, onTemplatesChanged, o
 
                       {/* Subslots column */}
                       <td style={{ ...catTdStyle, textAlign: "left" }}>
-                        {isSlot && candidateSubslots.length > 0 && (
+                        {(isSlot || isStation) && candidateSubslots.length > 0 && (
                           <div style={{ display: "flex", flexWrap: "wrap", gap: 3, alignItems: "center" }}>
                             {[...assignedSubslots].map(sno => {
                               const s = templates.find(x => x.order_no === sno);
@@ -2158,7 +2220,7 @@ function CataloguePanel({ templates, slotCompat, sigTypes, onTemplatesChanged, o
                             })}
                             <button
                               onClick={() => setExpandedSlot(isExpanded ? null : t.order_no)}
-                              title={isExpanded ? "Close subslot assignment" : "Assign compatible subslots"}
+                              title={isExpanded ? "Close" : "Assign compatible subslots"}
                               style={{ fontSize: 11, padding: "1px 6px", cursor: "pointer", borderRadius: 4,
                                 background: isExpanded ? "#dbeafe" : "#f0f6ff",
                                 color: isExpanded ? "#1e40af" : "#2255cc",
@@ -2198,14 +2260,14 @@ function CataloguePanel({ templates, slotCompat, sigTypes, onTemplatesChanged, o
                     </tr>
                   );
 
-                  // Expand row: shown below the slot row when expanded
-                  if (!isSlot || !isExpanded || candidateSubslots.length === 0) return [mainRow];
+                  // Expand row: shown below the slot/station row when expanded
+                  if (!(isSlot || isStation) || !isExpanded || candidateSubslots.length === 0) return [mainRow];
 
                   const expandRow = (
                     <tr key={`compat-${t.id}`} style={{ background: "#f0f6ff" }}>
                       <td colSpan={CATALOGUE_COLS.length} style={{ padding: "10px 18px", borderTop: "1px dashed #93c5fd" }}>
                         <div style={{ fontSize: 12, fontWeight: 600, color: "#1e40af", marginBottom: 8 }}>
-                          Compatible subslots for <span style={{ fontFamily: "monospace" }}>{t.display_name}</span>
+                          Compatible subslots for {isStation ? 'station' : 'slot'} <span style={{ fontFamily: "monospace" }}>{t.display_name}</span>
                         </div>
                         <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
                           {candidateSubslots.map(s => {
