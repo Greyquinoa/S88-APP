@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { AgGridReact } from "ag-grid-react";
 import { AllCommunityModule, ModuleRegistry, themeQuartz } from "ag-grid-community";
+import "ag-grid-community/styles/ag-grid.css";
+import "ag-grid-community/styles/ag-theme-quartz.css";
 import { listHwImports, listHwControllers, listHwFieldbuses, mrpGetDevices, mrpGetConfig, mrpSaveConfig, mrpDownloadCfg, mrpImportFromCfg } from "./api.js";
 import MRPTopologyView from "./MRPTopologyView.jsx";
 
