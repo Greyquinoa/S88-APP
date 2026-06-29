@@ -18,11 +18,14 @@ const hwConfigRoutes       = require('./routes/hwConfig');
 const hwControllersRoutes  = require('./routes/hwControllers');
 const hwFieldbusesRoutes   = require('./routes/hwFieldbuses');
 const mrpConfigRoutes      = require('./routes/mrpConfig');
+const signalMappingRoutes  = require('./routes/signalMappings');
+const ioConnectionRoutes   = require('./routes/ioConnections');
+const connectionRoutes     = require('./routes/connections');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
-app.use(cors({ origin: 'http://localhost:5173' }));
+app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:5174'] }));
 app.use(express.json({ limit: '10mb' }));
 
 app.use('/api/library',    libraryRoutes);
@@ -37,6 +40,9 @@ app.use('/api/hw-config',        hwConfigRoutes);
 app.use('/api/hw-controllers',   hwControllersRoutes);
 app.use('/api/hw-fieldbuses',    hwFieldbusesRoutes);
 app.use('/api/mrp',              mrpConfigRoutes);
+app.use('/api/signal-mappings',  signalMappingRoutes);
+app.use('/api/io-connections',   ioConnectionRoutes);
+app.use('/api/connections',      connectionRoutes);
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
