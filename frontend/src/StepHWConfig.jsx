@@ -2280,25 +2280,37 @@ function ProtocolMappingModal({ initial, templates, onClose, onSave }) {
         </div>
 
         <div style={{ marginBottom: 12 }}>
-          <label style={{ fontSize: 11, fontWeight: 600, display: "block", marginBottom: 4 }}>Card MLFB</label>
-          <select value={cardMlfb} onChange={e => setCardMlfb(e.target.value)}
-            style={{ width: "100%", padding: "7px 10px", fontSize: 12, fontFamily: "var(--font-mono, monospace)", border: "0.5px solid var(--color-border-secondary)", borderRadius: 4, background: "var(--color-background-secondary)", color: "var(--color-text-primary)" }}>
-            <option value="">— Select card module —</option>
-            {templates.filter(t => t.hw_category === 'slot' || !t.hw_category).map(t => (
-              <option key={t.id} value={t.order_no}>{t.order_no} · {t.display_name}</option>
-            ))}
-          </select>
+          <label style={{ fontSize: 11, fontWeight: 600, display: "block", marginBottom: 4 }}>Card MLFB (slot module)</label>
+          {templates.filter(t => t.hw_category === 'slot' || !t.hw_category).length > 0 ? (
+            <select value={cardMlfb} onChange={e => setCardMlfb(e.target.value)}
+              style={{ width: "100%", padding: "7px 10px", fontSize: 12, fontFamily: "var(--font-mono, monospace)", border: "0.5px solid var(--color-border-secondary)", borderRadius: 4, background: "var(--color-background-secondary)", color: "var(--color-text-primary)" }}>
+              <option value="">— Select card module —</option>
+              {templates.filter(t => t.hw_category === 'slot' || !t.hw_category).map(t => (
+                <option key={t.id} value={t.order_no}>{t.order_no} · {t.display_name}</option>
+              ))}
+            </select>
+          ) : (
+            <input type="text" value={cardMlfb} onChange={e => setCardMlfb(e.target.value)}
+              placeholder="e.g. 6ES7 131-6BH01-0BA0"
+              style={{ width: "100%", padding: "7px 10px", fontSize: 12, fontFamily: "var(--font-mono, monospace)", border: "0.5px solid var(--color-border-secondary)", borderRadius: 4, background: "var(--color-background-secondary)", color: "var(--color-text-primary)" }} />
+          )}
         </div>
 
         <div style={{ marginBottom: 12 }}>
           <label style={{ fontSize: 11, fontWeight: 600, display: "block", marginBottom: 4 }}>Station MLFB</label>
-          <select value={stationMlfb} onChange={e => setStationMlfb(e.target.value)}
-            style={{ width: "100%", padding: "7px 10px", fontSize: 12, fontFamily: "var(--font-mono, monospace)", border: "0.5px solid var(--color-border-secondary)", borderRadius: 4, background: "var(--color-background-secondary)", color: "var(--color-text-primary)" }}>
-            <option value="">— Select station module —</option>
-            {templates.filter(t => t.hw_category === 'station').map(t => (
-              <option key={t.id} value={t.order_no}>{t.order_no} · {t.display_name}</option>
-            ))}
-          </select>
+          {templates.filter(t => t.hw_category === 'station').length > 0 ? (
+            <select value={stationMlfb} onChange={e => setStationMlfb(e.target.value)}
+              style={{ width: "100%", padding: "7px 10px", fontSize: 12, fontFamily: "var(--font-mono, monospace)", border: "0.5px solid var(--color-border-secondary)", borderRadius: 4, background: "var(--color-background-secondary)", color: "var(--color-text-primary)" }}>
+              <option value="">— Select station module —</option>
+              {templates.filter(t => t.hw_category === 'station').map(t => (
+                <option key={t.id} value={t.order_no}>{t.order_no} · {t.display_name}</option>
+              ))}
+            </select>
+          ) : (
+            <input type="text" value={stationMlfb} onChange={e => setStationMlfb(e.target.value)}
+              placeholder="e.g. 6ES7 155-6AU00-0CN0"
+              style={{ width: "100%", padding: "7px 10px", fontSize: 12, fontFamily: "var(--font-mono, monospace)", border: "0.5px solid var(--color-border-secondary)", borderRadius: 4, background: "var(--color-background-secondary)", color: "var(--color-text-primary)" }} />
+          )}
         </div>
 
         <div style={{ marginBottom: 16 }}>
