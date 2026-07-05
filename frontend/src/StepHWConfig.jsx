@@ -2142,8 +2142,6 @@ function ProtocolMappingPanel({ templates, setError }) {
     } catch (e) { setError(e.message); }
   }
 
-  const slotTemplates = templates.filter(t => t.hw_category === 'slot' || !t.hw_category);
-
   return (
     <div>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
@@ -2212,7 +2210,7 @@ function ProtocolMappingPanel({ templates, setError }) {
       {(showAdd || editRow) && (
         <ProtocolMappingModal
           initial={editRow}
-          templates={slotTemplates}
+          templates={templates}
           onClose={() => { setShowAdd(false); setEditRow(null); }}
           onSave={handleSave}
         />
