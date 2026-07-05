@@ -813,7 +813,7 @@ router.post('/imports/:id/preview-iolist', upload.single('iolist'), async (req, 
       }
     }
 
-    let rows, stations;
+    let rows, stations, resolutionStats;
 
     // If no file but columnMap is provided, use stored raw rows from DB
     if (!req.file && overrideColumnMap) {
@@ -827,16 +827,18 @@ router.post('/imports/:id/preview-iolist', upload.single('iolist'), async (req, 
 
       // Parse using the stored raw rows (simulate as if we just read them from Excel)
       const rawExcelRows = stored.map(r => JSON.parse(r.row_json));
-      const parseResult = parseRawExcelRows(rawExcelRows, overrideColumnMap);
+      const parseResult = parseRawExcelRows(rawExcelRows, overrideColumnMap, db);
       rows = parseResult.rows;
       stations = parseResult.stations;
+      resolutionStats = parseResult.resolutionStats;
     } else {
       // File uploaded: parse it
       if (!req.file) return err(res, 400, 'No file uploaded');
       const sheetName = req.query.sheet || null;
-      const parseResult = await parseHwExcel(req.file.buffer, sheetName, overrideColumnMap);
+      const parseResult = await parseHwExcel(req.file.buffer, sheetName, overrideColumnMap, db);
       rows = parseResult.rows;
       stations = parseResult.stations;
+      resolutionStats = parseResult.resolutionStats;
     }
 
     // Build incoming map: key → parsed row
@@ -966,6 +968,7 @@ router.post('/imports/:id/preview-iolist', upload.single('iolist'), async (req, 
       parsedRows: rows,
       fileName: req.file.originalname,
       stationCount: stations.size,
+      resolutionStats,
     });
   } catch (e) { err(res, 500, e.message); }
 });
