@@ -790,6 +790,33 @@ router.post('/imports/:id/upload-iolist', upload.single('iolist'), async (req, r
     });
     for (let i = 0; i < rows.length; i += 500) insertBatch(rows.slice(i, i + 500));
 
+    // Tier 2: Create slot 0 rows for stations with station_mlfb
+    // This enables the grid to auto-generate ports (0.2, 0.3) based on the station module's port_config
+    const tier2Stations = db.prepare(`
+      SELECT DISTINCT station_address, station_name, ip_address, router_address, subsystem_no, station_mlfb
+      FROM hw_signals
+      WHERE hw_import_id=? AND resolved_by_tier2=1 AND station_mlfb IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM hw_signals s2 WHERE s2.hw_import_id=? AND s2.station_address=hw_signals.station_address AND s2.slot=0)
+    `).all(importId, importId);
+
+    if (tier2Stations.length > 0) {
+      const insSlot0 = db.prepare(`
+        INSERT OR IGNORE INTO hw_signals
+          (hw_import_id, row_number, station_address, station_name, ip_address,
+           slot, channel, module_order_no, module_name, tag, description, signal_type, subsystem_no, router_address,
+           station_mlfb, resolved_by_tier2, unresolved)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      `);
+      for (const s of tier2Stations) {
+        insSlot0.run(
+          importId, null, s.station_address, s.station_name, s.ip_address,
+          0, null, s.station_mlfb, s.station_name,
+          null, null, null, s.subsystem_no, s.router_address,
+          s.station_mlfb, 1, 0
+        );
+      }
+    }
+
     db.prepare('UPDATE hw_imports SET excel_name=?, status=? WHERE id=?')
       .run(req.file.originalname, 'ready', importId);
 
@@ -1211,6 +1238,33 @@ router.post('/imports/:id/apply-iolist', async (req, res) => {
     });
 
     apply();
+
+    // Tier 2: Create slot 0 rows for stations with station_mlfb
+    // This enables the grid to auto-generate ports (0.2, 0.3) based on the station module's port_config
+    const tier2Stations = db.prepare(`
+      SELECT DISTINCT station_address, station_name, ip_address, router_address, subsystem_no, station_mlfb
+      FROM hw_signals
+      WHERE hw_import_id=? AND resolved_by_tier2=1 AND station_mlfb IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM hw_signals s2 WHERE s2.hw_import_id=? AND s2.station_address=hw_signals.station_address AND s2.slot=0)
+    `).all(importId, importId);
+
+    if (tier2Stations.length > 0) {
+      const insSlot0 = db.prepare(`
+        INSERT OR IGNORE INTO hw_signals
+          (hw_import_id, row_number, station_address, station_name, ip_address,
+           slot, channel, module_order_no, module_name, tag, description, signal_type, subsystem_no, router_address,
+           station_mlfb, resolved_by_tier2, unresolved)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      `);
+      for (const s of tier2Stations) {
+        insSlot0.run(
+          importId, null, s.station_address, s.station_name, s.ip_address,
+          0, null, s.station_mlfb, s.station_name,
+          null, null, null, s.subsystem_no, s.router_address,
+          s.station_mlfb, 1, 0
+        );
+      }
+    }
 
     const signalCount = db.prepare(
       'SELECT COUNT(*) AS cnt FROM hw_signals WHERE hw_import_id=?'
