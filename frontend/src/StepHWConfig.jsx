@@ -2264,17 +2264,29 @@ function ProtocolMappingModal({ initial, templates, onClose, onSave }) {
         <h3 style={{ margin: "0 0 16px 0", fontSize: 15, fontWeight: 700 }}>{initial ? "Edit Mapping" : "Add Mapping"}</h3>
 
         <div style={{ marginBottom: 12 }}>
-          <label style={{ fontSize: 11, fontWeight: 600, display: "block", marginBottom: 4 }}>Protocol</label>
-          <input type="text" value={protocol} onChange={e => setProtocol(e.target.value)}
-            placeholder="e.g. SoftIO, STD, PF, Profibus DP…"
-            style={{ width: "100%", padding: "7px 10px", fontSize: 12, border: "0.5px solid var(--color-border-secondary)", borderRadius: 4, background: "var(--color-background-secondary)", color: "var(--color-text-primary)" }} />
+          <label style={{ fontSize: 11, fontWeight: 600, display: "block", marginBottom: 4 }}>Protocol{initial && " (read-only)"}</label>
+          {initial ? (
+            <div style={{ width: "100%", padding: "7px 10px", fontSize: 12, border: "0.5px solid var(--color-border-secondary)", borderRadius: 4, background: "var(--color-background-secondary)", color: "var(--color-text-primary)", fontFamily: "var(--font-mono, monospace)" }}>
+              {protocol}
+            </div>
+          ) : (
+            <input type="text" value={protocol} onChange={e => setProtocol(e.target.value)}
+              placeholder="e.g. SoftIO, STD, PF, Profibus DP…"
+              style={{ width: "100%", padding: "7px 10px", fontSize: 12, border: "0.5px solid var(--color-border-secondary)", borderRadius: 4, background: "var(--color-background-secondary)", color: "var(--color-text-primary)" }} />
+          )}
         </div>
 
         <div style={{ marginBottom: 12 }}>
-          <label style={{ fontSize: 11, fontWeight: 600, display: "block", marginBottom: 4 }}>Signal Type</label>
-          <input type="text" value={signalType} onChange={e => setSignalType(e.target.value)}
-            placeholder="e.g. DI, DO, AI, AO…"
-            style={{ width: "100%", padding: "7px 10px", fontSize: 12, border: "0.5px solid var(--color-border-secondary)", borderRadius: 4, background: "var(--color-background-secondary)", color: "var(--color-text-primary)" }} />
+          <label style={{ fontSize: 11, fontWeight: 600, display: "block", marginBottom: 4 }}>Signal Type{initial && " (read-only)"}</label>
+          {initial ? (
+            <div style={{ width: "100%", padding: "7px 10px", fontSize: 12, border: "0.5px solid var(--color-border-secondary)", borderRadius: 4, background: "var(--color-background-secondary)", color: "var(--color-text-primary)", fontFamily: "var(--font-mono, monospace)" }}>
+              {signalType}
+            </div>
+          ) : (
+            <input type="text" value={signalType} onChange={e => setSignalType(e.target.value)}
+              placeholder="e.g. DI, DO, AI, AO…"
+              style={{ width: "100%", padding: "7px 10px", fontSize: 12, border: "0.5px solid var(--color-border-secondary)", borderRadius: 4, background: "var(--color-background-secondary)", color: "var(--color-text-primary)" }} />
+          )}
         </div>
 
         <div style={{ marginBottom: 12 }}>
