@@ -173,27 +173,21 @@ router.get('/hardware-resolution', (req, res) => {
 router.post('/hardware-resolution', (req, res) => {
   try {
     const db = getDb();
-    const { protocol, signal_type, card_mlfb, description } = req.body;
+    const { protocol, signal_type, card_mlfb, station_mlfb, description } = req.body;
 
-    if (!protocol || !signal_type || !card_mlfb) {
-      return err(res, 400, 'protocol, signal_type, and card_mlfb are required');
-    }
-
-    // Verify card_mlfb exists in hw_module_templates
-    const template = db.prepare('SELECT id FROM hw_module_templates WHERE order_no=?').get(card_mlfb);
-    if (!template) {
-      return err(res, 400, `Card MLFB "${card_mlfb}" not found in module catalogue`);
+    if (!protocol || !signal_type || !card_mlfb || !station_mlfb) {
+      return err(res, 400, 'protocol, signal_type, card_mlfb, and station_mlfb are required');
     }
 
     // Upsert: try insert first, if unique constraint fails, update
     try {
-      db.prepare('INSERT INTO hw_hardware_resolution (protocol, signal_type, card_mlfb, description) VALUES (?,?,?,?)')
-        .run(protocol.trim(), signal_type.trim(), card_mlfb, description || null);
+      db.prepare('INSERT INTO hw_hardware_resolution (protocol, signal_type, card_mlfb, station_mlfb, description) VALUES (?,?,?,?,?)')
+        .run(protocol.trim(), signal_type.trim(), card_mlfb, station_mlfb, description || null);
       res.status(201).json({ ok: true, action: 'inserted' });
     } catch (e) {
       if (e.message.includes('UNIQUE')) {
-        db.prepare('UPDATE hw_hardware_resolution SET card_mlfb=?, description=? WHERE protocol=? AND signal_type=?')
-          .run(card_mlfb, description || null, protocol.trim(), signal_type.trim());
+        db.prepare('UPDATE hw_hardware_resolution SET card_mlfb=?, station_mlfb=?, description=? WHERE protocol=? AND signal_type=?')
+          .run(card_mlfb, station_mlfb, description || null, protocol.trim(), signal_type.trim());
         res.json({ ok: true, action: 'updated' });
       } else {
         throw e;
@@ -251,24 +245,16 @@ router.post('/hardware-resolution/import', upload.single('csv'), (req, res) => {
 
       // Simple CSV parsing (assumes no quotes or commas in values for simplicity)
       const parts = line.split(',').map(p => p.trim().replace(/^"(.*)"$/, '$1'));
-      if (parts.length < 3) {
+      if (parts.length < 4) {
         skipped++;
         continue;
       }
 
-      const [protocol, signal_type, card_mlfb, description] = parts;
+      const [protocol, signal_type, card_mlfb, station_mlfb, description] = parts;
       try {
-        // Verify card_mlfb exists
-        const template = db.prepare('SELECT id FROM hw_module_templates WHERE order_no=?').get(card_mlfb);
-        if (!template) {
-          errors.push(`Row ${i}: Card MLFB "${card_mlfb}" not found`);
-          skipped++;
-          continue;
-        }
-
         // Upsert
-        db.prepare('INSERT OR REPLACE INTO hw_hardware_resolution (protocol, signal_type, card_mlfb, description) VALUES (?,?,?,?)')
-          .run(protocol, signal_type, card_mlfb, description || null);
+        db.prepare('INSERT OR REPLACE INTO hw_hardware_resolution (protocol, signal_type, card_mlfb, station_mlfb, description) VALUES (?,?,?,?,?)')
+          .run(protocol, signal_type, card_mlfb, station_mlfb, description || null);
         imported++;
       } catch (e) {
         errors.push(`Row ${i}: ${e.message}`);
