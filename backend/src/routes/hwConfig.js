@@ -1016,7 +1016,7 @@ router.get('/imports/:id/preview-mapped', async (req, res) => {
     }
 
     const rawExcelRows = stored.map(r => JSON.parse(r.row_json));
-    const { rows, stations } = parseRawExcelRows(rawExcelRows, columnMap);
+    const { rows, stations, resolutionStats } = parseRawExcelRows(rawExcelRows, columnMap, db);
 
     // Build diff against current DB (same logic as preview-iolist)
     const CMP_FIELDS = ['station_address','station_name','ip_address','subsystem_no',
@@ -1106,6 +1106,8 @@ router.get('/imports/:id/preview-mapped', async (req, res) => {
                           module_name: cur.module_name, channel: cur.channel,
                           tag: cur.tag, signal_type: cur.signal_type, description: cur.description } : null,
         incoming: incomingNorm,
+        resolvedByTier2: !!inc.resolvedByTier2,
+        unresolved: !!inc.unresolved,
       });
     }
 
@@ -1135,6 +1137,7 @@ router.get('/imports/:id/preview-mapped', async (req, res) => {
       parsedRows: rows,
       fileName: 'Excel import',
       stationCount: stations.size,
+      resolutionStats,
     });
   } catch (e) { err(res, 500, e.message); }
 });
@@ -1181,8 +1184,9 @@ router.post('/imports/:id/apply-iolist', async (req, res) => {
       const ins = db.prepare(`
         INSERT INTO hw_signals
           (hw_import_id, row_number, station_address, station_name, ip_address,
-           slot, channel, module_order_no, module_name, tag, description, signal_type, subsystem_no, router_address)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           slot, channel, module_order_no, module_name, tag, description, signal_type, subsystem_no, router_address,
+           resolved_by_tier2, unresolved)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       `);
 
       let rowIdx = 0;
@@ -1197,7 +1201,8 @@ router.post('/imports/:id/apply-iolist', async (req, res) => {
 
         ins.run(importId, r.rowNum ?? rowIdx, r.stationAddr, r.stationName, r.ip,
           r.slot, r.channel ?? null, r.orderNo, r.moduleName, r.tag, r.desc,
-          r.signalType, r.subsystemNo ?? null, r.routerAddress || null);
+          r.signalType, r.subsystemNo ?? null, r.routerAddress || null,
+          r.resolvedByTier2 ?? 0, r.unresolved ?? 0);
         rowIdx++;
       }
 

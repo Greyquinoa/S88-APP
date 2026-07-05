@@ -43,6 +43,10 @@ export async function previewLibraryUpload(file, onProgress) {
   });
 }
 
+export async function computeLibraryDiff(token) {
+  return request('POST', '/library/compute-diff', { token });
+}
+
 export async function importLibrary(token, selectedNames) {
   return request('POST', '/library/import', { token, selectedNames });
 }
@@ -58,6 +62,12 @@ export async function getCmTypes() {
 
 export async function getCmTypeBlocks(cmTypeName) {
   return request('GET', `/cm-types/${encodeURIComponent(cmTypeName)}/blocks`);
+}
+export async function getCmTypeBlockPrefs(cmTypeName) {
+  return request('GET', `/cm-types/${encodeURIComponent(cmTypeName)}/block-prefs`);
+}
+export async function saveCmTypeBlockPrefs(cmTypeName, enabledBlocks) {
+  return request('PUT', `/cm-types/${encodeURIComponent(cmTypeName)}/block-prefs`, { enabledBlocks });
 }
 export async function patchVarDefault(cmTypeName, varId, val) {
   return request('PATCH', `/cm-types/${encodeURIComponent(cmTypeName)}/vars/${varId}`, { val });
@@ -92,6 +102,23 @@ export async function getUnitType(id)            { return request('GET',    `/un
 export async function createUnitType(data)        { return request('POST',   '/unit-types', data); }
 export async function updateUnitType(id, data)    { return request('PUT',    `/unit-types/${id}`, data); }
 export async function deleteUnitType(id)          { return request('DELETE', `/unit-types/${id}`); }
+
+// ── Unit Type Connections ─────────────────────────────────────────────────────
+export async function getUnitTypeConnections(unitTypeId) {
+  return request('GET', `/unit-types/${unitTypeId}/connections`);
+}
+
+export async function saveUnitTypeConnections(unitTypeId, connections, validateCycles = true) {
+  return request('POST', `/unit-types/${unitTypeId}/connections`, { connections, validateCycles });
+}
+
+export async function deleteUnitTypeConnection(unitTypeId, connId) {
+  return request('DELETE', `/unit-types/${unitTypeId}/connections/${connId}`);
+}
+
+export async function getCmTypeVariablesForUnit(unitTypeId) {
+  return request('GET', `/unit-types/${unitTypeId}/cm-type-variables`);
+}
 
 // ── Unit Instances (per project) ──────────────────────────────────────────────
 export async function getUnitInstances(projectId) {
@@ -147,6 +174,13 @@ export async function approveAllIOTags(importId, tagIds) {
 }
 export async function rejectIOTag(importId, tagId) {
   return request('POST', `/io/imports/${importId}/tags/${tagId}/reject`);
+}
+
+export async function getIOColumnPrefs(importId) {
+  return request('GET', `/io/imports/${importId}/column-prefs`);
+}
+export async function saveIOColumnPrefs(importId, activeColumns) {
+  return request('PUT', `/io/imports/${importId}/column-prefs`, { activeColumns });
 }
 
 export async function getIOColumnMaps()           { return request('GET',    '/io/column-maps'); }
@@ -226,6 +260,25 @@ export async function getHwModuleTemplateUsage(id) {
 export async function deleteHwModuleTemplate(id) {
   return request('DELETE', `/hw-config/module-templates/${id}`);
 }
+
+// ── Tier 2 Hardware Resolution (Protocol + SignalType → Card MLFB) ────────────
+export async function listHwHardwareResolutions(page = 0, limit = 200) {
+  return request('GET', `/hw-config/hardware-resolution?page=${page}&limit=${limit}`);
+}
+export async function upsertHwHardwareResolution(data) {
+  return request('POST', '/hw-config/hardware-resolution', data);
+}
+export async function deleteHwHardwareResolution(id) {
+  return request('DELETE', `/hw-config/hardware-resolution/${id}`);
+}
+export function exportHwHardwareResolutionUrl() {
+  return `${BASE}/hw-config/hardware-resolution/export`;
+}
+export async function importHwHardwareResolutionCsv(file) {
+  const fd = new FormData();
+  fd.append('csv', file);
+  return request('POST', '/hw-config/hardware-resolution/import', fd, true);
+}
 export async function parseCfgForCatalogue(file) {
   const fd = new FormData();
   fd.append('cfg', file);
@@ -242,12 +295,35 @@ export async function uploadHwBaseline(projectId, file) {
   fd.append('baseline', file);
   return request('POST', `/hw-config/project/${projectId}/upload-baseline`, fd, true);
 }
-export async function uploadHwIoList(importId, file, sheetName) {
+export async function uploadHwIoList(importId, file, sheetName, columnMapJson) {
   const fd = new FormData();
   fd.append('iolist', file);
-  const qs = sheetName ? `?sheet=${encodeURIComponent(sheetName)}` : '';
+  const params = new URLSearchParams();
+  if (sheetName) params.append('sheet', sheetName);
+  if (columnMapJson) params.append('columnMap', columnMapJson);
+  const qs = params.toString() ? `?${params.toString()}` : '';
   return request('POST', `/hw-config/imports/${importId}/upload-iolist${qs}`, fd, true);
 }
+export async function previewHwIoList(importId, file, sheetName, columnMapJson) {
+  const fd = new FormData();
+  fd.append('iolist', file);
+  const params = new URLSearchParams();
+  if (sheetName) params.append('sheet', sheetName);
+  if (columnMapJson) params.append('columnMap', columnMapJson);
+  const qs = params.toString() ? `?${params.toString()}` : '';
+  return request('POST', `/hw-config/imports/${importId}/preview-iolist${qs}`, fd, true);
+}
+
+export async function applyHwIoList(importId, approvedKeys, parsedRows, fileName, missingKeys) {
+  return request('POST', `/hw-config/imports/${importId}/apply-iolist`,
+    { approvedKeys, parsedRows, fileName, missingKeys });
+}
+
+export async function getColumnMappingSuggestions(importId, selectedColumns) {
+  return request('POST', `/hw-config/imports/${importId}/suggest-column-mappings`,
+    { selectedColumns });
+}
+
 export async function getHwStations(importId) {
   return request('GET', `/hw-config/imports/${importId}/stations`);
 }
@@ -393,3 +469,51 @@ export async function getCompositeCmType(id)           { return request('GET',  
 export async function createCompositeCmType(data)       { return request('POST',   '/composite-cm-types', data); }
 export async function updateCompositeCmType(id, data)   { return request('PUT',    `/composite-cm-types/${id}`, data); }
 export async function deleteCompositeCmType(id)         { return request('DELETE', `/composite-cm-types/${id}`); }
+
+// ── IO Connection Rules (lib_io_connections) ──────────────────────────────────
+export async function getIoConnections(cmTypeId) {
+  return request('GET', `/io-connections/cm-type/${cmTypeId}`);
+}
+export async function createIoConnection(cmTypeId, data) {
+  return request('POST', `/io-connections/cm-type/${cmTypeId}`, data);
+}
+export async function updateIoConnection(id, data) {
+  return request('PUT', `/io-connections/${id}`, data);
+}
+export async function deleteIoConnection(id) {
+  return request('DELETE', `/io-connections/${id}`);
+}
+export async function reorderIoConnections(cmTypeId, ids) {
+  return request('PATCH', `/io-connections/cm-type/${cmTypeId}/reorder`, { ids });
+}
+
+// ── Signal-to-Instance Mapping ────────────────────────────────────────────────
+export async function getSignalMappings(projectId, instance) {
+  const qs = instance ? `?instance=${encodeURIComponent(instance)}` : '';
+  return request('GET', `/signal-mappings/project/${projectId}${qs}`);
+}
+export async function saveInstanceSignalMappings(projectId, instanceName, mappings) {
+  return request('PUT', `/signal-mappings/project/${projectId}/instance/${encodeURIComponent(instanceName)}`, { mappings });
+}
+export async function deleteSignalMapping(id) {
+  return request('DELETE', `/signal-mappings/${id}`);
+}
+export async function getMappableSignals(projectId, { q = '', type = '', limit = 200 } = {}) {
+  const params = new URLSearchParams();
+  if (q)    params.set('q', q);
+  if (type) params.set('type', type);
+  if (limit) params.set('limit', String(limit));
+  const qs = params.toString();
+  return request('GET', `/signal-mappings/project/${projectId}/signals${qs ? '?' + qs : ''}`);
+}
+
+// ── Connection Generation (dummy ↔ hardware reconciliation) ───────────────────
+// Match every CM instance dummy IO against hardware symbols by exact name. Match
+// → REAL (bound to hardware address); no match → stays DUMMY. Re-runnable.
+export async function generateConnections(projectId) {
+  return request('POST', `/connections/project/${projectId}/generate`);
+}
+export async function getConnectionIOs(projectId, status) {
+  const qs = status ? `?status=${encodeURIComponent(status)}` : '';
+  return request('GET', `/connections/project/${projectId}${qs}`);
+}

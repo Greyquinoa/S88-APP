@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useRef } from "react";
 import MRPTopologyView from "./MRPTopologyView.jsx";
 import HwImportReview from "./HwImportReview.jsx";
+import HwColumnMappingPanel from "./HwColumnMappingPanel.jsx";
 import {
   listHwImports, uploadHwBaseline, uploadHwIoList, previewHwIoList,
   getHwStations, getHwAddressPreview, generateHwCfg, listHwCfgs, hwCfgDownloadUrl,
-  backfillFromCfg,
+  backfillFromCfg, getColumnMappingSuggestions,
   updateHwStation, updateHwSlot,
   listHwModuleTemplates,
   addHwStation, deleteHwStation, addHwSlot, deleteHwSlot,
@@ -18,10 +19,14 @@ import {
   listSlotCompat, addSlotCompat, removeSlotCompat,
   listHwSignalTypes, addHwSignalType,
   mrpGetDevices, mrpGetConfig, mrpSaveConfig, mrpDownloadCfg,
+  listHwHardwareResolutions, upsertHwHardwareResolution, deleteHwHardwareResolution,
+  exportHwHardwareResolutionUrl, importHwHardwareResolutionCsv,
 } from "./api.js";
 
 import StepController from "./StepController.jsx";
 import HwConfigGrid from "./HwConfigGrid.tsx";
+import CatalogueGrid from "./CatalogueGrid.jsx";
+import SymbolTableModal from "./SymbolTableModal.jsx";
 
 
 export default function StepHWConfig({ projectId }) {
@@ -41,6 +46,7 @@ export default function StepHWConfig({ projectId }) {
   const [cfgs,         setCfgs]         = useState([]);
   const [loading,      setLoading]      = useState("");
   const [error,        setError]        = useState("");
+  const [genWarnings,  setGenWarnings]  = useState([]);   // identifier diagnostics from last CFG generate
 
   // Inline-edit state
   const [editing, setEditing] = useState(null);
@@ -59,6 +65,14 @@ export default function StepHWConfig({ projectId }) {
 
   // Catalogue delete confirmation modal
   const [deleteCatalogueTarget, setDeleteCatalogueTarget] = useState(null);
+
+  // Symbol Table modal
+  const [showSymbolTable, setShowSymbolTable] = useState(false);
+
+  // Column mapping workflow (HW Import) — separate tab
+  const [excelFile, setExcelFile] = useState(null);
+  const [excelHeaders, setExcelHeaders] = useState([]);
+  const [selectedColumns, setSelectedColumns] = useState(new Set());
 
   // Slot ↔ Subslot compatibility map
   const [slotCompat, setSlotCompat] = useState([]); // [{ id, slot_order_no, subslot_order_no, is_default }]
@@ -144,22 +158,23 @@ export default function StepHWConfig({ projectId }) {
   async function handleIoListUpload(e) {
     const file = e.target.files[0];
     if (!file || !importId) { setError("Upload a baseline CFG first."); return; }
-    setLoading("Analysing import file…");
+    setLoading("Reading Excel headers…");
     setError("");
     try {
-      // If there are already stations in the grid, run delta analysis first
-      if (stations.length > 0) {
-        const diff = await previewHwIoList(importId, file);
-        setReviewData(diff);
-      } else {
-        // First import — no existing data, skip review screen
-        const result = await uploadHwIoList(importId, file);
-        setIoListOk(true);
-        setIoListInfo({ stationCount: result.stationCount, signalCount: result.signalCount });
-        await loadStations(importId);
-        await loadCfgs(importId);
-        setHwTab("config");
-      }
+      const fd = new FormData();
+      fd.append('iolist', file);
+      const headersResp = await fetch(`/api/hw-config/imports/${importId}/parse-headers`, {
+        method: 'POST',
+        body: fd,
+      });
+      if (!headersResp.ok) throw new Error('Failed to read Excel headers');
+      const { headers } = await headersResp.json();
+
+      // Store file and headers — colmap sub-tab lives inside the import panel now
+      setExcelFile(file);
+      setExcelHeaders(headers);
+      setSelectedColumns(new Set(headers));
+      setHwTab("import"); // stay on import tab; sub-tab switching happens inside ImportPanel
     } catch (err) { setError(err.message); }
     finally { setLoading(""); }
   }
@@ -202,8 +217,10 @@ export default function StepHWConfig({ projectId }) {
     }
     setLoading("Generating CFG…");
     setError("");
+    setGenWarnings([]);
     try {
-      await generateHwCfg(importId, opts);
+      const result = await generateHwCfg(importId, opts);
+      setGenWarnings(Array.isArray(result?.warnings) ? result.warnings : []);
       await loadCfgs(importId);
     } catch (err) { setError(err.message); }
     finally { setLoading(""); }
@@ -493,10 +510,25 @@ export default function StepHWConfig({ projectId }) {
 
         {error && <div style={alertStyle("#ffeaea", "#e88", "#b00")}>{error}</div>}
         {loading && <div style={alertStyle("#eef4ff", "#99b", "#336")}>{loading}</div>}
+        {genWarnings.length > 0 && (
+          <div style={alertStyle("#fffbeb", "#fcd34d", "#92400e")}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+              <strong>⚠ CFG generated with {genWarnings.length} identifier warning{genWarnings.length !== 1 ? "s" : ""}</strong>
+              <button onClick={() => setGenWarnings([])}
+                style={{ background: "none", border: "none", cursor: "pointer", color: "#92400e", fontSize: 16, lineHeight: 1 }}
+                title="Dismiss">✕</button>
+            </div>
+            <ul style={{ margin: "6px 0 0 0", paddingLeft: 20, fontSize: 12 }}>
+              {genWarnings.slice(0, 20).map((w, i) => <li key={i}>{w}</li>)}
+              {genWarnings.length > 20 && <li>…and {genWarnings.length - 20} more</li>}
+            </ul>
+          </div>
+        )}
 
-        {/* Import */}
+        {/* Import + Column Mapping — tabbed workspace */}
         {hwTab === "import" && (
-          <ImportPanel
+          <ImportWorkspace
+            /* import panel props */
             baselineOk={baselineOk}
             baselineInfo={baselineInfo}
             ioListOk={ioListOk}
@@ -522,6 +554,16 @@ export default function StepHWConfig({ projectId }) {
               if (file) handleBackfillFromCfg(file);
             }}
             loading={loading}
+            /* column mapping props */
+            excelHeaders={excelHeaders}
+            selectedColumns={selectedColumns}
+            setSelectedColumns={setSelectedColumns}
+            setError={setError}
+            setLoading={setLoading}
+            showColmap={excelHeaders.length > 0}
+            onMappingComplete={(data) => {
+              setReviewData(data);
+            }}
           />
         )}
 
@@ -574,6 +616,11 @@ export default function StepHWConfig({ projectId }) {
               } catch (e) { setError(e.message); setDeleteCatalogueTarget(null); }
             }}
           />
+        )}
+
+        {/* Protocol Mapping (Tier 2 Hardware Resolution) */}
+        {hwTab === "protocolMapping" && (
+          <ProtocolMappingPanel templates={templates} setError={setError} />
         )}
 
         {/* Controller — sub-tabs when a controller is selected */}
@@ -677,11 +724,11 @@ export default function StepHWConfig({ projectId }) {
                 onSaveSlotSubslotProfile={handleSaveSlotSubslotProfile}
                 onGenerate={handleGenerate}
                 isEditing={isEditing}
-                editVal={editVal}
                 onStartEdit={startEdit}
                 onChangeEdit={setEditVal}
                 onCommitEdit={commitEdit}
                 onCancelEdit={cancelEdit}
+                onShowSymbolTable={() => setShowSymbolTable(true)}
               />
             )}
           </>
@@ -696,8 +743,18 @@ export default function StepHWConfig({ projectId }) {
           items={reviewData.items}
           parsedRows={reviewData.parsedRows}
           fileName={reviewData.fileName}
+          resolutionStats={reviewData.resolutionStats}
           onApplied={handleReviewApplied}
           onClose={() => setReviewData(null)}
+        />
+      )}
+
+      {/* ── Symbol Table modal ──────────────────────────────────────────── */}
+      {showSymbolTable && importId && (
+        <SymbolTableModal
+          importId={importId}
+          stations={stations}
+          onClose={() => setShowSymbolTable(false)}
         />
       )}
     </div>
@@ -1769,6 +1826,7 @@ function NavPanel({ hwTab, setHwTab, controllers, selectedId, onSelect }) {
       <div style={{ paddingBottom: 8, borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
         {navBtn("import", "⬆ Import")}
         {navBtn("catalogue", "📋 Catalogue")}
+        {navBtn("protocolMapping", "🔗 Protocol Mapping")}
       </div>
 
       {/* Controllers section */}
@@ -1805,6 +1863,71 @@ function NavPanel({ hwTab, setHwTab, controllers, selectedId, onSelect }) {
             </div>
           );
         })}
+      </div>
+    </div>
+  );
+}
+
+// ── Import Workspace (Import + Column Mapping tabs) ───────────────────────────
+function ImportWorkspace({
+  // ImportPanel props
+  baselineOk, baselineInfo, ioListOk, ioListInfo, importId,
+  baselineRef, ioListRef, cfgBackfillRef,
+  onBaselineChange, onIoListChange, onBaselineBtn, onIoListBtn,
+  onBackfillFromCfg, onCfgBackfillChange, loading,
+  // Column Mapping props
+  excelHeaders, selectedColumns, setSelectedColumns,
+  setError, setLoading, showColmap, onMappingComplete,
+}) {
+  const [subTab, setSubTab] = React.useState(showColmap ? 'colmap' : 'import');
+
+  // Switch to colmap automatically when Excel is uploaded
+  React.useEffect(() => {
+    if (showColmap) setSubTab('colmap');
+  }, [showColmap]);
+
+  const tabStyle = (id) => ({
+    padding: '8px 20px', fontSize: 13, border: 'none', borderBottom: subTab === id ? '2px solid #2255cc' : '2px solid transparent',
+    background: 'transparent', cursor: 'pointer', fontWeight: subTab === id ? 700 : 400,
+    color: subTab === id ? '#2255cc' : 'var(--color-text-secondary)',
+  });
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+      {/* Tab bar */}
+      <div style={{ display: 'flex', borderBottom: '1px solid var(--color-border-secondary)', flexShrink: 0 }}>
+        <button style={tabStyle('import')} onClick={() => setSubTab('import')}>Import</button>
+        {showColmap && (
+          <button style={tabStyle('colmap')} onClick={() => setSubTab('colmap')}>Column Mapping</button>
+        )}
+      </div>
+
+      {/* Tab content */}
+      <div style={{ flex: 1, overflowY: 'auto' }}>
+        {subTab === 'import' && (
+          <ImportPanel
+            baselineOk={baselineOk} baselineInfo={baselineInfo}
+            ioListOk={ioListOk} ioListInfo={ioListInfo}
+            importId={importId}
+            baselineRef={baselineRef} ioListRef={ioListRef} cfgBackfillRef={cfgBackfillRef}
+            onBaselineChange={onBaselineChange} onIoListChange={onIoListChange}
+            onBaselineBtn={onBaselineBtn} onIoListBtn={onIoListBtn}
+            onBackfillFromCfg={onBackfillFromCfg} onCfgBackfillChange={onCfgBackfillChange}
+            loading={loading}
+          />
+        )}
+        {subTab === 'colmap' && (
+          <HwColumnMappingPanel
+            importId={importId}
+            excelHeaders={excelHeaders}
+            selectedColumns={selectedColumns}
+            setSelectedColumns={setSelectedColumns}
+            setError={setError}
+            setLoading={setLoading}
+            loading={loading}
+            onMappingComplete={onMappingComplete}
+          />
+        )}
       </div>
     </div>
   );
@@ -1940,40 +2063,6 @@ function ImportPanel({
 }
 
 // ── Catalogue Panel ────────────────────────────────────────────────────────────
-const CATALOGUE_COLS = [
-  { key: "orderNo",      header: "Order No",     defaultW: 160, align: "left"   },
-  { key: "displayName",  header: "Display Name", defaultW: 190, align: "left"   },
-  { key: "category",     header: "Category",     defaultW: 80,  align: "center" },
-  { key: "sigType",      header: "Sig Type",     defaultW: 70,  align: "center" },
-  { key: "channels",     header: "Channels",     defaultW: 65,  align: "center" },
-  { key: "inBytes",      header: "In bytes",     defaultW: 65,  align: "center" },
-  { key: "outBytes",     header: "Out bytes",    defaultW: 65,  align: "center" },
-  { key: "version",      header: "Version",      defaultW: 70,  align: "left"   },
-  { key: "subslots",     header: "Subslots",     defaultW: 170, align: "left"   },
-  { key: "actions",      header: "",             defaultW: 44,  align: "center" },
-];
-
-const CATALOGUE_COL_WIDTHS_KEY = "catalogue-col-widths-v1";
-
-function useCatalogueColWidths() {
-  const defaults = CATALOGUE_COLS.map(c => c.defaultW);
-  const [widths, setWidths] = useState(() => {
-    try {
-      const saved = JSON.parse(localStorage.getItem(CATALOGUE_COL_WIDTHS_KEY));
-      if (Array.isArray(saved) && saved.length === defaults.length && saved.every(w => typeof w === "number" && w > 0)) {
-        return saved;
-      }
-    } catch {}
-    return defaults;
-  });
-
-  const save = (next) => {
-    setWidths(next);
-    try { localStorage.setItem(CATALOGUE_COL_WIDTHS_KEY, JSON.stringify(next)); } catch {}
-  };
-
-  return [widths, save];
-}
 
 const CATEGORY_BADGE = {
   station: { label: "Station", bg: "#e0f2fe", color: "#0369a1" },
@@ -1994,326 +2083,277 @@ function CategoryBadge({ category }) {
 
 const SIG_TYPES = ['DI', 'DO', 'AI', 'AO', 'PA', 'INFRA', 'MIXED'];
 
-function CataloguePanel({ templates, slotCompat, sigTypes, onTemplatesChanged, onPatchTemplate, onAddSigType, onAddCompat, onRemoveCompat, onDeleteTemplate }) {
-  const [search,          setSearch]          = useState("");
-  const [familyFilter,    setFamilyFilter]    = useState("ALL");
-  const [showImport,      setShowImport]      = useState(false);
-  const [addingSigFor,    setAddingSigFor]    = useState(null);
-  const [newSigInput,     setNewSigInput]     = useState("");
-  const [expandedSlot,    setExpandedSlot]    = useState(null);
-  const cfgImportRef = useRef();
-  const [colWidths, saveColWidths] = useCatalogueColWidths();
-  const dragState = useRef(null); // { colIdx, startX, startW }
+// ── Protocol Mapping Panel (Tier 2 Hardware Resolution admin UI) ─────────────
+function ProtocolMappingPanel({ templates, setError }) {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [search, setSearch] = useState("");
+  const [showAdd, setShowAdd] = useState(false);
+  const [editRow, setEditRow] = useState(null); // row being edited, or null
+  const [deleteTarget, setDeleteTarget] = useState(null);
+  const csvInputRef = useRef();
 
-  const onResizeStart = (colIdx, e) => {
-    e.preventDefault();
-    dragState.current = { colIdx, startX: e.clientX, startW: colWidths[colIdx] };
-    const onMove = (ev) => {
-      if (!dragState.current) return;
-      const { colIdx: ci, startX, startW } = dragState.current;
-      const next = [...colWidths];
-      next[ci] = Math.max(30, startW + ev.clientX - startX);
-      // Update colgroup cols directly for smooth drag without React re-render
-      document.querySelectorAll(`.catalogue-colgroup-col-${ci}`).forEach(el => {
-        el.style.width = next[ci] + "px";
-      });
-      dragState.current._pending = next;
-    };
-    const onUp = () => {
-      if (dragState.current && dragState.current._pending) {
-        saveColWidths(dragState.current._pending);
+  function reload() {
+    setLoading(true);
+    listHwHardwareResolutions()
+      .then(data => setRows(data.rows || []))
+      .catch(e => setError(e.message))
+      .finally(() => setLoading(false));
+  }
+
+  useEffect(() => { reload(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const filtered = rows.filter(r => {
+    if (!search.trim()) return true;
+    const q = search.toLowerCase();
+    return (r.protocol || "").toLowerCase().includes(q)
+      || (r.signal_type || "").toLowerCase().includes(q)
+      || (r.card_mlfb || "").toLowerCase().includes(q)
+      || (r.display_name || "").toLowerCase().includes(q);
+  });
+
+  async function handleSave(data) {
+    setError("");
+    try {
+      await upsertHwHardwareResolution(data);
+      setShowAdd(false);
+      setEditRow(null);
+      reload();
+    } catch (e) { setError(e.message); }
+  }
+
+  async function handleDelete(row) {
+    setError("");
+    try {
+      await deleteHwHardwareResolution(row.id);
+      setDeleteTarget(null);
+      reload();
+    } catch (e) { setError(e.message); }
+  }
+
+  async function handleCsvImport(file) {
+    setError("");
+    try {
+      const result = await importHwHardwareResolutionCsv(file);
+      reload();
+      if (result.errors && result.errors.length) {
+        setError(`Imported ${result.imported}, skipped ${result.skipped}. Errors: ${result.errors.join('; ')}`);
       }
-      dragState.current = null;
-      document.removeEventListener("mousemove", onMove);
-      document.removeEventListener("mouseup", onUp);
-    };
-    document.addEventListener("mousemove", onMove);
-    document.addEventListener("mouseup", onUp);
-  };
+    } catch (e) { setError(e.message); }
+  }
+
+  const slotTemplates = templates.filter(t => t.hw_category === 'slot' || !t.hw_category);
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+        <div>
+          <h3 style={{ margin: 0, fontSize: 15, fontWeight: 700 }}>Protocol Mapping — Tier 2 Hardware Resolution</h3>
+          <p style={{ margin: "4px 0 0 0", fontSize: 12, color: "var(--color-text-secondary)" }}>
+            Maps Protocol + Signal Type combinations to a Card MLFB. Used during Excel import when the
+            "Card MLFB" column is not mapped — the parser derives the card (and station) from these entries instead.
+          </p>
+        </div>
+        <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+          <input type="file" accept=".csv" ref={csvInputRef} style={{ display: "none" }}
+            onChange={e => { if (e.target.files[0]) handleCsvImport(e.target.files[0]); e.target.value = ""; }} />
+          <button onClick={() => csvInputRef.current?.click()} style={btnSecondary}>⬆ Import CSV</button>
+          <a href={exportHwHardwareResolutionUrl()} style={{ ...btnSecondary, textDecoration: "none", display: "inline-flex", alignItems: "center" }}>⬇ Export CSV</a>
+          <button onClick={() => setShowAdd(true)} style={btnPrimary}>+ Add Mapping</button>
+        </div>
+      </div>
+
+      <input
+        type="text" placeholder="Search protocol, signal type, or card MLFB…"
+        value={search} onChange={e => setSearch(e.target.value)}
+        style={{
+          width: "100%", maxWidth: 400, padding: "7px 10px", fontSize: 12, marginBottom: 12,
+          border: "0.5px solid var(--color-border-secondary)", borderRadius: 4,
+          background: "var(--color-background-secondary)", color: "var(--color-text-primary)",
+        }}
+      />
+
+      {loading ? (
+        <div style={{ padding: 20, fontSize: 13, color: "var(--color-text-secondary)" }}>Loading…</div>
+      ) : filtered.length === 0 ? (
+        <div style={{ padding: 20, fontSize: 13, color: "var(--color-text-secondary)", fontStyle: "italic" }}>
+          {rows.length === 0 ? "No mappings defined yet. Click \"Add Mapping\" to create one." : "No mappings match your search."}
+        </div>
+      ) : (
+        <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 12 }}>
+          <thead>
+            <tr style={{ background: "var(--color-background-secondary)" }}>
+              <th style={pmThStyle}>Protocol</th>
+              <th style={pmThStyle}>Signal Type</th>
+              <th style={pmThStyle}>Card MLFB</th>
+              <th style={pmThStyle}>Display Name</th>
+              <th style={pmThStyle}>Family</th>
+              <th style={pmThStyle}>Description</th>
+              <th style={{ ...pmThStyle, width: 110 }}>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map(r => (
+              <tr key={r.id} style={{ borderBottom: "1px solid var(--color-border-tertiary)" }}>
+                <td style={pmTdStyle}>{r.protocol}</td>
+                <td style={pmTdStyle}>{r.signal_type}</td>
+                <td style={{ ...pmTdStyle, fontFamily: "var(--font-mono, monospace)" }}>{r.card_mlfb}</td>
+                <td style={pmTdStyle}>{r.display_name || "—"}</td>
+                <td style={pmTdStyle}>{r.family || "—"}</td>
+                <td style={pmTdStyle}>{r.description || "—"}</td>
+                <td style={pmTdStyle}>
+                  <button onClick={() => setEditRow(r)} style={linkBtn}>Edit</button>
+                  <button onClick={() => setDeleteTarget(r)} style={{ ...linkBtn, color: "#c00" }}>Delete</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      {(showAdd || editRow) && (
+        <ProtocolMappingModal
+          initial={editRow}
+          templates={slotTemplates}
+          onClose={() => { setShowAdd(false); setEditRow(null); }}
+          onSave={handleSave}
+        />
+      )}
+
+      {deleteTarget && (
+        <ProtocolMappingDeleteConfirm
+          title="Delete Mapping"
+          message={`Delete mapping "${deleteTarget.protocol} + ${deleteTarget.signal_type}" → ${deleteTarget.card_mlfb}?`}
+          onCancel={() => setDeleteTarget(null)}
+          onConfirm={() => handleDelete(deleteTarget)}
+        />
+      )}
+    </div>
+  );
+}
+
+const pmThStyle = { padding: "8px 12px", textAlign: "left", fontWeight: 600, fontSize: 11, borderBottom: "1px solid var(--color-border-secondary)" };
+const pmTdStyle = { padding: "7px 12px" };
+const linkBtn = { background: "none", border: "none", color: "#2255cc", cursor: "pointer", fontSize: 12, padding: "2px 6px", marginRight: 4 };
+const btnPrimary = { padding: "7px 14px", fontSize: 12, fontWeight: 600, border: "none", borderRadius: 4, background: "#2255cc", color: "#fff", cursor: "pointer" };
+const btnSecondary = { padding: "7px 14px", fontSize: 12, fontWeight: 600, border: "0.5px solid var(--color-border-secondary)", borderRadius: 4, background: "transparent", color: "var(--color-text-primary)", cursor: "pointer" };
+
+function ProtocolMappingModal({ initial, templates, onClose, onSave }) {
+  const [protocol, setProtocol] = useState(initial?.protocol || "");
+  const [signalType, setSignalType] = useState(initial?.signal_type || "");
+  const [cardMlfb, setCardMlfb] = useState(initial?.card_mlfb || "");
+  const [description, setDescription] = useState(initial?.description || "");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState("");
+
+  async function handleSubmit() {
+    if (!protocol.trim() || !signalType.trim() || !cardMlfb.trim()) {
+      setErr("Protocol, Signal Type, and Card MLFB are all required");
+      return;
+    }
+    setSaving(true);
+    setErr("");
+    try {
+      await onSave({ protocol: protocol.trim(), signal_type: signalType.trim(), card_mlfb: cardMlfb, description: description.trim() || null });
+    } catch (e) {
+      setErr(e.message);
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 3000, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div style={{ width: 440, background: "var(--color-background-primary)", borderRadius: 8, padding: 24, boxShadow: "0 10px 40px rgba(0,0,0,0.3)" }}>
+        <h3 style={{ margin: "0 0 16px 0", fontSize: 15, fontWeight: 700 }}>{initial ? "Edit Mapping" : "Add Mapping"}</h3>
+
+        <div style={{ marginBottom: 12 }}>
+          <label style={{ fontSize: 11, fontWeight: 600, display: "block", marginBottom: 4 }}>Protocol</label>
+          <input type="text" value={protocol} onChange={e => setProtocol(e.target.value)}
+            placeholder="e.g. SoftIO, STD, PF, Profibus DP…"
+            style={{ width: "100%", padding: "7px 10px", fontSize: 12, border: "0.5px solid var(--color-border-secondary)", borderRadius: 4, background: "var(--color-background-secondary)", color: "var(--color-text-primary)" }} />
+        </div>
+
+        <div style={{ marginBottom: 12 }}>
+          <label style={{ fontSize: 11, fontWeight: 600, display: "block", marginBottom: 4 }}>Signal Type</label>
+          <input type="text" value={signalType} onChange={e => setSignalType(e.target.value)}
+            placeholder="e.g. DI, DO, AI, AO…"
+            style={{ width: "100%", padding: "7px 10px", fontSize: 12, border: "0.5px solid var(--color-border-secondary)", borderRadius: 4, background: "var(--color-background-secondary)", color: "var(--color-text-primary)" }} />
+        </div>
+
+        <div style={{ marginBottom: 12 }}>
+          <label style={{ fontSize: 11, fontWeight: 600, display: "block", marginBottom: 4 }}>Card MLFB</label>
+          <select value={cardMlfb} onChange={e => setCardMlfb(e.target.value)}
+            style={{ width: "100%", padding: "7px 10px", fontSize: 12, fontFamily: "var(--font-mono, monospace)", border: "0.5px solid var(--color-border-secondary)", borderRadius: 4, background: "var(--color-background-secondary)", color: "var(--color-text-primary)" }}>
+            <option value="">— Select module —</option>
+            {templates.map(t => (
+              <option key={t.id} value={t.order_no}>{t.order_no} · {t.display_name}</option>
+            ))}
+          </select>
+        </div>
+
+        <div style={{ marginBottom: 16 }}>
+          <label style={{ fontSize: 11, fontWeight: 600, display: "block", marginBottom: 4 }}>Description (optional)</label>
+          <input type="text" value={description} onChange={e => setDescription(e.target.value)}
+            style={{ width: "100%", padding: "7px 10px", fontSize: 12, border: "0.5px solid var(--color-border-secondary)", borderRadius: 4, background: "var(--color-background-secondary)", color: "var(--color-text-primary)" }} />
+        </div>
+
+        {err && <div style={{ color: "#c00", fontSize: 12, marginBottom: 12 }}>{err}</div>}
+
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+          <button onClick={onClose} style={btnSecondary}>Cancel</button>
+          <button onClick={handleSubmit} disabled={saving} style={{ ...btnPrimary, opacity: saving ? 0.6 : 1 }}>
+            {saving ? "Saving…" : "Save"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ProtocolMappingDeleteConfirm({ title, message, onCancel, onConfirm }) {
+  const [busy, setBusy] = useState(false);
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 3000, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div style={{ width: 380, background: "var(--color-background-primary)", borderRadius: 8, padding: 24, boxShadow: "0 10px 40px rgba(0,0,0,0.3)" }}>
+        <h3 style={{ margin: "0 0 12px 0", fontSize: 15, fontWeight: 700 }}>{title}</h3>
+        <p style={{ margin: "0 0 20px 0", fontSize: 13, color: "var(--color-text-secondary)" }}>{message}</p>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+          <button onClick={onCancel} style={btnSecondary}>Cancel</button>
+          <button onClick={async () => { setBusy(true); await onConfirm(); }} disabled={busy}
+            style={{ ...btnPrimary, background: "#c00", opacity: busy ? 0.6 : 1 }}>
+            {busy ? "Deleting…" : "Delete"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CataloguePanel({ templates, slotCompat, sigTypes, onTemplatesChanged, onPatchTemplate, onAddSigType, onAddCompat, onRemoveCompat, onDeleteTemplate }) {
+  const [showImport, setShowImport] = useState(false);
+  const cfgImportRef = useRef();
 
   // All known signal types come from the DB (sigTypes prop).
   // Fall back to hardcoded SIG_TYPES only while the initial fetch is in-flight.
   const allSigTypes = sigTypes && sigTypes.length ? sigTypes : SIG_TYPES;
 
-  // Build fast lookup sets from slotCompat
-  const compatBySlot    = {};  // slot_order_no    → Set of subslot_order_no
-  const compatBySubslot = {};  // subslot_order_no → Set of slot_order_no
-  for (const row of (slotCompat || [])) {
-    if (!compatBySlot[row.slot_order_no]) compatBySlot[row.slot_order_no] = new Set();
-    compatBySlot[row.slot_order_no].add(row.subslot_order_no);
-    if (!compatBySubslot[row.subslot_order_no]) compatBySubslot[row.subslot_order_no] = new Set();
-    compatBySubslot[row.subslot_order_no].add(row.slot_order_no);
-  }
-
-  const families = ["ALL", ...Array.from(new Set(templates.map(t => t.family))).sort()];
-
-  const filtered = templates.filter(t => {
-    if (familyFilter !== "ALL" && t.family !== familyFilter) return false;
-    if (!search) return true;
-    const q = search.toLowerCase();
-    return (t.order_no || "").toLowerCase().includes(q) ||
-           (t.display_name || "").toLowerCase().includes(q) ||
-           (t.signal_type || "").toLowerCase().includes(q);
-  });
-
-  const grouped = {};
-  for (const t of filtered) {
-    if (!grouped[t.family]) grouped[t.family] = [];
-    grouped[t.family].push(t);
-  }
-
   return (
     <div>
-      {/* Toolbar */}
-      <div style={{ display: "flex", gap: 12, marginBottom: 16, alignItems: "center" }}>
-        <input
-          placeholder="Search order no, name, signal type…"
-          value={search}
-          onChange={e => setSearch(e.target.value)}
-          style={{ flex: 1, padding: "7px 12px", border: "1px solid #ccd", borderRadius: 6, fontSize: 13 }}
-        />
-        <select
-          value={familyFilter}
-          onChange={e => setFamilyFilter(e.target.value)}
-          style={{ padding: "7px 10px", border: "1px solid #ccd", borderRadius: 6, fontSize: 13 }}
-        >
-          {families.map(f => <option key={f} value={f}>{f === "ALL" ? "All families" : f}</option>)}
-        </select>
-        <input type="file" accept=".cfg" ref={cfgImportRef} style={{ display: "none" }}
-          onChange={e => { if (e.target.files[0]) setShowImport(e.target.files[0]); e.target.value = ""; }} />
-        <button
-          onClick={() => cfgImportRef.current.click()}
-          style={{ padding: "7px 14px", fontSize: 13, fontWeight: 500, cursor: "pointer",
-                   background: "#2255cc", color: "#fff", border: "none", borderRadius: 6,
-                   whiteSpace: "nowrap" }}>
-          ⬆ Import from .cfg
-        </button>
-      </div>
+      {/* Hidden .cfg file input, triggered from the grid toolbar's Import button */}
+      <input type="file" accept=".cfg" ref={cfgImportRef} style={{ display: "none" }}
+        onChange={e => { if (e.target.files[0]) setShowImport(e.target.files[0]); e.target.value = ""; }} />
 
-      {/* Table */}
-      {Object.keys(grouped).sort().map(family => (
-        <div key={family} style={{ marginBottom: 28 }}>
-          <div style={{ fontWeight: 700, fontSize: 13, color: "#446", textTransform: "uppercase",
-                        letterSpacing: "0.04em", marginBottom: 6, paddingBottom: 4,
-                        borderBottom: "1px solid #ccd" }}>
-            {family}
-          </div>
-          <div style={{ overflowX: "auto" }}>
-            <table style={{ ...tableStyle, tableLayout: "fixed", width: colWidths.reduce((a, w) => a + w, 0) }}>
-              <colgroup>
-                {CATALOGUE_COLS.map((col, ci) => (
-                  <col key={col.key} className={`catalogue-colgroup-col-${ci}`} style={{ width: colWidths[ci] }} />
-                ))}
-              </colgroup>
-              <thead>
-                <tr>
-                  {CATALOGUE_COLS.map((col, ci) => (
-                    <th key={col.key} style={{ ...thStyle, textAlign: col.align, position: "relative", userSelect: "none", overflow: "hidden" }}>
-                      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "block", paddingRight: 8 }}>{col.header}</span>
-                      {ci < CATALOGUE_COLS.length - 1 && (
-                        <span
-                          onMouseDown={e => onResizeStart(ci, e)}
-                          style={{
-                            position: "absolute", right: 0, top: 0, bottom: 0,
-                            width: 6, cursor: "col-resize",
-                            background: "transparent",
-                            borderRight: "2px solid #c8d4f0",
-                          }}
-                          title="Drag to resize"
-                        />
-                      )}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {grouped[family].flatMap((t, i) => {
-                  const isSlot    = t.hw_category === 'slot';
-                  const isStation = t.hw_category === 'station';
-                  const isSubslot = t.hw_category === 'subslot';
-                  const isExpanded = expandedSlot === t.order_no;
-                  const rowBg = i % 2 === 0 ? "#fff" : "#f7f9fc";
-
-                  // Subslots compatible with this slot/station
-                  const assignedSubslots = compatBySlot[t.order_no] || new Set();
-                  // Slots/stations using this subslot (only relevant for subslot rows)
-                  const usedBySlots = compatBySubslot[t.order_no] || new Set();
-                  // Candidate subslots for assignment = same family, hw_category === 'subslot'
-                  const candidateSubslots = templates.filter(s => s.hw_category === 'subslot' && s.family === t.family);
-
-                  const mainRow = (
-                    <tr key={t.id} style={{ background: rowBg }}>
-                      <td style={{ ...catTdStyle, fontFamily: "monospace", fontSize: 11, textAlign: "left" }} title={t.order_no}>
-                        {t.order_no}
-                      </td>
-                      <td style={{ ...catTdStyle, textAlign: "left" }} title={t.display_name}>{t.display_name}</td>
-                      <td style={{ ...catTdStyle, textAlign: "center" }}><CategoryBadge category={t.hw_category} /></td>
-                      <td style={{ ...catTdStyle, textAlign: "center" }}>
-                        {addingSigFor === t.id ? (
-                          <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
-                            <input
-                              autoFocus
-                              value={newSigInput}
-                              onChange={e => setNewSigInput(e.target.value.toUpperCase())}
-                              onKeyDown={e => {
-                                if (e.key === "Enter" && newSigInput.trim()) {
-                                  const val = newSigInput.trim().toUpperCase();
-                                  onAddSigType(val);
-                                  onPatchTemplate(t, { signal_type: val });
-                                  setAddingSigFor(null); setNewSigInput("");
-                                }
-                                if (e.key === "Escape") { setAddingSigFor(null); setNewSigInput(""); }
-                              }}
-                              placeholder="e.g. PID"
-                              style={{ width: 52, fontSize: 11, padding: "2px 4px",
-                                border: "1px solid #2255cc", borderRadius: 4, fontWeight: 700, textTransform: "uppercase" }}
-                            />
-                            <button onClick={() => {
-                              const val = newSigInput.trim().toUpperCase(); if (!val) return;
-                              onAddSigType(val);
-                              onPatchTemplate(t, { signal_type: val });
-                              setAddingSigFor(null); setNewSigInput("");
-                            }} style={{ fontSize: 11, padding: "1px 5px", cursor: "pointer",
-                              background: "#2255cc", color: "#fff", border: "none", borderRadius: 3 }}>✓</button>
-                            <button onClick={() => { setAddingSigFor(null); setNewSigInput(""); }}
-                              style={{ fontSize: 11, padding: "1px 5px", cursor: "pointer",
-                                background: "#eee", color: "#555", border: "none", borderRadius: 3 }}>✕</button>
-                          </div>
-                        ) : (
-                          <select
-                            value={t.signal_type || ''}
-                            onChange={e => {
-                              if (e.target.value === '__add_new__') { setNewSigInput(""); setAddingSigFor(t.id); }
-                              else onPatchTemplate(t, { signal_type: e.target.value });
-                            }}
-                            title="Change signal type"
-                            style={{ fontSize: 11, padding: "2px 4px",
-                              border: `1px solid ${sigBadge(t.signal_type).color}`,
-                              borderRadius: 4, background: sigBadge(t.signal_type).background,
-                              color: sigBadge(t.signal_type).color, fontWeight: 700, cursor: "pointer" }}
-                          >
-                            {allSigTypes.map(st => <option key={st} value={st}>{st}</option>)}
-                            <option disabled style={{ color: "#aaa" }}>──────</option>
-                            <option value="__add_new__">+ Add new…</option>
-                          </select>
-                        )}
-                      </td>
-                      <td style={{ ...catTdStyle, textAlign: "center" }}>{t.channel_count || "—"}</td>
-                      <td style={{ ...catTdStyle, textAlign: "center", fontFamily: "monospace" }}>{t.input_bytes || 0}</td>
-                      <td style={{ ...catTdStyle, textAlign: "center", fontFamily: "monospace" }}>{t.output_bytes || 0}</td>
-                      <td style={{ ...catTdStyle, color: "#888", fontSize: 12, textAlign: "left" }} title={t.version || ""}>{t.version || "—"}</td>
-
-                      {/* Subslots column */}
-                      <td style={{ ...catTdStyle, textAlign: "left" }}>
-                        {(isSlot || isStation) && candidateSubslots.length > 0 && (
-                          <div style={{ display: "flex", flexWrap: "wrap", gap: 3, alignItems: "center" }}>
-                            {[...assignedSubslots].map(sno => {
-                              const s = templates.find(x => x.order_no === sno);
-                              return (
-                                <span key={sno} title={sno} style={{
-                                  fontSize: 10, padding: "1px 6px", borderRadius: 10,
-                                  background: "#e0f2fe", color: "#0369a1", fontWeight: 600, whiteSpace: "nowrap",
-                                }}>
-                                  {s ? s.display_name : sno.slice(0, 16)}
-                                </span>
-                              );
-                            })}
-                            <button
-                              onClick={() => setExpandedSlot(isExpanded ? null : t.order_no)}
-                              title={isExpanded ? "Close" : "Assign compatible subslots"}
-                              style={{ fontSize: 11, padding: "1px 6px", cursor: "pointer", borderRadius: 4,
-                                background: isExpanded ? "#dbeafe" : "#f0f6ff",
-                                color: isExpanded ? "#1e40af" : "#2255cc",
-                                border: `1px solid ${isExpanded ? "#93c5fd" : "#c8d4f0"}`,
-                                fontWeight: 600, whiteSpace: "nowrap" }}
-                            >
-                              {isExpanded ? "▲ Close" : (assignedSubslots.size > 0 ? "✏ Edit" : "+ Assign")}
-                            </button>
-                          </div>
-                        )}
-                        {isSubslot && usedBySlots.size > 0 && (
-                          <span style={{ fontSize: 10, color: "#666" }}>
-                            Used by {usedBySlots.size} slot{usedBySlots.size !== 1 ? "s" : ""}
-                          </span>
-                        )}
-                        {t.family === 'Scalance' && t.port_config && (() => {
-                          let ports = [];
-                          try { ports = JSON.parse(t.port_config); } catch (_) {}
-                          const portList = ports.filter(p => p.type === 'port');
-                          const rj45 = portList.filter(p => p.medium === 'RJ45').length;
-                          const fo   = portList.filter(p => p.medium === 'FO').length;
-                          return (
-                            <span style={{ fontSize: 10, color: '#0369a1' }}>
-                              {portList.length} port{portList.length !== 1 ? 's' : ''}
-                              {rj45 ? ` · ${rj45}×RJ45` : ''}
-                              {fo   ? ` · ${fo}×FO`   : ''}
-                            </span>
-                          );
-                        })()}
-                      </td>
-
-                      <td style={{ ...catTdStyle, textAlign: "center" }}>
-                        <button onClick={() => onDeleteTemplate(t)}
-                          title="Delete from catalogue (only if not used in any station)"
-                          style={miniBtn("#e44", "#fff")}>✕</button>
-                      </td>
-                    </tr>
-                  );
-
-                  // Expand row: shown below the slot/station row when expanded
-                  if (!(isSlot || isStation) || !isExpanded || candidateSubslots.length === 0) return [mainRow];
-
-                  const expandRow = (
-                    <tr key={`compat-${t.id}`} style={{ background: "#f0f6ff" }}>
-                      <td colSpan={CATALOGUE_COLS.length} style={{ padding: "10px 18px", borderTop: "1px dashed #93c5fd" }}>
-                        <div style={{ fontSize: 12, fontWeight: 600, color: "#1e40af", marginBottom: 8 }}>
-                          Compatible subslots for {isStation ? 'station' : 'slot'} <span style={{ fontFamily: "monospace" }}>{t.display_name}</span>
-                        </div>
-                        <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                          {candidateSubslots.map(s => {
-                            const checked = assignedSubslots.has(s.order_no);
-                            return (
-                              <label key={s.order_no} style={{
-                                display: "flex", alignItems: "center", gap: 5, cursor: "pointer",
-                                padding: "4px 10px", borderRadius: 6,
-                                background: checked ? "#dbeafe" : "#fff",
-                                border: `1px solid ${checked ? "#93c5fd" : "#ccd"}`,
-                                fontSize: 12,
-                              }}>
-                                <input
-                                  type="checkbox"
-                                  checked={checked}
-                                  onChange={e => {
-                                    if (e.target.checked) onAddCompat(t.order_no, s.order_no);
-                                    else onRemoveCompat(t.order_no, s.order_no);
-                                  }}
-                                  style={{ accentColor: "#2255cc", cursor: "pointer" }}
-                                />
-                                <span style={{ fontWeight: checked ? 600 : 400, color: checked ? "#1e40af" : "#333" }}>
-                                  {s.display_name}
-                                </span>
-                                <span style={{ fontSize: 10, color: "#888", fontFamily: "monospace" }}>
-                                  {s.order_no.length > 20 ? s.order_no.slice(0, 18) + "…" : s.order_no}
-                                </span>
-                              </label>
-                            );
-                          })}
-                        </div>
-                      </td>
-                    </tr>
-                  );
-
-                  return [mainRow, expandRow];
-                })}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      ))}
-
-      {filtered.length === 0 && (
-        <p style={{ color: "#999", textAlign: "center", marginTop: 40 }}>No modules match your search.</p>
-      )}
+      <CatalogueGrid
+        templates={templates}
+        slotCompat={slotCompat}
+        sigTypes={sigTypes}
+        onPatchTemplate={onPatchTemplate}
+        onAddSigType={onAddSigType}
+        onAddCompat={onAddCompat}
+        onRemoveCompat={onRemoveCompat}
+        onDeleteTemplate={onDeleteTemplate}
+        onImportClick={() => cfgImportRef.current?.click()}
+      />
 
       {/* Import modal */}
       {showImport && (
@@ -3101,6 +3141,7 @@ function ConfigurationPanel({
   onDeleteSlot, onSaveSlotPip, onSaveSlotPotentialGroup, onSaveSlotPaProfile, onSaveSlotSubslotProfile,
   onGenerate,
   isEditing, onStartEdit, onChangeEdit, onCommitEdit, onCancelEdit,
+  onShowSymbolTable,
 }) {
   const canGenerate = baselineOk && stations.some(s => s.slots.length > 0);
   const nSelected   = selectedAddrs.size;
@@ -3123,6 +3164,15 @@ function ConfigurationPanel({
       {/* Toolbar — Generate / Download only */}
       <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
         <div style={{ flex: 1 }} />
+        {/* Symbol Table button */}
+        <button
+          onClick={onShowSymbolTable}
+          disabled={stations.length === 0 || !stations.some(s => s.slots && s.slots.length > 0)}
+          style={{ ...btnStyle, opacity: (stations.length === 0 || !stations.some(s => s.slots && s.slots.length > 0)) ? 0.4 : 1 }}
+          title="View all configured signals"
+        >
+          📋 Symbol Table
+        </button>
         {/* Generate dropdown */}
         <div style={{ position: "relative" }}>
           <div style={{ display: "flex", borderRadius: 6, overflow: "hidden", border: "1px solid #2255cc" }}>

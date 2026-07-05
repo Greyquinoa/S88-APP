@@ -181,10 +181,17 @@ async function parseHwExcel(buffer, sheetName, overrideColumnMap, db) {
  * Used when replaying stored raw rows with a different column mapping.
  * @param {Array} rawExcelRows - Array of {columnName: value} objects
  * @param {Object} colMap - Column mapping {appField: "excelColumnName", ...}
+ * @param {Object} db - Database instance (optional). If provided, enables Tier 2 resolution via Protocol+SignalType.
  */
-function parseRawExcelRows(rawExcelRows, colMap) {
+function parseRawExcelRows(rawExcelRows, colMap, db) {
   const stations = new Map();
   const rows = [];
+  const resolutionStats = {
+    total: 0,
+    tier1: 0,
+    tier2Resolved: 0,
+    tier2Unresolved: 0,
+  };
 
   for (let rowNum = 0; rowNum < rawExcelRows.length; rowNum++) {
     const data = rawExcelRows[rowNum];
@@ -198,9 +205,35 @@ function parseRawExcelRows(rawExcelRows, colMap) {
 
     const stationAddrRaw = get('station_address');
     const slotRaw = get('slot');
-    const orderNo = get('module_order_no');
+    let orderNo = get('module_order_no'); // Tier 1: direct MLFB from Excel
 
-    if (!stationAddrRaw || !orderNo) continue; // skip incomplete rows
+    if (!stationAddrRaw) continue; // skip rows without station address
+
+    // Tier 2: If no direct MLFB, try Protocol + SignalType lookup
+    let tier2Used = false;
+    let unresolved = false;
+    if (!orderNo && db) {
+      const protocol = get('protocol');
+      const signalType = get('signal_type');
+      if (protocol && signalType) {
+        const resolved = resolveTier2(db, protocol, signalType);
+        if (resolved) {
+          orderNo = resolved;
+          tier2Used = true;
+          resolutionStats.tier2Resolved++;
+        } else {
+          orderNo = `UNRESOLVED_${protocol.toUpperCase()}_${signalType.toUpperCase()}`;
+          tier2Used = true;
+          unresolved = true;
+          resolutionStats.tier2Unresolved++;
+        }
+      }
+    }
+
+    if (!orderNo) continue; // skip rows without any module order number
+
+    resolutionStats.total++;
+    if (!tier2Used) resolutionStats.tier1++;
 
     const stationAddr = parseInt(stationAddrRaw, 10);
     const slot = slotRaw != null ? parseInt(slotRaw, 10) : 0;
@@ -240,10 +273,14 @@ function parseRawExcelRows(rawExcelRows, colMap) {
       slotObj.channels.push({ channel: channel ?? slotObj.channels.length, tag, desc, signalType });
     }
 
-    rows.push({ rowNum, stationAddr, slot, orderNo, moduleName, tag, desc, signalType, channel, ip, stationName, subsystemNo, routerAddress });
+    rows.push({
+      rowNum, stationAddr, slot, orderNo, moduleName, tag, desc, signalType, channel, ip, stationName, subsystemNo, routerAddress,
+      resolvedByTier2: tier2Used ? 1 : 0,
+      unresolved: unresolved ? 1 : 0,
+    });
   }
 
-  return { rows, stations };
+  return { rows, stations, resolutionStats };
 }
 
 /**
