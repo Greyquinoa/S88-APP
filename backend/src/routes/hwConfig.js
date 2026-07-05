@@ -173,13 +173,20 @@ router.get('/hardware-resolution', (req, res) => {
 router.post('/hardware-resolution', (req, res) => {
   try {
     const db = getDb();
-    const { protocol, signal_type, card_mlfb, station_mlfb, description } = req.body;
+    const { id, protocol, signal_type, card_mlfb, station_mlfb, description } = req.body;
 
     if (!protocol || !signal_type || !card_mlfb || !station_mlfb) {
       return err(res, 400, 'protocol, signal_type, card_mlfb, and station_mlfb are required');
     }
 
-    // Upsert: try insert first, if unique constraint fails, update
+    // If id provided: update by id
+    if (id) {
+      db.prepare('UPDATE hw_hardware_resolution SET protocol=?, signal_type=?, card_mlfb=?, station_mlfb=?, description=? WHERE id=?')
+        .run(protocol.trim(), signal_type.trim(), card_mlfb.trim(), station_mlfb.trim(), description?.trim() || null, id);
+      return res.json({ ok: true, action: 'updated' });
+    }
+
+    // No id: insert or update by unique key
     try {
       db.prepare('INSERT INTO hw_hardware_resolution (protocol, signal_type, card_mlfb, station_mlfb, description) VALUES (?,?,?,?,?)')
         .run(protocol.trim(), signal_type.trim(), card_mlfb.trim(), station_mlfb.trim(), description?.trim() || null);
