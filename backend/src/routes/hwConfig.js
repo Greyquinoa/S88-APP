@@ -4,8 +4,8 @@ const express = require('express');
 const multer  = require('multer');
 const { getDb } = require('../db');
 const { parseCfg, parseCfgDevices } = require('../services/cfgParser');
-const { parseHwExcel }       = require('../services/hwExcelParser');
-const { allocateAddresses, findTemplate } = require('../services/hwAddressEngine');
+const { parseHwExcel, parseRawExcelRows, suggestColumnMappingByLevenshtein }  = require('../services/hwExcelParser');
+const { allocateAddresses, findTemplate, defaultIdentifiers } = require('../services/hwAddressEngine');
 const { generateCfg, hexToIp } = require('../services/cfgGenerator');
 const { parseCfgForCatalogue } = require('../services/cfgCatalogueParser');
 const { parseMrpConfig } = require('../services/mrpCfgParser');
@@ -66,29 +66,40 @@ router.post('/module-templates', (req, res) => {
       order_no, display_name, family, signal_type, channel_count = 0,
       input_bytes = 0, output_bytes = 0, in_addr_fmt, out_addr_fmt,
       param_template, version, gsdml_file, dap_id, hw_category, subslot_defaults, port_config,
+      in_identifier, out_identifier,
     } = req.body;
     if (!order_no || !display_name || !family) return err(res, 400, 'order_no, display_name, family required');
+
+    // SYMBOL-line identifiers: keep an explicit value (incl. intentional blank → null);
+    // when omitted entirely, fall back to the signal-type default.
+    const def = defaultIdentifiers(signal_type);
+    const inIdent  = in_identifier  !== undefined ? (in_identifier  || null) : def.in;
+    const outIdent = out_identifier !== undefined ? (out_identifier || null) : def.out;
 
     const existing = db.prepare('SELECT id FROM hw_module_templates WHERE order_no=?').get(order_no);
     if (existing) {
       db.prepare(`UPDATE hw_module_templates SET
         display_name=?, family=?, signal_type=?, channel_count=?,
         input_bytes=?, output_bytes=?, in_addr_fmt=?, out_addr_fmt=?,
-        param_template=?, version=?, gsdml_file=?, dap_id=?, hw_category=?, subslot_defaults=?, port_config=?
+        param_template=?, version=?, gsdml_file=?, dap_id=?, hw_category=?, subslot_defaults=?, port_config=?,
+        in_identifier=?, out_identifier=?
         WHERE order_no=?`).run(
         display_name, family, signal_type, channel_count,
         input_bytes, output_bytes, in_addr_fmt, out_addr_fmt,
-        param_template, version, gsdml_file, dap_id, hw_category || null, subslot_defaults || null, port_config || null, order_no
+        param_template, version, gsdml_file, dap_id, hw_category || null, subslot_defaults || null, port_config || null,
+        inIdent, outIdent, order_no
       );
       res.json({ id: existing.id, updated: true });
     } else {
       const r = db.prepare(`INSERT INTO hw_module_templates
         (order_no, display_name, family, signal_type, channel_count, input_bytes, output_bytes,
-         in_addr_fmt, out_addr_fmt, param_template, version, gsdml_file, dap_id, hw_category, subslot_defaults, port_config)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+         in_addr_fmt, out_addr_fmt, param_template, version, gsdml_file, dap_id, hw_category, subslot_defaults, port_config,
+         in_identifier, out_identifier)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
         order_no, display_name, family, signal_type, channel_count,
         input_bytes, output_bytes, in_addr_fmt, out_addr_fmt,
-        param_template, version, gsdml_file, dap_id, hw_category || null, subslot_defaults || null, port_config || null
+        param_template, version, gsdml_file, dap_id, hw_category || null, subslot_defaults || null, port_config || null,
+        inIdent, outIdent
       );
       res.status(201).json({ id: r.lastInsertRowid });
     }
@@ -134,6 +145,141 @@ router.delete('/module-templates/:id', (req, res) => {
   } catch (e) { err(res, 500, e.message); }
 });
 
+// ── Tier 2 Hardware Resolution (Protocol + SignalType → Card MLFB) ────────────────
+
+// GET /hardware-resolution — List all mappings with pagination
+router.get('/hardware-resolution', (req, res) => {
+  try {
+    const db = getDb();
+    const page = parseInt(req.query.page, 10) || 0;
+    const limit = parseInt(req.query.limit, 10) || 50;
+    const offset = page * limit;
+
+    const total = db.prepare('SELECT COUNT(*) AS n FROM hw_hardware_resolution').get().n;
+    const rows = db.prepare(`
+      SELECT hr.id, hr.protocol, hr.signal_type, hr.card_mlfb, hr.description, hr.created_at,
+             ht.display_name, ht.family
+      FROM hw_hardware_resolution hr
+      LEFT JOIN hw_module_templates ht ON ht.order_no = hr.card_mlfb
+      ORDER BY hr.protocol, hr.signal_type
+      LIMIT ? OFFSET ?
+    `).all(limit, offset);
+
+    res.json({ rows, total, page, limit });
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// POST /hardware-resolution — Add or update a mapping
+router.post('/hardware-resolution', (req, res) => {
+  try {
+    const db = getDb();
+    const { protocol, signal_type, card_mlfb, description } = req.body;
+
+    if (!protocol || !signal_type || !card_mlfb) {
+      return err(res, 400, 'protocol, signal_type, and card_mlfb are required');
+    }
+
+    // Verify card_mlfb exists in hw_module_templates
+    const template = db.prepare('SELECT id FROM hw_module_templates WHERE order_no=?').get(card_mlfb);
+    if (!template) {
+      return err(res, 400, `Card MLFB "${card_mlfb}" not found in module catalogue`);
+    }
+
+    // Upsert: try insert first, if unique constraint fails, update
+    try {
+      db.prepare('INSERT INTO hw_hardware_resolution (protocol, signal_type, card_mlfb, description) VALUES (?,?,?,?)')
+        .run(protocol.trim(), signal_type.trim(), card_mlfb, description || null);
+      res.status(201).json({ ok: true, action: 'inserted' });
+    } catch (e) {
+      if (e.message.includes('UNIQUE')) {
+        db.prepare('UPDATE hw_hardware_resolution SET card_mlfb=?, description=? WHERE protocol=? AND signal_type=?')
+          .run(card_mlfb, description || null, protocol.trim(), signal_type.trim());
+        res.json({ ok: true, action: 'updated' });
+      } else {
+        throw e;
+      }
+    }
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// DELETE /hardware-resolution/:id — Remove a mapping
+router.delete('/hardware-resolution/:id', (req, res) => {
+  try {
+    const db = getDb();
+    const id = parseInt(req.params.id, 10);
+    const row = db.prepare('SELECT protocol, signal_type FROM hw_hardware_resolution WHERE id=?').get(id);
+    if (!row) return err(res, 404, 'Mapping not found');
+    db.prepare('DELETE FROM hw_hardware_resolution WHERE id=?').run(id);
+    res.json({ ok: true, deleted: { protocol: row.protocol, signal_type: row.signal_type } });
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// GET /hardware-resolution/export — Export all mappings as CSV
+router.get('/hardware-resolution/export', (req, res) => {
+  try {
+    const db = getDb();
+    const rows = db.prepare(`
+      SELECT protocol, signal_type, card_mlfb, description
+      FROM hw_hardware_resolution
+      ORDER BY protocol, signal_type
+    `).all();
+
+    // Build CSV
+    const csv = 'protocol,signal_type,card_mlfb,description\n' +
+      rows.map(r => `"${r.protocol}","${r.signal_type}","${r.card_mlfb}","${r.description || ''}"`)
+        .join('\n');
+
+    res.type('text/csv').set('Content-Disposition', 'attachment; filename="hw-resolution-mappings.csv"').send(csv);
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// POST /hardware-resolution/import — Bulk import from CSV
+router.post('/hardware-resolution/import', upload.single('csv'), (req, res) => {
+  try {
+    if (!req.file) return err(res, 400, 'No CSV file uploaded');
+    const db = getDb();
+    const text = req.file.buffer.toString('utf8');
+    const lines = text.trim().split('\n');
+    if (lines.length < 2) return err(res, 400, 'CSV must have header row and at least one data row');
+
+    let imported = 0, skipped = 0, errors = [];
+
+    // Skip header, process data rows
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line.trim()) continue; // skip empty lines
+
+      // Simple CSV parsing (assumes no quotes or commas in values for simplicity)
+      const parts = line.split(',').map(p => p.trim().replace(/^"(.*)"$/, '$1'));
+      if (parts.length < 3) {
+        skipped++;
+        continue;
+      }
+
+      const [protocol, signal_type, card_mlfb, description] = parts;
+      try {
+        // Verify card_mlfb exists
+        const template = db.prepare('SELECT id FROM hw_module_templates WHERE order_no=?').get(card_mlfb);
+        if (!template) {
+          errors.push(`Row ${i}: Card MLFB "${card_mlfb}" not found`);
+          skipped++;
+          continue;
+        }
+
+        // Upsert
+        db.prepare('INSERT OR REPLACE INTO hw_hardware_resolution (protocol, signal_type, card_mlfb, description) VALUES (?,?,?,?)')
+          .run(protocol, signal_type, card_mlfb, description || null);
+        imported++;
+      } catch (e) {
+        errors.push(`Row ${i}: ${e.message}`);
+        skipped++;
+      }
+    }
+
+    res.json({ ok: true, imported, skipped, errors });
+  } catch (e) { err(res, 500, e.message); }
+});
+
 // ── Catalogue — import from .cfg ──────────────────────────────────────────────
 
 // POST /module-templates/parse-cfg
@@ -172,13 +318,15 @@ router.post('/module-templates/bulk-upsert', (req, res) => {
 
     const insSql = db.prepare(`INSERT INTO hw_module_templates
       (order_no, display_name, family, signal_type, channel_count, input_bytes, output_bytes,
-       in_addr_fmt, out_addr_fmt, param_template, version, gsdml_file, dap_id, hw_category, subslot_defaults, port_config)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+       in_addr_fmt, out_addr_fmt, param_template, version, gsdml_file, dap_id, hw_category, subslot_defaults, port_config,
+       in_identifier, out_identifier)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
 
     const updSql = db.prepare(`UPDATE hw_module_templates SET
       display_name=?, family=?, signal_type=?, channel_count=?,
       input_bytes=?, output_bytes=?, in_addr_fmt=?, out_addr_fmt=?,
-      param_template=?, version=?, gsdml_file=?, dap_id=?, hw_category=?, subslot_defaults=?, port_config=?
+      param_template=?, version=?, gsdml_file=?, dap_id=?, hw_category=?, subslot_defaults=?, port_config=?,
+      in_identifier=?, out_identifier=?
       WHERE order_no=?`);
 
     const upsert = db.transaction((devices) => {
@@ -187,11 +335,18 @@ router.post('/module-templates/bulk-upsert', (req, res) => {
         const existing = db.prepare('SELECT id FROM hw_module_templates WHERE order_no=?').get(d.order_no);
         if (existing && d.action !== 'overwrite') { skipped++; continue; }
 
+        // Identifiers: explicit value wins; otherwise default from signal type (so
+        // CFG-imported catalogue entries get I/Q/IW/QW automatically).
+        const def = defaultIdentifiers(d.signal_type);
+        const inIdent  = d.in_identifier  !== undefined ? (d.in_identifier  || null) : def.in;
+        const outIdent = d.out_identifier !== undefined ? (d.out_identifier || null) : def.out;
+
         const vals = [
           d.display_name, d.family, d.signal_type || null, d.channel_count || 0,
           d.input_bytes || 0, d.output_bytes || 0, d.in_addr_fmt || null, d.out_addr_fmt || null,
           d.param_template || null, d.version || null, d.gsdml_file || null, d.dap_id || null,
           d.hw_category || null, d.subslot_defaults || null, d.port_config || null,
+          inIdent, outIdent,
         ];
 
         if (existing) {
@@ -509,7 +664,97 @@ router.post('/imports/:id/backfill-from-cfg', upload.single('cfg'), (req, res) =
   } catch (e) { err(res, 500, e.message); }
 });
 
+// POST /api/hw-config/imports/:id/parse-headers
+// Extract column headers from an Excel file without parsing data
+// Returns: { headers: string[] }
+router.post('/imports/:id/parse-headers', upload.single('iolist'), async (req, res) => {
+  try {
+    const db       = getDb();
+    const importId = parseInt(req.params.id, 10);
+    const hwImport = db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
+    if (!hwImport) return err(res, 404, 'HW import not found');
+    if (!req.file)  return err(res, 400, 'No file uploaded');
+
+    const sheetName = req.query.sheet || null;
+    const { headers, rawExcelRows } = await parseHwExcel(req.file.buffer, sheetName);
+
+    // Store raw Excel rows so they can be previewed without re-uploading
+    db.prepare('DELETE FROM hw_excel_raw WHERE hw_import_id=?').run(importId);
+    const insert = db.prepare('INSERT INTO hw_excel_raw (hw_import_id, row_index, row_json) VALUES (?,?,?)');
+    rawExcelRows.forEach((row, i) => insert.run(importId, i, JSON.stringify(row)));
+
+    res.json({ headers, rowCount: rawExcelRows.length });
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// GET /api/hw-config/imports/:id/excel-preview
+// Returns raw Excel rows stored during parse-headers (no file re-upload needed)
+// Optional query: ?limit=N (default 100)
+router.get('/imports/:id/excel-preview', async (req, res) => {
+  try {
+    const db       = getDb();
+    const importId = parseInt(req.params.id, 10);
+    const hwImport = db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
+    if (!hwImport) return err(res, 404, 'HW import not found');
+
+    const limit = parseInt(req.query.limit, 10) || 200;
+    const stored = db.prepare(
+      'SELECT row_json FROM hw_excel_raw WHERE hw_import_id=? ORDER BY row_index LIMIT ?'
+    ).all(importId, limit);
+
+    if (stored.length === 0) {
+      return res.json({ rows: [], headers: [], message: 'No Excel data stored — re-upload the file' });
+    }
+
+    const rows = stored.map(r => JSON.parse(r.row_json));
+    const headers = rows.length > 0 ? Object.keys(rows[0]) : [];
+
+    res.json({ rows, headers, total: stored.length });
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// POST /api/hw-config/imports/:id/suggest-column-mappings
+// Suggests column mappings using fuzzy matching (Levenshtein distance).
+// Request body: { selectedColumns: string[] } — user-selected columns from Excel file
+// Response: { suggestions: { [appField]: { column, score } }, mandatory: string[], optional: string[] }
+router.post('/imports/:id/suggest-column-mappings', async (req, res) => {
+  try {
+    const importId = parseInt(req.params.id, 10);
+    const { selectedColumns } = req.body;
+
+    if (!Array.isArray(selectedColumns) || selectedColumns.length === 0) {
+      return err(res, 400, 'selectedColumns must be a non-empty array');
+    }
+
+    // Define mandatory and optional fields that can be mapped
+    const MANDATORY_FIELDS = ['station_address', 'module_order_no', 'slot', 'tag', 'channel'];
+    const OPTIONAL_FIELDS = [
+      'station_name', 'ip_address', 'description', 'signal_type', 'subsystem_no', 'router_address'
+    ];
+    const ALL_FIELDS = [...MANDATORY_FIELDS, ...OPTIONAL_FIELDS];
+
+    // Get fuzzy match suggestions
+    const suggestions = suggestColumnMappingByLevenshtein(ALL_FIELDS, selectedColumns, 0.6);
+
+    // Transform suggestions for response (flatten the score data)
+    const suggestionMap = {};
+    for (const [field, data] of Object.entries(suggestions)) {
+      suggestionMap[field] = data.column; // Return just the column name
+    }
+
+    res.json({
+      suggestions: suggestionMap,
+      mandatory: MANDATORY_FIELDS,
+      optional: OPTIONAL_FIELDS,
+      selectedColumns,
+    });
+  } catch (e) { err(res, 500, e.message); }
+});
+
 // POST /api/hw-config/imports/:id/upload-iolist
+// Optional query params:
+//   sheet=<name> — Excel sheet name to parse
+//   columnMap=<json> — User-provided column mapping override (JSON string or stringified object)
 router.post('/imports/:id/upload-iolist', upload.single('iolist'), async (req, res) => {
   try {
     const db       = getDb();
@@ -519,21 +764,34 @@ router.post('/imports/:id/upload-iolist', upload.single('iolist'), async (req, r
     if (!req.file)  return err(res, 400, 'No file uploaded');
 
     const sheetName = req.query.sheet || null;
-    const { rows, stations, colMap } = await parseHwExcel(req.file.buffer, sheetName);
+
+    // Parse columnMap from query string if provided
+    let overrideColumnMap = null;
+    if (req.query.columnMap) {
+      try {
+        overrideColumnMap = JSON.parse(req.query.columnMap);
+      } catch (e) {
+        return err(res, 400, 'Invalid columnMap JSON: ' + e.message);
+      }
+    }
+
+    const { rows, stations, colMap, resolutionStats } = await parseHwExcel(req.file.buffer, sheetName, overrideColumnMap, db);
 
     db.prepare('DELETE FROM hw_signals WHERE hw_import_id=?').run(importId);
 
     const ins = db.prepare(`
       INSERT INTO hw_signals
         (hw_import_id, row_number, station_address, station_name, ip_address,
-         slot, channel, module_order_no, module_name, tag, description, signal_type, subsystem_no, router_address)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         slot, channel, module_order_no, module_name, tag, description, signal_type, subsystem_no, router_address,
+         resolved_by_tier2, unresolved)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     `);
     const insertBatch = db.transaction((batch) => {
       for (const r of batch) {
         ins.run(importId, r.rowNum, r.stationAddr, r.stationName, r.ip,
           r.slot, r.channel, r.orderNo, r.moduleName, r.tag, r.desc, r.signalType,
-          r.subsystemNo ?? null, r.routerAddress || null);
+          r.subsystemNo ?? null, r.routerAddress || null,
+          r.resolvedByTier2 ?? 0, r.unresolved ?? 0);
       }
     });
     for (let i = 0; i < rows.length; i += 500) insertBatch(rows.slice(i, i + 500));
@@ -541,7 +799,424 @@ router.post('/imports/:id/upload-iolist', upload.single('iolist'), async (req, r
     db.prepare('UPDATE hw_imports SET excel_name=?, status=? WHERE id=?')
       .run(req.file.originalname, 'ready', importId);
 
-    res.json({ importId, stationCount: stations.size, signalCount: rows.length, colMap });
+    res.json({ importId, stationCount: stations.size, signalCount: rows.length, colMap, resolutionStats });
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// POST /api/hw-config/imports/:id/preview-iolist  (parse + diff, NO DB writes)
+// If columnMap in query + no file: use stored raw rows from hw_excel_raw table
+// If file uploaded: parse it fresh
+// Optional query params:
+//   sheet=<name> — Excel sheet name to parse
+//   columnMap=<json> — User-provided column mapping override (JSON string)
+router.post('/imports/:id/preview-iolist', upload.single('iolist'), async (req, res) => {
+  try {
+    const db       = getDb();
+    const importId = parseInt(req.params.id, 10);
+    const hwImport = db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
+    if (!hwImport) return err(res, 404, 'HW import not found');
+
+    // Parse columnMap from query string
+    let overrideColumnMap = null;
+    if (req.query.columnMap) {
+      try {
+        overrideColumnMap = JSON.parse(req.query.columnMap);
+      } catch (e) {
+        return err(res, 400, 'Invalid columnMap JSON: ' + e.message);
+      }
+    }
+
+    let rows, stations;
+
+    // If no file but columnMap is provided, use stored raw rows from DB
+    if (!req.file && overrideColumnMap) {
+      const stored = db.prepare(
+        'SELECT row_json FROM hw_excel_raw WHERE hw_import_id=? ORDER BY row_index'
+      ).all(importId);
+
+      if (stored.length === 0) {
+        return err(res, 400, 'No stored Excel data — upload the file first');
+      }
+
+      // Parse using the stored raw rows (simulate as if we just read them from Excel)
+      const rawExcelRows = stored.map(r => JSON.parse(r.row_json));
+      const parseResult = parseRawExcelRows(rawExcelRows, overrideColumnMap);
+      rows = parseResult.rows;
+      stations = parseResult.stations;
+    } else {
+      // File uploaded: parse it
+      if (!req.file) return err(res, 400, 'No file uploaded');
+      const sheetName = req.query.sheet || null;
+      const parseResult = await parseHwExcel(req.file.buffer, sheetName, overrideColumnMap);
+      rows = parseResult.rows;
+      stations = parseResult.stations;
+    }
+
+    // Build incoming map: key → parsed row
+    const CMP_FIELDS = ['station_address','station_name','ip_address','subsystem_no',
+                        'slot','module_order_no','module_name','channel','tag','signal_type','description'];
+
+    // Normalize channel for keying: infra rows (no tag, no signal type) always key as 'null'
+    // regardless of whether the DB stored them as NULL or 0, to avoid phantom New+Missing pairs.
+    function chKey(channel, tag, signalType) {
+      if (!tag && !signalType) return 'null';
+      return channel ?? 'null';
+    }
+
+    const incoming = new Map();
+    for (const r of rows) {
+      const key = `${r.stationAddr}:${r.slot}:${chKey(r.channel, r.tag, r.signalType)}`;
+      incoming.set(key, r);
+    }
+
+    // Load current DB signals
+    const dbRows = db.prepare(
+      `SELECT station_address, station_name, ip_address, subsystem_no, router_address,
+              slot, channel, module_order_no, module_name, tag, description, signal_type
+       FROM hw_signals WHERE hw_import_id=? AND module_order_no != 'PLACEHOLDER'`
+    ).all(importId);
+
+    const current = new Map();
+    for (const r of dbRows) {
+      const key = `${r.station_address}:${r.slot}:${chKey(r.channel, r.tag, r.signal_type)}`;
+      current.set(key, r);
+    }
+
+    const items = [];
+    const summary = { total: 0, new: 0, modified: 0, missing: 0, unchanged: 0 };
+
+    // For infra rows (no tag, no signal type), channel is not meaningful — normalize to null
+    // so that channel=0 and channel=null are treated identically in comparison.
+    function normChannel(channel, tag, signalType) {
+      if (!tag && !signalType) return null;
+      return channel ?? null;
+    }
+
+    // Classify incoming rows
+    for (const [key, inc] of incoming) {
+      const cur = current.get(key);
+      const isInfraInc = !inc.tag && !inc.signalType;
+      const incomingNorm = {
+        station_address: inc.stationAddr,
+        station_name:    inc.stationName || null,
+        ip_address:      inc.ip || null,
+        subsystem_no:    inc.subsystemNo ?? null,
+        slot:            inc.slot,
+        module_order_no: inc.orderNo || null,
+        module_name:     inc.moduleName || null,
+        channel:         normChannel(inc.channel, inc.tag, inc.signalType),
+        tag:             inc.tag || null,
+        signal_type:     inc.signalType || null,
+        description:     inc.desc || null,
+      };
+
+      let status;
+      const changes = [];
+
+      if (!cur) {
+        status = 'new';
+      } else {
+        const curNorm = {
+          station_address: cur.station_address,
+          station_name:    cur.station_name,
+          ip_address:      cur.ip_address,
+          subsystem_no:    cur.subsystem_no,
+          slot:            cur.slot,
+          module_order_no: cur.module_order_no,
+          module_name:     cur.module_name,
+          channel:         normChannel(cur.channel, cur.tag, cur.signal_type),
+          tag:             cur.tag,
+          signal_type:     cur.signal_type,
+          description:     cur.description,
+        };
+        for (const f of CMP_FIELDS) {
+          const cv = curNorm[f] ?? null;
+          const iv = incomingNorm[f] ?? null;
+          if (String(cv ?? '') !== String(iv ?? '')) {
+            changes.push({ property: f, currentValue: cv, importedValue: iv });
+          }
+        }
+        status = changes.length > 0 ? 'modified' : 'unchanged';
+      }
+
+      summary[status]++;
+      items.push({
+        key, status,
+        objectName: incomingNorm.tag || incomingNorm.module_name || key,
+        changes,
+        current:  cur ? { station_address: cur.station_address, station_name: cur.station_name,
+                          ip_address: cur.ip_address, subsystem_no: cur.subsystem_no,
+                          slot: cur.slot, module_order_no: cur.module_order_no,
+                          module_name: cur.module_name, channel: cur.channel,
+                          tag: cur.tag, signal_type: cur.signal_type, description: cur.description } : null,
+        incoming: incomingNorm,
+      });
+    }
+
+    // Missing rows — in DB but not in incoming
+    for (const [key, cur] of current) {
+      if (!incoming.has(key)) {
+        summary.missing++;
+        items.push({
+          key, status: 'missing',
+          objectName: cur.tag || cur.module_name || key,
+          changes: [],
+          current: { station_address: cur.station_address, station_name: cur.station_name,
+                     ip_address: cur.ip_address, subsystem_no: cur.subsystem_no,
+                     slot: cur.slot, module_order_no: cur.module_order_no,
+                     module_name: cur.module_name, channel: cur.channel,
+                     tag: cur.tag, signal_type: cur.signal_type, description: cur.description },
+          incoming: null,
+        });
+      }
+    }
+
+    summary.total = items.length;
+
+    res.json({
+      summary,
+      items,
+      parsedRows: rows,
+      fileName: req.file.originalname,
+      stationCount: stations.size,
+    });
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// GET /api/hw-config/imports/:id/preview-mapped
+// Preview with stored raw rows + user-provided column mapping (no file upload)
+// Query params:
+//   columnMap=<json> — Column mapping {appField: "excelColumnName", ...}
+router.get('/imports/:id/preview-mapped', async (req, res) => {
+  try {
+    const db       = getDb();
+    const importId = parseInt(req.params.id, 10);
+    const hwImport = db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
+    if (!hwImport) return err(res, 404, 'HW import not found');
+
+    // Parse columnMap from query
+    if (!req.query.columnMap) {
+      return err(res, 400, 'columnMap query param required');
+    }
+
+    let columnMap;
+    try {
+      columnMap = JSON.parse(req.query.columnMap);
+    } catch (e) {
+      return err(res, 400, 'Invalid columnMap JSON: ' + e.message);
+    }
+
+    // Load stored raw rows from DB
+    const stored = db.prepare(
+      'SELECT row_json FROM hw_excel_raw WHERE hw_import_id=? ORDER BY row_index'
+    ).all(importId);
+
+    if (stored.length === 0) {
+      return err(res, 400, 'No stored Excel data — upload the file first');
+    }
+
+    const rawExcelRows = stored.map(r => JSON.parse(r.row_json));
+    const { rows, stations } = parseRawExcelRows(rawExcelRows, columnMap);
+
+    // Build diff against current DB (same logic as preview-iolist)
+    const CMP_FIELDS = ['station_address','station_name','ip_address','subsystem_no',
+                        'slot','module_order_no','module_name','channel','tag','signal_type','description'];
+
+    function chKey(channel, tag, signalType) {
+      if (!tag && !signalType) return 'null';
+      return channel ?? 'null';
+    }
+
+    const incoming = new Map();
+    for (const r of rows) {
+      const key = `${r.stationAddr}:${r.slot}:${chKey(r.channel, r.tag, r.signalType)}`;
+      incoming.set(key, r);
+    }
+
+    const dbRows = db.prepare(
+      `SELECT station_address, station_name, ip_address, subsystem_no, router_address,
+              slot, channel, module_order_no, module_name, tag, description, signal_type
+       FROM hw_signals WHERE hw_import_id=? AND module_order_no != 'PLACEHOLDER'`
+    ).all(importId);
+
+    const current = new Map();
+    for (const r of dbRows) {
+      const key = `${r.station_address}:${r.slot}:${chKey(r.channel, r.tag, r.signal_type)}`;
+      current.set(key, r);
+    }
+
+    const items = [];
+    const summary = { total: 0, new: 0, modified: 0, missing: 0, unchanged: 0 };
+
+    // Classify incoming rows
+    for (const [key, inc] of incoming) {
+      const cur = current.get(key);
+      const isInfraInc = !inc.tag && !inc.signalType;
+      const incomingNorm = {
+        station_address: inc.stationAddr,
+        station_name:    inc.stationName || null,
+        ip_address:      inc.ip || null,
+        subsystem_no:    inc.subsystemNo ?? null,
+        slot:            inc.slot,
+        module_order_no: inc.orderNo || null,
+        module_name:     inc.moduleName || null,
+        channel:         chKey(inc.channel, inc.tag, inc.signalType),
+        tag:             inc.tag || null,
+        signal_type:     inc.signalType || null,
+        description:     inc.desc || null,
+      };
+
+      let status;
+      const changes = [];
+
+      if (!cur) {
+        status = 'new';
+      } else {
+        const curNorm = {
+          station_address: cur.station_address,
+          station_name:    cur.station_name,
+          ip_address:      cur.ip_address,
+          subsystem_no:    cur.subsystem_no,
+          slot:            cur.slot,
+          module_order_no: cur.module_order_no,
+          module_name:     cur.module_name,
+          channel:         chKey(cur.channel, cur.tag, cur.signal_type),
+          tag:             cur.tag,
+          signal_type:     cur.signal_type,
+          description:     cur.description,
+        };
+        for (const f of CMP_FIELDS) {
+          const cv = curNorm[f] ?? null;
+          const iv = incomingNorm[f] ?? null;
+          if (String(cv ?? '') !== String(iv ?? '')) {
+            changes.push({ property: f, currentValue: cv, importedValue: iv });
+          }
+        }
+        status = changes.length > 0 ? 'modified' : 'unchanged';
+      }
+
+      summary[status]++;
+      items.push({
+        key, status,
+        objectName: incomingNorm.tag || incomingNorm.module_name || key,
+        changes,
+        current:  cur ? { station_address: cur.station_address, station_name: cur.station_name,
+                          ip_address: cur.ip_address, subsystem_no: cur.subsystem_no,
+                          slot: cur.slot, module_order_no: cur.module_order_no,
+                          module_name: cur.module_name, channel: cur.channel,
+                          tag: cur.tag, signal_type: cur.signal_type, description: cur.description } : null,
+        incoming: incomingNorm,
+      });
+    }
+
+    // Missing rows — in DB but not in incoming
+    for (const [key, cur] of current) {
+      if (!incoming.has(key)) {
+        summary.missing++;
+        items.push({
+          key, status: 'missing',
+          objectName: cur.tag || cur.module_name || key,
+          changes: [],
+          current: { station_address: cur.station_address, station_name: cur.station_name,
+                     ip_address: cur.ip_address, subsystem_no: cur.subsystem_no,
+                     slot: cur.slot, module_order_no: cur.module_order_no,
+                     module_name: cur.module_name, channel: cur.channel,
+                     tag: cur.tag, signal_type: cur.signal_type, description: cur.description },
+          incoming: null,
+        });
+      }
+    }
+
+    summary.total = items.length;
+
+    res.json({
+      summary,
+      items,
+      parsedRows: rows,
+      fileName: 'Excel import',
+      stationCount: stations.size,
+    });
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// POST /api/hw-config/imports/:id/apply-iolist  (commit approved changes)
+router.post('/imports/:id/apply-iolist', async (req, res) => {
+  try {
+    const db       = getDb();
+    const importId = parseInt(req.params.id, 10);
+    const hwImport = db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
+    if (!hwImport) return err(res, 404, 'HW import not found');
+
+    const { approvedKeys, parsedRows, fileName, missingKeys } = req.body;
+    if (!Array.isArray(approvedKeys)) return err(res, 400, 'approvedKeys must be an array');
+    if (!Array.isArray(parsedRows))   return err(res, 400, 'parsedRows must be an array');
+
+    const approvedSet = new Set(approvedKeys);
+    const missingSet  = new Set(missingKeys || []);
+
+    // Same key normalization as preview route
+    function chKey(channel, tag, signalType) {
+      if (!tag && !signalType) return 'null';
+      return channel ?? 'null';
+    }
+
+    // Load current DB signals (need tag + signal_type to normalize key)
+    const dbRows = db.prepare(
+      `SELECT station_address, slot, channel, tag, signal_type FROM hw_signals
+       WHERE hw_import_id=? AND module_order_no != 'PLACEHOLDER'`
+    ).all(importId);
+
+    const apply = db.transaction(() => {
+      // Delete approved missing rows
+      for (const r of dbRows) {
+        const key = `${r.station_address}:${r.slot}:${chKey(r.channel, r.tag, r.signal_type)}`;
+        if (missingSet.has(key) && approvedSet.has(key)) {
+          db.prepare(
+            `DELETE FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=? AND channel IS ?`
+          ).run(importId, r.station_address, r.slot, r.channel ?? null);
+        }
+      }
+
+      // Upsert approved incoming rows (new + modified)
+      const ins = db.prepare(`
+        INSERT INTO hw_signals
+          (hw_import_id, row_number, station_address, station_name, ip_address,
+           slot, channel, module_order_no, module_name, tag, description, signal_type, subsystem_no, router_address)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      `);
+
+      let rowIdx = 0;
+      for (const r of parsedRows) {
+        const key = `${r.stationAddr}:${r.slot}:${chKey(r.channel, r.tag, r.signalType)}`;
+        if (!approvedSet.has(key)) { rowIdx++; continue; }
+
+        // Delete existing row for this key before inserting (upsert)
+        db.prepare(
+          `DELETE FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=? AND channel IS ?`
+        ).run(importId, r.stationAddr, r.slot, r.channel ?? null);
+
+        ins.run(importId, r.rowNum ?? rowIdx, r.stationAddr, r.stationName, r.ip,
+          r.slot, r.channel ?? null, r.orderNo, r.moduleName, r.tag, r.desc,
+          r.signalType, r.subsystemNo ?? null, r.routerAddress || null);
+        rowIdx++;
+      }
+
+      if (fileName) {
+        db.prepare('UPDATE hw_imports SET excel_name=?, status=? WHERE id=?')
+          .run(fileName, 'ready', importId);
+      }
+    });
+
+    apply();
+
+    const signalCount = db.prepare(
+      'SELECT COUNT(*) AS cnt FROM hw_signals WHERE hw_import_id=?'
+    ).get(importId).cnt;
+    const stationCount = db.prepare(
+      'SELECT COUNT(DISTINCT station_address) AS cnt FROM hw_signals WHERE hw_import_id=?'
+    ).get(importId).cnt;
+
+    res.json({ importId, stationCount, signalCount, appliedKeys: approvedKeys.length });
   } catch (e) { err(res, 500, e.message); }
 });
 
@@ -1086,15 +1761,51 @@ router.post('/imports/:id/stations/:addr/slots', (req, res) => {
   } catch (e) { err(res, 500, e.message); }
 });
 
-// DELETE /imports/:id/stations/:addr/slots/:slot — remove one slot
+// DELETE /imports/:id/stations/:addr/slots/:slot — remove one slot and renumber remaining
 router.delete('/imports/:id/stations/:addr/slots/:slot', (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id,   10);
     const addr     = parseInt(req.params.addr, 10);
     const slot     = parseInt(req.params.slot, 10);
-    db.prepare('DELETE FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=?').run(importId, addr, slot);
-    db.prepare('DELETE FROM hw_slot_subslots WHERE hw_import_id=? AND station_address=? AND slot=?').run(importId, addr, slot);
+
+    db.transaction(() => {
+      db.prepare('DELETE FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=?').run(importId, addr, slot);
+      db.prepare('DELETE FROM hw_slot_subslots WHERE hw_import_id=? AND station_address=? AND slot=?').run(importId, addr, slot);
+
+      // Renumber remaining user slots to be contiguous.
+      // CFU_PA reserves slots 0-2 (head + DIQ8 + PA Master); all others start user slots at 1.
+      const imRow = db.prepare(
+        'SELECT module_order_no FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=0 LIMIT 1'
+      ).get(importId, addr);
+      const imTpl = imRow
+        ? db.prepare('SELECT family FROM hw_module_templates WHERE order_no=?').get(imRow.module_order_no)
+        : null;
+      const firstUser = (imTpl && imTpl.family === 'CFU_PA') ? 3 : 1;
+
+      // Distinct user slot numbers still present, sorted ascending
+      const userSlots = db.prepare(
+        'SELECT DISTINCT slot FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot>=? ORDER BY slot'
+      ).all(importId, addr, firstUser).map(r => r.slot);
+
+      if (userSlots.length === 0) return;
+      const isContiguous = userSlots.every((s, i) => s === firstUser + i);
+      if (isContiguous) return;
+
+      // Two-pass renumber through temporary negative slots to avoid unique-key conflicts.
+      for (let i = userSlots.length - 1; i >= 0; i--) {
+        const tmp = -(i + 1);
+        db.prepare('UPDATE hw_signals SET slot=? WHERE hw_import_id=? AND station_address=? AND slot=?').run(tmp, importId, addr, userSlots[i]);
+        db.prepare('UPDATE hw_slot_subslots SET slot=? WHERE hw_import_id=? AND station_address=? AND slot=?').run(tmp, importId, addr, userSlots[i]);
+      }
+      for (let i = 0; i < userSlots.length; i++) {
+        const tmp    = -(i + 1);
+        const newSlot = firstUser + i;
+        db.prepare('UPDATE hw_signals SET slot=? WHERE hw_import_id=? AND station_address=? AND slot=?').run(newSlot, importId, addr, tmp);
+        db.prepare('UPDATE hw_slot_subslots SET slot=? WHERE hw_import_id=? AND station_address=? AND slot=?').run(newSlot, importId, addr, tmp);
+      }
+    })();
+
     res.json({ ok: true });
   } catch (e) { err(res, 500, e.message); }
 });
@@ -1294,11 +2005,12 @@ router.post('/imports/:id/generate', async (req, res) => {
       parsedBaseline.existingAddresses.maxOutput
     );
 
-    const cfgText = generateCfg(parsedBaseline, stations, templateMap);
+    const { cfg: cfgText, warnings } = generateCfg(parsedBaseline, stations, templateMap);
 
     let moduleCount = 0;
     for (const st of stations.values()) moduleCount += st.slots.size;
-    const stats = JSON.stringify({ stations: stations.size, modules: moduleCount, signals: signals.length });
+    // Persist warnings in stats so they survive a reload of the generated CFG list.
+    const stats = JSON.stringify({ stations: stations.size, modules: moduleCount, signals: signals.length, warnings });
 
     db.prepare('DELETE FROM hw_generated_cfgs WHERE hw_import_id=?').run(importId);
     const r = db.prepare(
@@ -1306,7 +2018,7 @@ router.post('/imports/:id/generate', async (req, res) => {
     ).run(importId, cfgText, stats);
     db.prepare('UPDATE hw_imports SET status=? WHERE id=?').run('generated', importId);
 
-    res.json({ cfgId: r.lastInsertRowid, stats: JSON.parse(stats), previewLines: cfgText.split('\n').slice(0, 30) });
+    res.json({ cfgId: r.lastInsertRowid, stats: JSON.parse(stats), warnings, previewLines: cfgText.split('\n').slice(0, 30) });
   } catch (e) { err(res, 500, e.message); }
 });
 

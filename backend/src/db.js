@@ -286,6 +286,46 @@ function ensureSchema() {
       sort_order        INTEGER NOT NULL DEFAULT 0
     )`,
     `CREATE INDEX IF NOT EXISTS idx_ccc_comp ON composite_cm_connections(composite_id)`,
+
+    // ── Unit Type Member Connections ──────────────────────────────────────────
+    // Wiring between unit members: from_alias.from_var → to_alias.to_var
+    // Supports one-to-many (single output to multiple inputs)
+    `CREATE TABLE IF NOT EXISTS unit_type_member_connections (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      unit_type_id      INTEGER NOT NULL REFERENCES unit_types(id) ON DELETE CASCADE,
+      from_alias        TEXT NOT NULL,           -- source member alias
+      from_sub_idx      INTEGER NOT NULL DEFAULT 0,  -- sub-member index (for composites)
+      from_var_name     TEXT NOT NULL,           -- output variable name
+      to_alias          TEXT NOT NULL,           -- target member alias
+      to_sub_idx        INTEGER NOT NULL DEFAULT 0,  -- sub-member index (for composites)
+      to_var_name       TEXT NOT NULL,           -- input variable name
+      conn_type         TEXT NOT NULL DEFAULT 'interconnection',  -- 'interconnection'|'value'|'io_connection'
+      static_value      TEXT,                    -- for value type (literal) or io_connection (JSON metadata)
+      sort_order        INTEGER NOT NULL DEFAULT 0,
+      created_at        TEXT DEFAULT (datetime('now'))
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_utmc_unit ON unit_type_member_connections(unit_type_id)`,
+
+    // ── Resolved Unit Connections (materialized by expand) ────────────────────
+    // unit_type_member_connections wire member ALIASES (UNIT_PLC.QCmndUnitCM →
+    // XV10.CmndUnit). They live at the unit-type level and cross composite-member
+    // boundaries, so the composite_group_id grouping cannot represent them. The
+    // expand step resolves each one to concrete project-instance names and stores
+    // it here; generate.js turns these rows into interconnection wire specs.
+    `CREATE TABLE IF NOT EXISTS unit_resolved_connections (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id        INTEGER NOT NULL REFERENCES projects(id),
+      unit_instance_id  INTEGER NOT NULL,        -- source unit_instances.id (for cleanup)
+      from_instance     TEXT NOT NULL,           -- resolved source instance name
+      from_var_name     TEXT NOT NULL,           -- output variable name
+      to_instance       TEXT NOT NULL,           -- resolved destination instance name
+      to_var_name       TEXT NOT NULL,           -- input variable name
+      conn_type         TEXT NOT NULL DEFAULT 'interconnection',
+      static_value      TEXT,
+      user_project      TEXT,
+      sort_order        INTEGER NOT NULL DEFAULT 0
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_urc_proj ON unit_resolved_connections(project_id)`,
   ];
 
   for (const s of stmts) _db.run(s);
@@ -619,7 +659,9 @@ function ensureSchema() {
     version        TEXT,
     gsdml_file     TEXT,
     dap_id         TEXT,
-    hw_category    TEXT
+    hw_category    TEXT,
+    in_identifier  TEXT,
+    out_identifier TEXT
   )`);
 
   _db.run(`CREATE TABLE IF NOT EXISTS hw_imports (
@@ -673,6 +715,24 @@ function ensureSchema() {
     // Valid values: 'Analog Input (AI)short' | 'Analog Input (AI)long' | 'SP (short)' | null
     _db.run("ALTER TABLE hw_signals ADD COLUMN pa_profile TEXT");
   }
+  if (!hwSigCols.includes('resolved_by_tier2')) {
+    // Flag: 1 if this row was resolved by Tier 2 (Protocol+SignalType lookup), 0 otherwise
+    _db.run("ALTER TABLE hw_signals ADD COLUMN resolved_by_tier2 INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!hwSigCols.includes('unresolved')) {
+    // Flag: 1 if Tier 2 lookup failed (placeholder used), needs manual resolution
+    _db.run("ALTER TABLE hw_signals ADD COLUMN unresolved INTEGER NOT NULL DEFAULT 0");
+  }
+
+  // Raw Excel rows stored during parse-headers for preview/mapping without re-upload
+  _db.run(`CREATE TABLE IF NOT EXISTS hw_excel_raw (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    hw_import_id INTEGER NOT NULL REFERENCES hw_imports(id),
+    row_index    INTEGER NOT NULL,
+    row_json     TEXT NOT NULL
+  )`);
+  _db.run(`CREATE INDEX IF NOT EXISTS idx_hwer_import ON hw_excel_raw(hw_import_id)`);
+  // Migration: ensure table exists for older DBs (no-op if already present)
 
   // Per-subslot PA profile assignments (one row per function subslot of a CFU_PA device slot)
   _db.run(`CREATE TABLE IF NOT EXISTS hw_slot_subslots (
@@ -685,6 +745,26 @@ function ensureSchema() {
     UNIQUE(hw_import_id, station_address, slot, subslot_no)
   )`);
   _db.run(`CREATE INDEX IF NOT EXISTS idx_hwss_import ON hw_slot_subslots(hw_import_id)`);
+
+  // ── Signal-to-Instance Mapping (standalone, additive) ────────────────────────
+  // Attaches a hardware signal tag to a block ControlVariable of an instance.
+  // Identity = (project, instance, block, variable); injected during XML export only.
+  // No existing table/import/generation logic depends on this — it is purely additive.
+  _db.run(`CREATE TABLE IF NOT EXISTS signal_mappings (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id    INTEGER NOT NULL REFERENCES projects(id),
+    instance_name TEXT NOT NULL,
+    block_name    TEXT NOT NULL,
+    var_name      TEXT NOT NULL,
+    signal_tag    TEXT NOT NULL,
+    hw_signal_id  INTEGER,          -- soft ref to hw_signals.id (nullable)
+    var_dtype     TEXT,             -- snapshot of variable datatype (audit/validation)
+    signal_type   TEXT,             -- snapshot of signal type (DI/DO/AI/AO)
+    created_at    TEXT DEFAULT (datetime('now')),
+    UNIQUE (project_id, instance_name, block_name, var_name)
+  )`);
+  _db.run(`CREATE INDEX IF NOT EXISTS idx_sigmap_proj_inst
+    ON signal_mappings(project_id, instance_name)`);
 
   // One-time migration: copy existing pa_profile values from hw_signals into hw_slot_subslots as subslot_no=1
   {
@@ -708,6 +788,13 @@ function ensureSchema() {
   }
   if (!hwTplCols.includes('port_config')) {
     _db.run('ALTER TABLE hw_module_templates ADD COLUMN port_config TEXT');
+  }
+  // Per-card SYMBOL-line address identifiers, scoped by direction (I/IW inputs, Q/QW outputs).
+  if (!hwTplCols.includes('in_identifier')) {
+    _db.run('ALTER TABLE hw_module_templates ADD COLUMN in_identifier TEXT');
+  }
+  if (!hwTplCols.includes('out_identifier')) {
+    _db.run('ALTER TABLE hw_module_templates ADD COLUMN out_identifier TEXT');
   }
   if (!hwTplCols.includes('hw_category')) {
     _db.run('ALTER TABLE hw_module_templates ADD COLUMN hw_category TEXT');
@@ -909,6 +996,30 @@ function ensureSchema() {
     }
   }
 
+  // Backfill per-card SYMBOL identifiers from signal_type defaults for any row that
+  // hasn't got an explicit value yet (covers both pre-existing and freshly-seeded
+  // rows — INSERT OR IGNORE never writes these columns). Idempotent: only NULLs are
+  // touched, so user overrides made in the catalogue editor are preserved.
+  // Notably fixes ET200SP DO cards → out_identifier 'Q' (previously hardcoded 'O').
+  {
+    const { defaultIdentifiers } = require('./services/hwAddressEngine');
+    const rows = rawAll(
+      `SELECT id, signal_type FROM hw_module_templates
+       WHERE in_identifier IS NULL OR out_identifier IS NULL`
+    );
+    const upd = _db.prepare(
+      `UPDATE hw_module_templates
+       SET in_identifier  = COALESCE(in_identifier, ?),
+           out_identifier = COALESCE(out_identifier, ?)
+       WHERE id = ?`
+    );
+    for (const r of rows) {
+      const def = defaultIdentifiers(r.signal_type);
+      upd.run([def.in, def.out, r.id]);
+    }
+    upd.free();
+  }
+
   // ── Signal types (user-extensible list) ─────────────────────────────────────
   _db.run(`CREATE TABLE IF NOT EXISTS hw_signal_types (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -929,6 +1040,38 @@ function ensureSchema() {
     const existing = rawAll(`SELECT DISTINCT signal_type FROM hw_module_templates WHERE signal_type IS NOT NULL`);
     for (const row of existing) {
       _db.run(`INSERT OR IGNORE INTO hw_signal_types (name) VALUES (?)`, [row.signal_type]);
+    }
+  }
+
+  // ── Tier 2 Hardware Resolution (Protocol + SignalType → Card MLFB) ──────────────
+  _db.run(`CREATE TABLE IF NOT EXISTS hw_hardware_resolution (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    protocol     TEXT NOT NULL,
+    signal_type  TEXT NOT NULL,
+    card_mlfb    TEXT NOT NULL,
+    description  TEXT,
+    created_at   TEXT DEFAULT (datetime('now')),
+    UNIQUE(protocol, signal_type)
+  )`);
+  _db.run(`CREATE INDEX IF NOT EXISTS idx_hwres_proto_sig ON hw_hardware_resolution(protocol, signal_type)`);
+
+  // Seed default mappings from customer requirements (example data)
+  // These can be customized later via the admin UI
+  const hwResCount = rawGet('SELECT COUNT(*) AS n FROM hw_hardware_resolution').n;
+  if (!hwResCount) {
+    const resolutions = [
+      ['SoftIO', 'DI', 'GSDML-V2.35-Festo-CPX-AP-I-20240606.xml|Module_8199', 'Festo CPX SoftIO DI Module'],
+      ['STD', 'DI', '6ES7 131-6BH01-0BA0', 'ET200SP DI 16x24VDC'],
+      ['STD', 'DO', '6ES7 132-6BH01-0BA0', 'ET200SP DO 16x24VDC'],
+      ['STD', 'AI', '6ES7 134-6HD01-0BA1', 'ET200SP AI 4xU/I/RTD'],
+      ['STD', 'AO', '6ES7 135-6HD00-0BA1', 'ET200SP AO 4xU/I'],
+      ['PF', 'DO', 'GSDML-V2.35-Festo-CPX-AP-I-20240606.xml|Module_8505', 'Festo CPX PF DO Module'],
+    ];
+    const insRes = _db.prepare(
+      'INSERT INTO hw_hardware_resolution (protocol, signal_type, card_mlfb, description) VALUES (?,?,?,?)'
+    );
+    for (const [protocol, signalType, cardMlfb, desc] of resolutions) {
+      insRes.run(protocol, signalType, cardMlfb, desc);
     }
   }
 
@@ -984,6 +1127,93 @@ function ensureSchema() {
     to_port_subslot      INTEGER NOT NULL
   )`);
   _db.run(`CREATE INDEX IF NOT EXISTS idx_mrppl_cfg ON mrp_port_links(mrp_config_id)`);
+
+  // ── IO Connection Rules & Instance IOs ──────────────────────────────────────
+  // lib_io_connections: one rule per (cm_type, block, variable) describing how a
+  // dummy IO signal name is derived from a tag name (prefix+tag+suffix) and which
+  // block pin it is pre-wired to. Lives on the lib_cm_type so it can be surfaced
+  // from inside the Composite CM editor (where the user thinks about IO rules).
+  _db.run(`CREATE TABLE IF NOT EXISTS lib_io_connections (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    cm_type_id   INTEGER NOT NULL REFERENCES lib_cm_types(id) ON DELETE CASCADE,
+    block_name   TEXT NOT NULL,
+    var_name     TEXT NOT NULL,
+    suffix       TEXT NOT NULL DEFAULT '',
+    prefix       TEXT NOT NULL DEFAULT '',
+    signal_type  TEXT NOT NULL DEFAULT 'DI',
+    required     INTEGER NOT NULL DEFAULT 1,
+    sort_order   INTEGER NOT NULL DEFAULT 0
+  )`);
+  _db.run(`CREATE INDEX IF NOT EXISTS idx_lioc_cmtype ON lib_io_connections(cm_type_id)`);
+
+  // instance_ios: one row per (instance, block, variable) auto-generated from
+  // lib_io_connections when an IO list is imported. status='dummy' until Part 3
+  // reconciliation matches it to a hw_signal; status='real' once linked.
+  _db.run(`CREATE TABLE IF NOT EXISTS instance_ios (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id       INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    instance_name    TEXT NOT NULL,
+    io_connection_id INTEGER REFERENCES lib_io_connections(id),
+    block_name       TEXT NOT NULL,
+    var_name         TEXT NOT NULL,
+    signal_name      TEXT NOT NULL,
+    signal_type      TEXT,
+    required         INTEGER NOT NULL DEFAULT 1,
+    status           TEXT NOT NULL DEFAULT 'dummy' CHECK(status IN ('dummy','real')),
+    hw_signal_id     INTEGER REFERENCES hw_signals(id),
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(project_id, instance_name, block_name, var_name)
+  )`);
+  _db.run(`CREATE INDEX IF NOT EXISTS idx_iios_proj_inst ON instance_ios(project_id, instance_name)`);
+  _db.run(`CREATE INDEX IF NOT EXISTS idx_iios_signal    ON instance_ios(signal_name)`);
+  _db.run(`CREATE INDEX IF NOT EXISTS idx_iios_hwsig     ON instance_ios(hw_signal_id)`);
+
+  // Migration: add signal_type + required to instance_ios (reconciliation needs
+  // these for export — signal_type for the binding, required for the
+  // "no block if required+unmatched" rule). Safe on DBs created before this.
+  const iioCols = rawAll('PRAGMA table_info(instance_ios)').map(c => c.name);
+  if (!iioCols.includes('signal_type')) {
+    _db.run(`ALTER TABLE instance_ios ADD COLUMN signal_type TEXT`);
+  }
+  if (!iioCols.includes('required')) {
+    _db.run(`ALTER TABLE instance_ios ADD COLUMN required INTEGER NOT NULL DEFAULT 1`);
+  }
+
+  // Migration: add source column to project_instances.
+  // 'manual' = created via the normal generate/wizard flow (default for existing rows).
+  // 'imported' = auto-created from an IO list import.
+  const piColsFinal = rawAll('PRAGMA table_info(project_instances)').map(c => c.name);
+  if (!piColsFinal.includes('source')) {
+    _db.run(`ALTER TABLE project_instances ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'`);
+  }
+
+  // Migration: add connections column to project_instances.
+  // Stores IO connection rules as JSON array. Auto-populated from lib_io_connections when importing.
+  if (!piColsFinal.includes('connections')) {
+    _db.run(`ALTER TABLE project_instances ADD COLUMN connections TEXT NOT NULL DEFAULT '[]'`);
+  }
+
+  // Clear orphaned lib_io_connections records (old approach; now using composite_cm_connections)
+  _db.run(`DELETE FROM lib_io_connections`);
+
+  // User preferences for optional block selections in Type Configuration
+  _db.run(`CREATE TABLE IF NOT EXISTS user_cm_block_prefs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    cm_type_name  TEXT NOT NULL,
+    enabled_blocks TEXT NOT NULL DEFAULT '[]',
+    updated_at    TEXT DEFAULT (datetime('now')),
+    UNIQUE(cm_type_name)
+  )`);
+
+  // User preferences for selected columns in IO imports
+  _db.run(`CREATE TABLE IF NOT EXISTS user_io_column_prefs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_id     INTEGER NOT NULL,
+    active_columns TEXT NOT NULL DEFAULT '[]',
+    updated_at    TEXT DEFAULT (datetime('now')),
+    UNIQUE(import_id),
+    FOREIGN KEY(import_id) REFERENCES io_imports(id) ON DELETE CASCADE
+  )`);
 
   saveDb();
   console.log('[DB] Schema ready');
