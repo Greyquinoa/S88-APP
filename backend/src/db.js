@@ -1060,6 +1060,12 @@ function ensureSchema() {
   )`);
   _db.run(`CREATE INDEX IF NOT EXISTS idx_hwres_proto_sig ON hw_hardware_resolution(protocol, signal_type)`);
 
+  // Migration: add station_mlfb column if missing (for existing databases)
+  const hwResCols = rawAll('PRAGMA table_info(hw_hardware_resolution)').map(c => c.name);
+  if (!hwResCols.includes('station_mlfb')) {
+    _db.run('ALTER TABLE hw_hardware_resolution ADD COLUMN station_mlfb TEXT NOT NULL DEFAULT ""');
+  }
+
   // Seed default mappings from customer requirements (example data)
   // These can be customized later via the admin UI
   const hwResCount = rawGet('SELECT COUNT(*) AS n FROM hw_hardware_resolution').n;

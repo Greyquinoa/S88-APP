@@ -182,12 +182,12 @@ router.post('/hardware-resolution', (req, res) => {
     // Upsert: try insert first, if unique constraint fails, update
     try {
       db.prepare('INSERT INTO hw_hardware_resolution (protocol, signal_type, card_mlfb, station_mlfb, description) VALUES (?,?,?,?,?)')
-        .run(protocol.trim(), signal_type.trim(), card_mlfb, station_mlfb, description || null);
+        .run(protocol.trim(), signal_type.trim(), card_mlfb.trim(), station_mlfb.trim(), description?.trim() || null);
       res.status(201).json({ ok: true, action: 'inserted' });
     } catch (e) {
       if (e.message.includes('UNIQUE')) {
         db.prepare('UPDATE hw_hardware_resolution SET card_mlfb=?, station_mlfb=?, description=? WHERE protocol=? AND signal_type=?')
-          .run(card_mlfb, station_mlfb, description || null, protocol.trim(), signal_type.trim());
+          .run(card_mlfb.trim(), station_mlfb.trim(), description?.trim() || null, protocol.trim(), signal_type.trim());
         res.json({ ok: true, action: 'updated' });
       } else {
         throw e;
@@ -254,7 +254,7 @@ router.post('/hardware-resolution/import', upload.single('csv'), (req, res) => {
       try {
         // Upsert
         db.prepare('INSERT OR REPLACE INTO hw_hardware_resolution (protocol, signal_type, card_mlfb, station_mlfb, description) VALUES (?,?,?,?,?)')
-          .run(protocol, signal_type, card_mlfb, station_mlfb, description || null);
+          .run(protocol?.trim() || '', signal_type?.trim() || '', card_mlfb?.trim() || '', station_mlfb?.trim() || '', description?.trim() || null);
         imported++;
       } catch (e) {
         errors.push(`Row ${i}: ${e.message}`);
