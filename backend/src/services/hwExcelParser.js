@@ -30,19 +30,19 @@ function detectColumnMap(headers) {
 }
 
 /**
- * Tier 2 Hardware Resolution: resolve card MLFB from Protocol + SignalType via lookup table.
+ * Tier 2 Hardware Resolution: resolve card MLFB + station MLFB from Protocol + SignalType via lookup table.
  * @param {Object} db - Database instance (getDb() result)
  * @param {string} protocol - Protocol value from Excel
  * @param {string} signalType - Signal type value from Excel
- * @returns {string|null} - Resolved card_mlfb if found, null otherwise
+ * @returns {Object|null} - { card_mlfb, station_mlfb } if found, null otherwise
  */
 function resolveTier2(db, protocol, signalType) {
   if (!db || !protocol || !signalType) return null;
   try {
     const result = db.prepare(
-      'SELECT card_mlfb FROM hw_hardware_resolution WHERE protocol=? AND signal_type=?'
+      'SELECT card_mlfb, station_mlfb FROM hw_hardware_resolution WHERE protocol=? AND signal_type=?'
     ).get(protocol.trim(), signalType.trim());
-    return result ? result.card_mlfb : null;
+    return result || null;
   } catch (e) {
     console.warn(`[Tier2 lookup] Error querying hw_hardware_resolution:`, e.message);
     return null;
@@ -103,13 +103,15 @@ async function parseHwExcel(buffer, sheetName, overrideColumnMap, db) {
     // Tier 2: If no direct MLFB, try Protocol + SignalType lookup
     let tier2Used = false;
     let unresolved = false;
+    let stationMlfb = null;
     if (!orderNo && db) {
       const protocol = get('protocol');
       const signalType = get('signal_type');
       if (protocol && signalType) {
         const resolved = resolveTier2(db, protocol, signalType);
         if (resolved) {
-          orderNo = resolved;
+          orderNo = resolved.card_mlfb;
+          stationMlfb = resolved.station_mlfb;
           tier2Used = true;
           resolutionStats.tier2Resolved++;
         } else {
@@ -168,6 +170,7 @@ async function parseHwExcel(buffer, sheetName, overrideColumnMap, db) {
 
     rawRows.push({
       rowNum, stationAddr, slot, orderNo, moduleName, tag, desc, signalType, channel, ip, stationName, subsystemNo, routerAddress,
+      stationMlfb,
       resolvedByTier2: tier2Used ? 1 : 0,
       unresolved: unresolved ? 1 : 0,
     });
@@ -212,13 +215,15 @@ function parseRawExcelRows(rawExcelRows, colMap, db) {
     // Tier 2: If no direct MLFB, try Protocol + SignalType lookup
     let tier2Used = false;
     let unresolved = false;
+    let stationMlfb = null;
     if (!orderNo && db) {
       const protocol = get('protocol');
       const signalType = get('signal_type');
       if (protocol && signalType) {
         const resolved = resolveTier2(db, protocol, signalType);
         if (resolved) {
-          orderNo = resolved;
+          orderNo = resolved.card_mlfb;
+          stationMlfb = resolved.station_mlfb;
           tier2Used = true;
           resolutionStats.tier2Resolved++;
         } else {
@@ -275,6 +280,7 @@ function parseRawExcelRows(rawExcelRows, colMap, db) {
 
     rows.push({
       rowNum, stationAddr, slot, orderNo, moduleName, tag, desc, signalType, channel, ip, stationName, subsystemNo, routerAddress,
+      stationMlfb,
       resolvedByTier2: tier2Used ? 1 : 0,
       unresolved: unresolved ? 1 : 0,
     });

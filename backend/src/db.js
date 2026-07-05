@@ -723,6 +723,10 @@ function ensureSchema() {
     // Flag: 1 if Tier 2 lookup failed (placeholder used), needs manual resolution
     _db.run("ALTER TABLE hw_signals ADD COLUMN unresolved INTEGER NOT NULL DEFAULT 0");
   }
+  if (!hwSigCols.includes('station_mlfb')) {
+    // Station MLFB: resolved from hw_hardware_resolution lookup (Tier 2 resolution)
+    _db.run("ALTER TABLE hw_signals ADD COLUMN station_mlfb TEXT");
+  }
 
   // Raw Excel rows stored during parse-headers for preview/mapping without re-upload
   _db.run(`CREATE TABLE IF NOT EXISTS hw_excel_raw (
@@ -1043,14 +1047,15 @@ function ensureSchema() {
     }
   }
 
-  // ── Tier 2 Hardware Resolution (Protocol + SignalType → Card MLFB) ──────────────
+  // ── Tier 2 Hardware Resolution (Protocol + SignalType → Card MLFB + Station MLFB) ──
   _db.run(`CREATE TABLE IF NOT EXISTS hw_hardware_resolution (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    protocol     TEXT NOT NULL,
-    signal_type  TEXT NOT NULL,
-    card_mlfb    TEXT NOT NULL,
-    description  TEXT,
-    created_at   TEXT DEFAULT (datetime('now')),
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    protocol       TEXT NOT NULL,
+    signal_type    TEXT NOT NULL,
+    card_mlfb      TEXT NOT NULL,
+    station_mlfb   TEXT NOT NULL,
+    description    TEXT,
+    created_at     TEXT DEFAULT (datetime('now')),
     UNIQUE(protocol, signal_type)
   )`);
   _db.run(`CREATE INDEX IF NOT EXISTS idx_hwres_proto_sig ON hw_hardware_resolution(protocol, signal_type)`);
@@ -1060,19 +1065,20 @@ function ensureSchema() {
   const hwResCount = rawGet('SELECT COUNT(*) AS n FROM hw_hardware_resolution').n;
   if (!hwResCount) {
     const resolutions = [
-      ['SoftIO', 'DI', 'GSDML-V2.35-Festo-CPX-AP-I-20240606.xml|Module_8199', 'Festo CPX SoftIO DI Module'],
-      ['STD', 'DI', '6ES7 131-6BH01-0BA0', 'ET200SP DI 16x24VDC'],
-      ['STD', 'DO', '6ES7 132-6BH01-0BA0', 'ET200SP DO 16x24VDC'],
-      ['STD', 'AI', '6ES7 134-6HD01-0BA1', 'ET200SP AI 4xU/I/RTD'],
-      ['STD', 'AO', '6ES7 135-6HD00-0BA1', 'ET200SP AO 4xU/I'],
-      ['PF', 'DO', 'GSDML-V2.35-Festo-CPX-AP-I-20240606.xml|Module_8505', 'Festo CPX PF DO Module'],
+      ['SoftIO', 'DI', 'GSDML-V2.35-Festo-CPX-AP-I-20240606.xml|Module_8199', '6ES7 155-6AU00-0CN0', 'Festo CPX SoftIO DI Module'],
+      ['STD', 'DI', '6ES7 131-6BH01-0BA0', '6ES7 155-6AU00-0CN0', 'ET200SP DI 16x24VDC'],
+      ['STD', 'DO', '6ES7 132-6BH01-0BA0', '6ES7 155-6AU00-0CN0', 'ET200SP DO 16x24VDC'],
+      ['STD', 'AI', '6ES7 134-6HD01-0BA1', '6ES7 155-6AU00-0CN0', 'ET200SP AI 4xU/I/RTD'],
+      ['STD', 'AO', '6ES7 135-6HD00-0BA1', '6ES7 155-6AU00-0CN0', 'ET200SP AO 4xU/I'],
+      ['PF', 'DO', 'GSDML-V2.35-Festo-CPX-AP-I-20240606.xml|Module_8505', '6ES7 155-6AU00-0CN0', 'Festo CPX PF DO Module'],
     ];
     const insRes = _db.prepare(
-      'INSERT INTO hw_hardware_resolution (protocol, signal_type, card_mlfb, description) VALUES (?,?,?,?)'
+      'INSERT INTO hw_hardware_resolution (protocol, signal_type, card_mlfb, station_mlfb, description) VALUES (?,?,?,?,?)'
     );
-    for (const [protocol, signalType, cardMlfb, desc] of resolutions) {
-      insRes.run(protocol, signalType, cardMlfb, desc);
+    for (const [protocol, signalType, cardMlfb, stationMlfb, desc] of resolutions) {
+      insRes.run([protocol, signalType, cardMlfb, stationMlfb, desc]);
     }
+    insRes.free();
   }
 
   // ── Slot ↔ Subslot compatibility (M2M) ───────────────────────────────────────

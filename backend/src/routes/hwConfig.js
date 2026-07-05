@@ -783,14 +783,15 @@ router.post('/imports/:id/upload-iolist', upload.single('iolist'), async (req, r
       INSERT INTO hw_signals
         (hw_import_id, row_number, station_address, station_name, ip_address,
          slot, channel, module_order_no, module_name, tag, description, signal_type, subsystem_no, router_address,
-         resolved_by_tier2, unresolved)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         station_mlfb, resolved_by_tier2, unresolved)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     `);
     const insertBatch = db.transaction((batch) => {
       for (const r of batch) {
         ins.run(importId, r.rowNum, r.stationAddr, r.stationName, r.ip,
           r.slot, r.channel, r.orderNo, r.moduleName, r.tag, r.desc, r.signalType,
           r.subsystemNo ?? null, r.routerAddress || null,
+          r.stationMlfb || null,
           r.resolvedByTier2 ?? 0, r.unresolved ?? 0);
       }
     });
@@ -1185,8 +1186,8 @@ router.post('/imports/:id/apply-iolist', async (req, res) => {
         INSERT INTO hw_signals
           (hw_import_id, row_number, station_address, station_name, ip_address,
            slot, channel, module_order_no, module_name, tag, description, signal_type, subsystem_no, router_address,
-           resolved_by_tier2, unresolved)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           station_mlfb, resolved_by_tier2, unresolved)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       `);
 
       let rowIdx = 0;
@@ -1202,6 +1203,7 @@ router.post('/imports/:id/apply-iolist', async (req, res) => {
         ins.run(importId, r.rowNum ?? rowIdx, r.stationAddr, r.stationName, r.ip,
           r.slot, r.channel ?? null, r.orderNo, r.moduleName, r.tag, r.desc,
           r.signalType, r.subsystemNo ?? null, r.routerAddress || null,
+          r.stationMlfb || null,
           r.resolvedByTier2 ?? 0, r.unresolved ?? 0);
         rowIdx++;
       }

@@ -2186,8 +2186,7 @@ function ProtocolMappingPanel({ templates, setError }) {
               <th style={pmThStyle}>Protocol</th>
               <th style={pmThStyle}>Signal Type</th>
               <th style={pmThStyle}>Card MLFB</th>
-              <th style={pmThStyle}>Display Name</th>
-              <th style={pmThStyle}>Family</th>
+              <th style={pmThStyle}>Station MLFB</th>
               <th style={pmThStyle}>Description</th>
               <th style={{ ...pmThStyle, width: 110 }}>Actions</th>
             </tr>
@@ -2198,8 +2197,7 @@ function ProtocolMappingPanel({ templates, setError }) {
                 <td style={pmTdStyle}>{r.protocol}</td>
                 <td style={pmTdStyle}>{r.signal_type}</td>
                 <td style={{ ...pmTdStyle, fontFamily: "var(--font-mono, monospace)" }}>{r.card_mlfb}</td>
-                <td style={pmTdStyle}>{r.display_name || "—"}</td>
-                <td style={pmTdStyle}>{r.family || "—"}</td>
+                <td style={{ ...pmTdStyle, fontFamily: "var(--font-mono, monospace)" }}>{r.station_mlfb}</td>
                 <td style={pmTdStyle}>{r.description || "—"}</td>
                 <td style={pmTdStyle}>
                   <button onClick={() => setEditRow(r)} style={linkBtn}>Edit</button>
@@ -2242,19 +2240,20 @@ function ProtocolMappingModal({ initial, templates, onClose, onSave }) {
   const [protocol, setProtocol] = useState(initial?.protocol || "");
   const [signalType, setSignalType] = useState(initial?.signal_type || "");
   const [cardMlfb, setCardMlfb] = useState(initial?.card_mlfb || "");
+  const [stationMlfb, setStationMlfb] = useState(initial?.station_mlfb || "");
   const [description, setDescription] = useState(initial?.description || "");
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState("");
 
   async function handleSubmit() {
-    if (!protocol.trim() || !signalType.trim() || !cardMlfb.trim()) {
-      setErr("Protocol, Signal Type, and Card MLFB are all required");
+    if (!protocol.trim() || !signalType.trim() || !cardMlfb.trim() || !stationMlfb.trim()) {
+      setErr("Protocol, Signal Type, Card MLFB, and Station MLFB are all required");
       return;
     }
     setSaving(true);
     setErr("");
     try {
-      await onSave({ protocol: protocol.trim(), signal_type: signalType.trim(), card_mlfb: cardMlfb, description: description.trim() || null });
+      await onSave({ protocol: protocol.trim(), signal_type: signalType.trim(), card_mlfb: cardMlfb, station_mlfb: stationMlfb, description: description.trim() || null });
     } catch (e) {
       setErr(e.message);
       setSaving(false);
@@ -2284,8 +2283,19 @@ function ProtocolMappingModal({ initial, templates, onClose, onSave }) {
           <label style={{ fontSize: 11, fontWeight: 600, display: "block", marginBottom: 4 }}>Card MLFB</label>
           <select value={cardMlfb} onChange={e => setCardMlfb(e.target.value)}
             style={{ width: "100%", padding: "7px 10px", fontSize: 12, fontFamily: "var(--font-mono, monospace)", border: "0.5px solid var(--color-border-secondary)", borderRadius: 4, background: "var(--color-background-secondary)", color: "var(--color-text-primary)" }}>
-            <option value="">— Select module —</option>
-            {templates.map(t => (
+            <option value="">— Select card module —</option>
+            {templates.filter(t => t.hw_category === 'slot' || !t.hw_category).map(t => (
+              <option key={t.id} value={t.order_no}>{t.order_no} · {t.display_name}</option>
+            ))}
+          </select>
+        </div>
+
+        <div style={{ marginBottom: 12 }}>
+          <label style={{ fontSize: 11, fontWeight: 600, display: "block", marginBottom: 4 }}>Station MLFB</label>
+          <select value={stationMlfb} onChange={e => setStationMlfb(e.target.value)}
+            style={{ width: "100%", padding: "7px 10px", fontSize: 12, fontFamily: "var(--font-mono, monospace)", border: "0.5px solid var(--color-border-secondary)", borderRadius: 4, background: "var(--color-background-secondary)", color: "var(--color-text-primary)" }}>
+            <option value="">— Select station module —</option>
+            {templates.filter(t => t.hw_category === 'station').map(t => (
               <option key={t.id} value={t.order_no}>{t.order_no} · {t.display_name}</option>
             ))}
           </select>
