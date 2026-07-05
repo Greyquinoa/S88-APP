@@ -157,7 +157,7 @@ router.get('/hardware-resolution', (req, res) => {
 
     const total = db.prepare('SELECT COUNT(*) AS n FROM hw_hardware_resolution').get().n;
     const rows = db.prepare(`
-      SELECT hr.id, hr.protocol, hr.signal_type, hr.card_mlfb, hr.description, hr.created_at,
+      SELECT hr.id, hr.protocol, hr.signal_type, hr.card_mlfb, hr.station_mlfb, hr.description, hr.created_at,
              ht.display_name, ht.family
       FROM hw_hardware_resolution hr
       LEFT JOIN hw_module_templates ht ON ht.order_no = hr.card_mlfb
@@ -213,14 +213,14 @@ router.get('/hardware-resolution/export', (req, res) => {
   try {
     const db = getDb();
     const rows = db.prepare(`
-      SELECT protocol, signal_type, card_mlfb, description
+      SELECT protocol, signal_type, card_mlfb, station_mlfb, description
       FROM hw_hardware_resolution
       ORDER BY protocol, signal_type
     `).all();
 
     // Build CSV
-    const csv = 'protocol,signal_type,card_mlfb,description\n' +
-      rows.map(r => `"${r.protocol}","${r.signal_type}","${r.card_mlfb}","${r.description || ''}"`)
+    const csv = 'protocol,signal_type,card_mlfb,station_mlfb,description\n' +
+      rows.map(r => `"${r.protocol}","${r.signal_type}","${r.card_mlfb}","${r.station_mlfb}","${r.description || ''}"`)
         .join('\n');
 
     res.type('text/csv').set('Content-Disposition', 'attachment; filename="hw-resolution-mappings.csv"').send(csv);
