@@ -2062,7 +2062,7 @@ router.post('/imports/:id/generate', async (req, res) => {
       parsedBaseline.existingAddresses.maxOutput
     );
 
-    const { cfg: cfgText, warnings } = generateCfg(parsedBaseline, stations, templateMap);
+    const { cfg: cfgText, warnings } = generateCfg(parsedBaseline, stations, templateMap, db);
 
     let moduleCount = 0;
     for (const st of stations.values()) moduleCount += st.slots.size;
@@ -2139,6 +2139,145 @@ router.delete('/slot-compat', (req, res) => {
     db.prepare('DELETE FROM hw_slot_subslot_compat WHERE slot_order_no=? AND subslot_order_no=?')
       .run(slot_order_no, subslot_order_no);
     res.json({ ok: true });
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// ── Station Auto-Slot Configuration ───────────────────────────────────────────
+
+// GET /station-auto-slots — List all families + their auto-slot configs
+router.get('/station-auto-slots', (req, res) => {
+  try {
+    const db = getDb();
+    const rows = db.prepare(
+      'SELECT family, auto_slots_config, created_at, updated_at FROM hw_station_auto_slots ORDER BY family'
+    ).all();
+
+    const families = rows.map(r => ({
+      family: r.family,
+      config: JSON.parse(r.auto_slots_config),
+      created_at: r.created_at,
+      updated_at: r.updated_at
+    }));
+
+    res.json(families);
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// GET /station-auto-slots/:family — Get config for a specific family
+router.get('/station-auto-slots/:family', (req, res) => {
+  try {
+    const db = getDb();
+    const family = (req.params.family || '').trim();
+    if (!family) return err(res, 400, 'family parameter required');
+
+    const row = db.prepare(
+      'SELECT family, auto_slots_config, created_at, updated_at FROM hw_station_auto_slots WHERE family=?'
+    ).get(family);
+
+    if (!row) {
+      return err(res, 404, `No auto-slot config found for family "${family}"`);
+    }
+
+    res.json({
+      family: row.family,
+      config: JSON.parse(row.auto_slots_config),
+      created_at: row.created_at,
+      updated_at: row.updated_at
+    });
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// POST /station-auto-slots — Create or update auto-slot config for a family
+// Body: { family, auto_slots_config: {...} }
+router.post('/station-auto-slots', (req, res) => {
+  try {
+    const db = getDb();
+    const { family, auto_slots_config } = req.body;
+
+    if (!family || !family.trim()) {
+      return err(res, 400, 'family is required');
+    }
+
+    if (!auto_slots_config || typeof auto_slots_config !== 'object') {
+      return err(res, 400, 'auto_slots_config must be a valid JSON object');
+    }
+
+    // Validate JSON-serializability
+    let configJson;
+    try {
+      configJson = JSON.stringify(auto_slots_config);
+    } catch (e) {
+      return err(res, 400, `Invalid auto_slots_config JSON: ${e.message}`);
+    }
+
+    const existing = db.prepare('SELECT id FROM hw_station_auto_slots WHERE family=?').get(family.trim());
+
+    if (existing) {
+      db.prepare(
+        'UPDATE hw_station_auto_slots SET auto_slots_config=?, updated_at=datetime("now") WHERE family=?'
+      ).run(configJson, family.trim());
+      return res.json({ ok: true, action: 'updated', family: family.trim() });
+    } else {
+      const r = db.prepare(
+        'INSERT INTO hw_station_auto_slots (family, auto_slots_config) VALUES (?, ?)'
+      ).run(family.trim(), configJson);
+      return res.status(201).json({ ok: true, action: 'created', family: family.trim(), id: r.lastInsertRowid });
+    }
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// PUT /station-auto-slots/:family — Update auto-slot config (full replace)
+// Body: auto_slots_config JSON object
+router.put('/station-auto-slots/:family', (req, res) => {
+  try {
+    const db = getDb();
+    const family = (req.params.family || '').trim();
+    const auto_slots_config = req.body;
+
+    if (!family) return err(res, 400, 'family parameter required');
+    if (!auto_slots_config || typeof auto_slots_config !== 'object') {
+      return err(res, 400, 'Request body must be a valid JSON object');
+    }
+
+    // Validate JSON-serializability
+    let configJson;
+    try {
+      configJson = JSON.stringify(auto_slots_config);
+    } catch (e) {
+      return err(res, 400, `Invalid JSON: ${e.message}`);
+    }
+
+    const existing = db.prepare('SELECT id FROM hw_station_auto_slots WHERE family=?').get(family);
+
+    if (!existing) {
+      return err(res, 404, `No auto-slot config found for family "${family}"`);
+    }
+
+    db.prepare(
+      'UPDATE hw_station_auto_slots SET auto_slots_config=?, updated_at=datetime("now") WHERE family=?'
+    ).run(configJson, family);
+
+    res.json({ ok: true, action: 'updated', family });
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// DELETE /station-auto-slots/:family — Delete auto-slot config for a family
+router.delete('/station-auto-slots/:family', (req, res) => {
+  try {
+    const db = getDb();
+    const family = (req.params.family || '').trim();
+
+    if (!family) return err(res, 400, 'family parameter required');
+
+    const existing = db.prepare('SELECT id FROM hw_station_auto_slots WHERE family=?').get(family);
+
+    if (!existing) {
+      return err(res, 404, `No auto-slot config found for family "${family}"`);
+    }
+
+    db.prepare('DELETE FROM hw_station_auto_slots WHERE family=?').run(family);
+
+    res.json({ ok: true, deleted: family });
   } catch (e) { err(res, 500, e.message); }
 });
 

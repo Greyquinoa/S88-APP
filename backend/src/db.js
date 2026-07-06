@@ -1087,6 +1087,87 @@ function ensureSchema() {
     insRes.free();
   }
 
+  // ── Station Auto-Slot Configuration ────────────────────────────────────────────
+  // Each station family (ET200SP, CFU_PA, Scalance) has a JSON config defining which
+  // slots auto-create, their order numbers, subslots, and rendering rules.
+  _db.run(`CREATE TABLE IF NOT EXISTS hw_station_auto_slots (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    family                TEXT NOT NULL UNIQUE,
+    auto_slots_config     TEXT NOT NULL,
+    created_at            TEXT DEFAULT (datetime('now')),
+    updated_at            TEXT DEFAULT (datetime('now'))
+  )`);
+
+  // Seed auto-slot configurations from the existing hardcoded logic
+  const autoSlotConfigCount = rawGet('SELECT COUNT(*) AS n FROM hw_station_auto_slots').n;
+  if (!autoSlotConfigCount) {
+    const autoSlotConfigs = [
+      {
+        family: 'ET200SP',
+        config: {
+          family: 'ET200SP',
+          slots: [
+            {
+              slot: 0,
+              type: 'interface',
+              is_autocreated: true,
+              use_from_station_slot: true,
+              subslots: [
+                { subslot: 1, type: 'iface', is_autocreated: true },
+                { subslot: 2, type: 'port', port_label: 'Port 1 RJ45', order_no: 'DEFAULT:6ES7 193-6AR00-0AA0', is_autocreated: true },
+                { subslot: 3, type: 'port', port_label: 'Port 2 RJ45', order_no: 'DEFAULT:6ES7 193-6AR00-0AA0', is_autocreated: true }
+              ]
+            }
+          ],
+          rules: {
+            server_module_enabled: true,
+            server_module_order: 'V1_1:6ES7 193-6PA00-0AA0',
+            server_module_placement: 'after_last_io'
+          }
+        }
+      },
+      {
+        family: 'CFU_PA',
+        config: {
+          family: 'CFU_PA',
+          slots: [
+            {
+              slot: 0,
+              type: 'interface',
+              is_autocreated: true,
+              order_no: 'V_2_0_PA_ETER:6ES7 655-5PX11-0XX0',
+              subslots: [
+                { subslot: 1, type: 'iface', is_autocreated: true },
+                { subslot: 2, type: 'port', port_label: 'Port 1 RJ45', order_no: 'V_2_0_PORT_1:6DL1 193-6AR00-0AA0', is_autocreated: true },
+                { subslot: 3, type: 'port', port_label: 'Port 2 RJ45', order_no: 'V_2_0_PORT_2:6DL1 193-6AR00-0AA0', is_autocreated: true }
+              ]
+            },
+            {
+              slot: 2,
+              type: 'pa_master',
+              is_autocreated: true,
+              subslots: [
+                { subslot: 1, type: 'pa_master_param', is_autocreated: true },
+                { subslot: 2, type: 'pa_master_status', is_autocreated: true }
+              ]
+            }
+          ],
+          rules: {
+            server_module_enabled: false
+          }
+        }
+      }
+    ];
+
+    const insAutoSlot = _db.prepare(
+      'INSERT INTO hw_station_auto_slots (family, auto_slots_config) VALUES (?, ?)'
+    );
+    for (const item of autoSlotConfigs) {
+      insAutoSlot.run([item.family, JSON.stringify(item.config)]);
+    }
+    insAutoSlot.free();
+  }
+
   // ── Slot ↔ Subslot compatibility (M2M) ───────────────────────────────────────
   _db.run(`CREATE TABLE IF NOT EXISTS hw_slot_subslot_compat (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,

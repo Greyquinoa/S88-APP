@@ -1,17 +1,13 @@
 // services/cfgGenerator.js — Generate a PCS7 STEP7 .cfg file from baseline + station data
 'use strict';
-const { findTemplate, isGsdPaPath } = require('./hwAddressEngine');
+const { findTemplate, isGsdPaPath, defaultIdentifiers } = require('./hwAddressEngine');
+const { loadFamilyAutoSlotConfig, buildSlotMap, buildSubslotMap, isSlotAutocreated, isSubslotAutocreated, resolveSlotOrderNo, resolveSubslotOrderNo } = require('./autoSlotResolver');
 const blocks = require('./cfgBlocks');
 
 // I/O modules that PCS7 does NOT wrap in a REDUNDANCY block even on an H-station.
 const NON_REDUNDANT_ORDERS = new Set([
   '6ES7 135-6TD00-0CA1', // ET200SP AQ4 x I HART
 ]);
-
-// ET200SP RJ45 port submodule order (slot 0 subslots 2/3).
-const ET200SP_PORT_ORDER = 'DEFAULT:6ES7 193-6AR00-0AA0';
-// ET200SP server module (auto-added as the last slot).
-const ET200SP_SERVER_ORDER = 'V1_1:6ES7 193-6PA00-0AA0';
 
 /**
  * Convert dotted-decimal IP string to the 8-char hex format used in .cfg files.
@@ -62,21 +58,56 @@ function deviceName(station) {
 }
 
 /**
- * Build SYMBOL lines for one address direction (input or output).
- * Byte offset per channel = channel × (totalBytes / channelCount), rounded to int.
+ * Build SYMBOL lines for one address direction, using the card's configured
+ * identifier (I / Q / IW / QW …) verbatim. The identifier is resolved by the
+ * caller from the card catalogue (hw_module_templates.in_identifier / .out_identifier),
+ * NOT inferred here — this is the single source of truth the feature centralises on.
+ *
+ * The SYMBOL offset field is expressed in the module's native addressing unit:
+ *   - Word/analog modules (≥ 1 byte per channel, e.g. AI4 = 8 bytes / 4 ch = 2):
+ *       offset = channel × bytesPerCh  →  0, 2, 4, 6
+ *   - Bit/digital modules (< 1 byte per channel, e.g. DI16 = 2 bytes / 16 ch = 0.125):
+ *       offset = channel index (the bit position)  →  0, 1, 2, 3 …
+ *     Rounding channel × bytesPerCh here would collapse every sub-byte channel to 0.
+ *   - bytesPerCh = 0 (MIXED slots pass totalBytes = 0 deliberately): offset stays 0.
+ *
  * Only channels with a non-empty tag are emitted.
  */
-function buildSymbolLines(direction, channels, totalBytes, channelCount) {
+function buildSymbolLines(identifier, channels, totalBytes, channelCount) {
   if (!channels || channels.length === 0) return [];
   const bytesPerCh = channelCount > 0 ? totalBytes / channelCount : 0;
   const lines = [];
   for (const ch of channels) {
     if (!ch.tag) continue;
-    const byteOfs = Math.round(ch.channel * bytesPerCh);
+    const chIdx = Number(ch.channel) || 0;
+    const byteOfs = (bytesPerCh > 0 && bytesPerCh < 1)
+      ? chIdx                              // bit-packed digital → channel/bit index
+      : Math.round(chIdx * bytesPerCh);    // word/analog → byte offset (0 when bytesPerCh = 0)
     const desc = ch.desc || '';
-    lines.push(`SYMBOL  ${direction} , ${byteOfs}, "${ch.tag}", "${desc}"`);
+    lines.push(`SYMBOL  ${identifier} , ${byteOfs}, "${ch.tag}", "${desc}"`);
   }
   return lines;
+}
+
+/**
+ * Resolve a card's SYMBOL identifier for one direction: the explicit catalogue value
+ * wins; otherwise fall back to the signal-type default. When tagged channels exist in
+ * a direction but the card has NO explicit identifier for it, record a warning so the
+ * user knows generation relied on an inferred value (requirement: don't silently
+ * default a possibly-wrong identifier).
+ */
+function resolveIdentifier(tpl, dir, hasTaggedChannels, warnings, ctx) {
+  const explicit = tpl ? (dir === 'in' ? tpl.in_identifier : tpl.out_identifier) : null;
+  const fallback = defaultIdentifiers(tpl ? tpl.signal_type : null)[dir];
+  const ident = explicit || fallback || (dir === 'in' ? 'I' : 'Q');
+  if (!explicit && hasTaggedChannels && warnings && ctx) {
+    warnings.push(
+      `Station ${ctx.addr} slot ${ctx.slot} (${ctx.order || tpl?.order_no || '?'}): ` +
+      `no ${dir === 'in' ? 'input' : 'output'} identifier defined for signal type ` +
+      `${tpl?.signal_type || '?'} — using default "${ident}". Set it in the Catalogue.`
+    );
+  }
+  return ident;
 }
 
 /**
@@ -88,9 +119,12 @@ function buildSymbolLines(direction, channels, totalBytes, channelCount) {
  *   LOCAL_OUT_ADDRESSES
  *     ADDRESS  ...
  *   SYMBOL  I , <byteOfs>, "<tag>", "<desc>"
- *   SYMBOL  O , <byteOfs>, "<tag>", "<desc>"   (outputs use "O", not "Q")
+ *   SYMBOL  Q , <byteOfs>, "<tag>", "<desc>"
+ *
+ * The output identifier ("Q", "QW", …) comes from the card catalogue, not a
+ * hardcoded value — ET200SP DO cards need "Q" where this used to emit "O".
  */
-function buildAddressLines(tpl, slot) {
+function buildAddressLines(tpl, slot, warnings, ctx) {
   const channels = slot.channels ? [...slot.channels.values()] : [];
   const pipNo = slot.pipNo != null ? slot.pipNo : null;
   const isMixed = tpl && tpl.signal_type === 'MIXED';
@@ -101,16 +135,18 @@ function buildAddressLines(tpl, slot) {
   if (tpl && tpl.input_bytes > 0 && slot.inputAddr != null && tpl.in_addr_fmt) {
     const fields = patchPip(fillAddrFmt(tpl.in_addr_fmt, slot.inputAddr), pipNo);
     addrLines.push('LOCAL_IN_ADDRESSES', `  ADDRESS  ${fields}`);
-    // MIXED (DIQ8): only DI channels → SYMBOL I; pass totalBytes=0 so byteOfs=0 for all (bit-packed)
+    // MIXED (DIQ8): only DI channels → input identifier; pass totalBytes=0 so byteOfs=0 for all (bit-packed)
     const inChannels = isMixed ? channels.filter(c => c.signalType === 'DI') : channels;
-    symbolLines.push(...buildSymbolLines('I', inChannels, isMixed ? 0 : tpl.input_bytes, isMixed ? 1 : (tpl.channel_count || 0)));
+    const inIdent = resolveIdentifier(tpl, 'in', inChannels.some(c => c.tag), warnings, ctx);
+    symbolLines.push(...buildSymbolLines(inIdent, inChannels, isMixed ? 0 : tpl.input_bytes, isMixed ? 1 : (tpl.channel_count || 0)));
   }
   if (tpl && tpl.output_bytes > 0 && slot.outputAddr != null && tpl.out_addr_fmt) {
     const fields = patchPip(fillAddrFmt(tpl.out_addr_fmt, slot.outputAddr), pipNo);
     addrLines.push('LOCAL_OUT_ADDRESSES', `  ADDRESS  ${fields}`);
-    // MIXED (DIQ8): only DO channels → SYMBOL O (PCS7 uses "O" not "Q" for outputs)
+    // MIXED (DIQ8): only DO channels → output identifier (catalogue-driven, e.g. "Q")
     const outChannels = isMixed ? channels.filter(c => c.signalType === 'DO') : channels;
-    symbolLines.push(...buildSymbolLines('O', outChannels, isMixed ? 0 : tpl.output_bytes, isMixed ? 1 : (tpl.channel_count || 0)));
+    const outIdent = resolveIdentifier(tpl, 'out', outChannels.some(c => c.tag), warnings, ctx);
+    symbolLines.push(...buildSymbolLines(outIdent, outChannels, isMixed ? 0 : tpl.output_bytes, isMixed ? 1 : (tpl.channel_count || 0)));
   }
 
   // All address blocks first, then all SYMBOL lines — PCS7 requires this order
@@ -146,8 +182,10 @@ function buildParamLines(tpl, potentialGroup) {
  * ET200SP-family station, reproducing the structure PCS7 exports.
  *
  * @param diag - { ptr } mutable diagnostic-address counter (counts down)
+ * @param warnings - mutable array collecting missing-identifier diagnostics
+ * @param autoSlotConfig - Auto-slot configuration from database (optional)
  */
-function renderEt200sp(station, templateMap, ioNo, diag) {
+function renderEt200sp(station, templateMap, ioNo, diag, warnings, autoSlotConfig) {
   const out = [];
   const addr      = station.address;
   const name      = deviceName(station);
@@ -160,12 +198,27 @@ function renderEt200sp(station, templateMap, ioNo, diag) {
   const imVer    = headTpl && headTpl.version ? headTpl.version : 'V4.2';
   const ifaceOrder = blocks.ifaceOrderString(imOrder, imVer);
 
-  // Device header + SLOT 0 + interface + 2 RJ45 ports (each consumes a diag addr)
+  // Device header + SLOT 0 + interface + auto-created subslots from config
   out.push(blocks.deviceHeaderBlock({ ioNo, addr, imOrder, imVersion: imVer, name, posX: station.posX, posY: station.posY }));
   out.push(blocks.slot0Block({ ioNo, addr, imOrder, name, hexIp, hexRouter, diag: diag.ptr-- }));
   out.push(blocks.ifaceBlock({ ioNo, addr, ifaceOrder, diag: diag.ptr-- }));
-  out.push(blocks.portBlock({ ioNo, addr, subslot: 2, portLabel: 'Port 1 RJ45', portOrder: ET200SP_PORT_ORDER, diag: diag.ptr-- }));
-  out.push(blocks.portBlock({ ioNo, addr, subslot: 3, portLabel: 'Port 2 RJ45', portOrder: ET200SP_PORT_ORDER, diag: diag.ptr-- }));
+
+  // Auto-create subslots (ports) from config
+  if (autoSlotConfig && autoSlotConfig.slots) {
+    const slot0Config = autoSlotConfig.slots.find(s => s.slot === 0);
+    if (slot0Config && slot0Config.subslots) {
+      for (const subslot of slot0Config.subslots) {
+        if (subslot.type === 'port' && subslot.order_no) {
+          out.push(blocks.portBlock({
+            ioNo, addr, subslot: subslot.subslot,
+            portLabel: subslot.port_label,
+            portOrder: subslot.order_no,
+            diag: diag.ptr--
+          }));
+        }
+      }
+    }
+  }
 
   // I/O module slots (ascending), excluding the head. The ET200SP server module
   // (193-6PA00-0AA0) is special: it carries a diagnostic address, not a process
@@ -189,14 +242,15 @@ function renderEt200sp(station, templateMap, ioNo, diag) {
       version: tpl && tpl.version ? tpl.version : '',
       name: slot.name,
       redundant: !NON_REDUNDANT_ORDERS.has(slot.orderNo),
-      addressLines: buildAddressLines(tpl, slot),
+      addressLines: buildAddressLines(tpl, slot, warnings, { addr, slot: slotNo, order: slot.orderNo }),
       paramLines: buildParamLines(tpl, slot.potentialGroup || null),
     }));
   }
 
   // PCS7 always inserts the server module as the last slot — add it if the IO
-  // list did not already include one.
+  // list did not already include one. Server module order is hardcoded (not DB-configurable).
   if (!hasServer) {
+    const serverModuleOrder = 'V1_1:6ES7 193-6PA00-0AA0';
     out.push(blocks.serverModuleBlock({ ioNo, addr, slot: maxSlot + 1, diag: diag.ptr-- }));
   }
 
@@ -212,8 +266,10 @@ function renderEt200sp(station, templateMap, ioNo, diag) {
  *     Slot 2/Subslot 1 (param/diag, diagnostic address only)
  *     Slot 2/Subslot 2 (status/notifications, 4 bytes DI + 2 bytes DQ in ANALOG space)
  *   Slot 3+ — PA transmitter slots added by the user (one META\PA... block each)
+ *
+ * @param autoSlotConfig - Auto-slot configuration from database (optional)
  */
-function renderCfuPa(station, templateMap, ioNo, diag) {
+function renderCfuPa(station, templateMap, ioNo, diag, warnings, autoSlotConfig) {
   const out = [];
   const addr      = station.address;
   const name      = deviceName(station);
@@ -225,19 +281,36 @@ function renderCfuPa(station, templateMap, ioNo, diag) {
   const imOrder  = headSlot ? headSlot.orderNo : 'V_2_0_PA:6ES7 655-5PX11-0XX0';
   const imVer    = headTpl && headTpl.version ? headTpl.version : 'V2.0';
 
-  // Slot 0 ethernet head order: replace leading "V_2_0_PA:" with "V_2_0_PA_ETER:"
-  const slot0Order = imOrder.replace(/^V_\d+_\d+_PA:/, m => m.slice(0, -1) + '_ETER:');
+  // Resolve slot 0 order from config (explicit order_no from DB)
+  let slot0Order = imOrder;
+  if (autoSlotConfig && autoSlotConfig.slots) {
+    const slot0Config = autoSlotConfig.slots.find(s => s.slot === 0);
+    if (slot0Config && slot0Config.order_no) {
+      slot0Order = slot0Config.order_no;
+    }
+  }
 
-  // RJ45 port order for CFU_PA (6DL1 193-6AR00-0AA0 — matches golden CFG)
-  const CFU_PA_PORT_ORDER = 'V_2_0_PORT_1:6DL1 193-6AR00-0AA0';
-  const CFU_PA_PORT2_ORDER = 'V_2_0_PORT_2:6DL1 193-6AR00-0AA0';
-
-  // Device header + Slot 0 + IFACE + 2 ports (each consumes a diag address)
+  // Device header + Slot 0 + IFACE + auto-created subslots from config
   out.push(blocks.cfuPaDeviceHeaderBlock({ ioNo, addr, imOrder, imVersion: imVer, name, posX: station.posX, posY: station.posY }));
   out.push(blocks.cfuPaSlot0Block({ ioNo, addr, slot0Order, name, hexIp, hexRouter, diag: diag.ptr-- }));
   out.push(blocks.cfuPaIfaceBlock({ ioNo, addr, diag: diag.ptr-- }));
-  out.push(blocks.portBlock({ ioNo, addr, subslot: 2, portLabel: 'Port 1 RJ45', portOrder: CFU_PA_PORT_ORDER,  diag: diag.ptr-- }));
-  out.push(blocks.portBlock({ ioNo, addr, subslot: 3, portLabel: 'Port 2 RJ45', portOrder: CFU_PA_PORT2_ORDER, diag: diag.ptr-- }));
+
+  // Auto-create subslots (ports) from config
+  if (autoSlotConfig && autoSlotConfig.slots) {
+    const slot0Config = autoSlotConfig.slots.find(s => s.slot === 0);
+    if (slot0Config && slot0Config.subslots) {
+      for (const subslot of slot0Config.subslots) {
+        if (subslot.type === 'port' && subslot.order_no) {
+          out.push(blocks.portBlock({
+            ioNo, addr, subslot: subslot.subslot,
+            portLabel: subslot.port_label,
+            portOrder: subslot.order_no,
+            diag: diag.ptr--
+          }));
+        }
+      }
+    }
+  }
 
   // Slot 1 — DIQ8 (digital, user-facing, address already allocated)
   const slot1 = station.slots.get(1);
@@ -249,7 +322,7 @@ function renderCfuPa(station, templateMap, ioNo, diag) {
       version: '',
       name: slot1 ? slot1.name : 'DIQ8 DC24V/0.5A',
       redundant: false,
-      addressLines: buildAddressLines(slot1Tpl, slot1),
+      addressLines: buildAddressLines(slot1Tpl, slot1, warnings, { addr, slot: 1, order: slot1.orderNo }),
       paramLines: slot1Tpl ? buildParamLines(slot1Tpl, null) : null,
     }));
   }
@@ -349,21 +422,24 @@ function renderCfuPa(station, templateMap, ioNo, diag) {
           inputAddr:  ssInAddr,
           outputAddr: ssOutAddr,
           channels:   ch ? [ch] : [],
-        });
+        }, warnings, { addr, slot: slotNo, order: slot.orderNo });
       } else if (ssInAddr != null) {
-        // GSD-path fallback: construct ADDRESS line directly
+        // GSD-path fallback: construct ADDRESS line directly. Identifiers come from
+        // the card catalogue when a template exists, else the PA defaults (I / Q).
+        const ch = channelsBySubslot.get(fi);
+        const inIdent = resolveIdentifier(tpl, 'in', !!(ch && ch.tag), warnings, { addr, slot: slotNo, order: slot.orderNo });
         ssAddressLines = [
           'LOCAL_IN_ADDRESSES',
           `  ADDRESS  ${ssInAddr}, 0, ${perSubslotBytes}, 0, ${pipNo}, 0`,
         ];
-        const ch = channelsBySubslot.get(fi);
         if (ch && ch.tag) {
-          ssAddressLines.push(`SYMBOL  I , 0, "${ch.tag}", "${ch.desc || ''}"`);
+          ssAddressLines.push(`SYMBOL  ${inIdent} , 0, "${ch.tag}", "${ch.desc || ''}"`);
         }
         if (perSubslotOutBytes > 0 && ssOutAddr != null) {
+          const outIdent = resolveIdentifier(tpl, 'out', !!(ch && ch.tag), warnings, { addr, slot: slotNo, order: slot.orderNo });
           ssAddressLines.push('LOCAL_OUT_ADDRESSES', `  ADDRESS  ${ssOutAddr}, 0, ${perSubslotOutBytes}, 0, ${pipNo}, 0`);
           if (ch && ch.tag) {
-            ssAddressLines.push(`SYMBOL  Q , 0, "${ch.tag}", "${ch.desc || ''}"`);
+            ssAddressLines.push(`SYMBOL  ${outIdent} , 0, "${ch.tag}", "${ch.desc || ''}"`);
           }
         }
       } else {
@@ -440,15 +516,20 @@ function renderScalance(station, templateMap, ioNo, diag) {
 /**
  * Render a station. ET200SP gets full PCS7 fidelity; CFU_PA gets its own renderer;
  * Scalance gets its GSDML-based renderer; others fall back to a minimal block.
+ *
+ * @param db - Database instance (for loading auto-slot configs)
  */
-function renderStation(station, templateMap, ioNo, diag) {
+function renderStation(station, templateMap, ioNo, diag, warnings, db) {
   const headSlot = station.slots.get(0) ||
     station.slots.get([...station.slots.keys()].sort((a, b) => a - b)[0]);
   const headTpl  = headSlot ? findTemplate(templateMap, headSlot.orderNo) : null;
   const family   = headTpl ? headTpl.family : 'ET200SP';
 
+  // Load auto-slot config from database
+  const autoSlotConfig = db ? loadFamilyAutoSlotConfig(db, family) : null;
+
   if (family === 'CFU_PA') {
-    return renderCfuPa(station, templateMap, ioNo, diag);
+    return renderCfuPa(station, templateMap, ioNo, diag, warnings, autoSlotConfig);
   }
 
   if (family === 'Scalance') {
@@ -456,7 +537,7 @@ function renderStation(station, templateMap, ioNo, diag) {
   }
 
   if (family === 'ET200SP') {
-    return renderEt200sp(station, templateMap, ioNo, diag);
+    return renderEt200sp(station, templateMap, ioNo, diag, warnings, autoSlotConfig);
   }
 
   // Generic fallback (non-ET200SP). Minimal but structurally valid.
@@ -479,7 +560,7 @@ function renderStation(station, templateMap, ioNo, diag) {
       version: tpl && tpl.version ? tpl.version : '',
       name: slot.name,
       redundant: false,
-      addressLines: buildAddressLines(tpl, slot),
+      addressLines: buildAddressLines(tpl, slot, warnings, { addr, slot: slotNo, order: slot.orderNo }),
       paramLines: buildParamLines(tpl),
     }));
   }
@@ -492,8 +573,9 @@ function renderStation(station, templateMap, ioNo, diag) {
  * @param {object} parsedBaseline - From cfgParser.parseCfg()
  * @param {Map}    stations       - From hwAddressEngine.allocateAddresses()
  * @param {Map}    templateMap    - Map<orderNo, templateRow>
+ * @param {object} db             - Database instance (for loading auto-slot configs)
  */
-function generateCfg(parsedBaseline, stations, templateMap) {
+function generateCfg(parsedBaseline, stations, templateMap, db) {
   const parts = [];
   const defaultIoNo = parsedBaseline.ioSubsystemNo;
 
@@ -563,6 +645,7 @@ function generateCfg(parsedBaseline, stations, templateMap) {
   const COLS = 15, STEP_X = 90, STEP_Y = 150;
 
   const diag = { ptr: (parsedBaseline.minDiag || 16384) - 1 };
+  const warnings = [];   // missing-identifier diagnostics collected during render
   const sortedAddrs = [...stations.keys()].sort((a, b) => a - b);
   sortedAddrs.forEach((addr, idx) => {
     const col = idx % COLS;
@@ -573,7 +656,7 @@ function generateCfg(parsedBaseline, stations, templateMap) {
   for (const addr of sortedAddrs) {
     const station = stations.get(addr);
     const ioNo = station.subsystemNo != null ? station.subsystemNo : defaultIoNo;
-    parts.push(renderStation(station, templateMap, ioNo, diag));
+    parts.push(renderStation(station, templateMap, ioNo, diag, warnings, db));
     parts.push('');
   }
 
@@ -581,7 +664,8 @@ function generateCfg(parsedBaseline, stations, templateMap) {
   // "END " (trailing space preserved) followed by one blank line. Strip any trailing
   // blank lines we accumulated, re-add the single blank, then convert LF → CRLF.
   const body = parts.join('\n').replace(/[\r\n]+$/, '');
-  return (body + '\n\n').replace(/\r?\n/g, '\r\n');
+  const cfg = (body + '\n\n').replace(/\r?\n/g, '\r\n');
+  return { cfg, warnings };
 }
 
 module.exports = { generateCfg, ipToHex, hexToIp };
