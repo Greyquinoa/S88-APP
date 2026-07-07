@@ -9,6 +9,7 @@ const { allocateAddresses, findTemplate, defaultIdentifiers } = require('../serv
 const { generateCfg, hexToIp } = require('../services/cfgGenerator');
 const { parseCfgForCatalogue } = require('../services/cfgCatalogueParser');
 const { parseMrpConfig } = require('../services/mrpCfgParser');
+const { loadStationAutoSlotConfig } = require('../services/autoSlotResolver');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
@@ -63,6 +64,7 @@ router.post('/module-templates', (req, res) => {
   try {
     const db = getDb();
     const {
+      id,
       order_no, display_name, family, signal_type, channel_count = 0,
       input_bytes = 0, output_bytes = 0, in_addr_fmt, out_addr_fmt,
       param_template, version, gsdml_file, dap_id, hw_category, subslot_defaults, port_config,
@@ -76,18 +78,29 @@ router.post('/module-templates', (req, res) => {
     const inIdent  = in_identifier  !== undefined ? (in_identifier  || null) : def.in;
     const outIdent = out_identifier !== undefined ? (out_identifier || null) : def.out;
 
-    const existing = db.prepare('SELECT id FROM hw_module_templates WHERE order_no=?').get(order_no);
+    // Prefer matching by primary-key id when provided (editing a specific row).
+    // The same order_no + hw_category can appear on multiple rows (e.g. Port 1 & Port 2
+    // are both subslots with the same GSDML path), so order_no is NOT a safe update key.
+    // Fall back to (order_no, hw_category) only when no id is given (fresh upsert from import).
+    let existing = null;
+    if (id != null) {
+      existing = db.prepare('SELECT id FROM hw_module_templates WHERE id=?').get(id);
+    } else {
+      existing = db.prepare(
+        'SELECT id FROM hw_module_templates WHERE order_no=? AND (hw_category IS ? OR hw_category=?)'
+      ).get(order_no, hw_category || null, hw_category || null);
+    }
     if (existing) {
       db.prepare(`UPDATE hw_module_templates SET
-        display_name=?, family=?, signal_type=?, channel_count=?,
+        order_no=?, display_name=?, family=?, signal_type=?, channel_count=?,
         input_bytes=?, output_bytes=?, in_addr_fmt=?, out_addr_fmt=?,
         param_template=?, version=?, gsdml_file=?, dap_id=?, hw_category=?, subslot_defaults=?, port_config=?,
         in_identifier=?, out_identifier=?
-        WHERE order_no=?`).run(
-        display_name, family, signal_type, channel_count,
+        WHERE id=?`).run(
+        order_no, display_name, family, signal_type, channel_count,
         input_bytes, output_bytes, in_addr_fmt, out_addr_fmt,
         param_template, version, gsdml_file, dap_id, hw_category || null, subslot_defaults || null, port_config || null,
-        inIdent, outIdent, order_no
+        inIdent, outIdent, existing.id
       );
       res.json({ id: existing.id, updated: true });
     } else {
@@ -312,20 +325,24 @@ router.post('/module-templates/bulk-upsert', (req, res) => {
     const insSql = db.prepare(`INSERT INTO hw_module_templates
       (order_no, display_name, family, signal_type, channel_count, input_bytes, output_bytes,
        in_addr_fmt, out_addr_fmt, param_template, version, gsdml_file, dap_id, hw_category, subslot_defaults, port_config,
-       in_identifier, out_identifier)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+       in_identifier, out_identifier, mlfb)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
 
     const updSql = db.prepare(`UPDATE hw_module_templates SET
       display_name=?, family=?, signal_type=?, channel_count=?,
       input_bytes=?, output_bytes=?, in_addr_fmt=?, out_addr_fmt=?,
       param_template=?, version=?, gsdml_file=?, dap_id=?, hw_category=?, subslot_defaults=?, port_config=?,
-      in_identifier=?, out_identifier=?
-      WHERE order_no=?`);
+      in_identifier=?, out_identifier=?, mlfb=?
+      WHERE order_no=? AND (hw_category IS ? OR hw_category=?)`);
 
     const upsert = db.transaction((devices) => {
       for (const d of devices) {
         if (d.action === 'skip') { skipped++; continue; }
-        const existing = db.prepare('SELECT id FROM hw_module_templates WHERE order_no=?').get(d.order_no);
+        // Existence check must match the UNIQUE (order_no, hw_category) constraint.
+        // The same order_no can exist as station, slot, and subslot — each is a distinct row.
+        const existing = db.prepare(
+          'SELECT id FROM hw_module_templates WHERE order_no=? AND (hw_category IS ? OR hw_category=?)'
+        ).get(d.order_no, d.hw_category || null, d.hw_category || null);
         if (existing && d.action !== 'overwrite') { skipped++; continue; }
 
         // Identifiers: explicit value wins; otherwise default from signal type (so
@@ -339,11 +356,12 @@ router.post('/module-templates/bulk-upsert', (req, res) => {
           d.input_bytes || 0, d.output_bytes || 0, d.in_addr_fmt || null, d.out_addr_fmt || null,
           d.param_template || null, d.version || null, d.gsdml_file || null, d.dap_id || null,
           d.hw_category || null, d.subslot_defaults || null, d.port_config || null,
-          inIdent, outIdent,
+          inIdent, outIdent, d.mlfb || null,
         ];
 
         if (existing) {
-          updSql.run(...vals, d.order_no);
+          // Update by unique (order_no, hw_category) pair, not order_no alone
+          updSql.run(...vals, d.order_no, d.hw_category || null, d.hw_category || null);
           overwritten++;
         } else {
           insSql.run(d.order_no, ...vals);
@@ -1645,10 +1663,10 @@ router.post('/imports/:id/stations', (req, res) => {
     const stationName = name || `Station_${addr}`;
     const subsysNo    = subsystemNo ?? 100;
 
-    // Look up the IM template to detect family-specific auto-slots
-    const imTpl = db.prepare('SELECT family FROM hw_module_templates WHERE order_no=?').get(imOrderNo);
-    const isCfuPa   = imTpl && imTpl.family === 'CFU_PA';
-    const isScalance = imTpl && imTpl.family === 'Scalance';
+    // Load the auto-slot configuration for this station (keyed by IM order_no).
+    // This is completely generic — whatever slots are defined in the config get created,
+    // regardless of hardware family (ET200, CFU, Scalance, Festo, etc.)
+    const autoSlotConfig = loadStationAutoSlotConfig(db, imOrderNo);
 
     const insSignal = db.prepare(`INSERT INTO hw_signals
       (hw_import_id, station_address, station_name, ip_address, slot, module_order_no, module_name, subsystem_no)
@@ -1658,16 +1676,20 @@ router.post('/imports/:id/stations', (req, res) => {
       // Slot 0 = station head — always inserted (holds IP, name, subsystem)
       insSignal.run(importId, addr, stationName, ip || null, 0, imOrderNo, imName || imOrderNo, subsysNo);
 
-      if (isCfuPa) {
-        // Slot 1 — DIQ8 (always present on CFU_PA)
-        insSignal.run(importId, addr, stationName, ip || null, 1,
-          '_S7H_HSP_CFU_PA_V2_0_DI8_DQ8_CT', 'DIQ8 DC24V/0.5A', subsysNo);
-        // Slot 2 — PA Master (always present on CFU_PA, AUTOCREATED)
-        insSignal.run(importId, addr, stationName, ip || null, 2,
-          '_S7H_HSP_CFU_PA_V2_0_PA_MASTER_CT', 'PROFIBUS PA Master', subsysNo);
+      // Create all additional slots (slot ≥ 1) from the auto-slot config.
+      // Slot 0's subslots (ports/interface) are AUTOCREATED at generation time from
+      // the config/port_config — they are not stored as separate hw_signals rows.
+      if (autoSlotConfig && Array.isArray(autoSlotConfig.slots)) {
+        for (const slotCfg of autoSlotConfig.slots) {
+          if (slotCfg.slot == null || slotCfg.slot === 0) continue; // skip head; already inserted
+          if (!slotCfg.order_no) continue; // no module defined for this slot
+          insSignal.run(
+            importId, addr, stationName, ip || null,
+            slotCfg.slot, slotCfg.order_no,
+            slotCfg.label || slotCfg.order_no, subsysNo
+          );
+        }
       }
-      // Scalance: only slot 0 (the device head). Ports are AUTOCREATED subslots under slot 0,
-      // derived from port_config on the template at generation time — no separate hw_signals rows.
     });
     insertStation();
 
@@ -2144,140 +2166,203 @@ router.delete('/slot-compat', (req, res) => {
 
 // ── Station Auto-Slot Configuration ───────────────────────────────────────────
 
-// GET /station-auto-slots — List all families + their auto-slot configs
+// Infer each slot/subslot's `type` from the catalogue + structural position, so the
+// UI never has to expose a "type" field. The generator relies on subslot.type==='port'
+// to emit PORT blocks; everything else is descriptive.
+function inferAutoSlotTypes(db, config) {
+  if (!config || !Array.isArray(config.slots)) return config;
+
+  const tplRows = db.prepare('SELECT order_no, hw_category, signal_type, display_name FROM hw_module_templates').all();
+  const tplMap  = new Map(tplRows.map(t => [t.order_no, t]));
+
+  // A subslot is a network port if the catalogue marks it INFRA/port-ish, its order_no
+  // matches a known PN port MLFB, or it already carries a port_label.
+  const isPort = (ss) => {
+    const tpl = tplMap.get(ss.order_no);
+    const on  = (ss.order_no || '').toUpperCase();
+    if (ss.port_label) return true;
+    if (/6AR00|193-6AR|PORT/.test(on)) return true;
+    if (tpl && /port/i.test(tpl.display_name || '')) return true;
+    return false;
+  };
+
+  for (const slot of config.slots) {
+    const slotTpl = tplMap.get(slot.order_no);
+    slot.type = slotTpl?.hw_category === 'station' ? 'interface' : (slotTpl?.hw_category || slot.type || '');
+    if (Array.isArray(slot.subslots)) {
+      for (const ss of slot.subslots) {
+        ss.type = isPort(ss) ? 'port' : (tplMap.get(ss.order_no)?.hw_category || ss.type || 'submodule');
+      }
+    }
+  }
+  return config;
+}
+
+// GET /station-auto-slots — List all stations + their auto-slot configs (by order_no)
 router.get('/station-auto-slots', (req, res) => {
   try {
     const db = getDb();
     const rows = db.prepare(
-      'SELECT family, auto_slots_config, created_at, updated_at FROM hw_station_auto_slots ORDER BY family'
+      'SELECT order_no, auto_slots_config, created_at, updated_at FROM hw_station_auto_slots ORDER BY order_no'
     ).all();
 
-    const families = rows.map(r => ({
-      family: r.family,
+    const stations = rows.map(r => ({
+      order_no: r.order_no,
       config: JSON.parse(r.auto_slots_config),
       created_at: r.created_at,
       updated_at: r.updated_at
     }));
 
-    res.json(families);
+    res.json(stations);
   } catch (e) { err(res, 500, e.message); }
 });
 
-// GET /station-auto-slots/:family — Get config for a specific family
-router.get('/station-auto-slots/:family', (req, res) => {
+// GET /station-auto-slots/:orderNo — Get config for a specific station (by order_no)
+// If config doesn't exist, return an empty template with default rules instead of 404.
+// This allows users to create configurations for new station order numbers.
+router.get('/station-auto-slots/:orderNo', (req, res) => {
   try {
     const db = getDb();
-    const family = (req.params.family || '').trim();
-    if (!family) return err(res, 400, 'family parameter required');
+    const orderNo = (req.params.orderNo || '').trim();
+    if (!orderNo) return err(res, 400, 'orderNo parameter required');
 
     const row = db.prepare(
-      'SELECT family, auto_slots_config, created_at, updated_at FROM hw_station_auto_slots WHERE family=?'
-    ).get(family);
+      'SELECT order_no, auto_slots_config, created_at, updated_at FROM hw_station_auto_slots WHERE order_no=?'
+    ).get(orderNo);
 
+    // If no existing config, return an empty template with default rules
+    // Default rules: ET200* enables server module, CFU_PA disables it
     if (!row) {
-      return err(res, 404, `No auto-slot config found for family "${family}"`);
+      const defaultRules = {};
+      if (/^6ES7 1[3589]\d-6/.test(orderNo) || /ET200SP/.test(orderNo)) {
+        // ET200SP family — enable server module by default
+        defaultRules.server_module_enabled = true;
+      } else if (/^V.*:6ES7 655-5PX11|CFU_PA/.test(orderNo)) {
+        // CFU_PA family — disable server module
+        defaultRules.server_module_enabled = false;
+      }
+      return res.json({
+        order_no: orderNo,
+        config: { slots: [], rules: defaultRules },
+        created_at: null,
+        updated_at: null,
+        isNew: true
+      });
     }
 
     res.json({
-      family: row.family,
+      order_no: row.order_no,
       config: JSON.parse(row.auto_slots_config),
       created_at: row.created_at,
-      updated_at: row.updated_at
+      updated_at: row.updated_at,
+      isNew: false
     });
   } catch (e) { err(res, 500, e.message); }
 });
 
-// POST /station-auto-slots — Create or update auto-slot config for a family
-// Body: { family, auto_slots_config: {...} }
+// POST /station-auto-slots — Create or update auto-slot config for a station
+// Body: { order_no, config: {...} }
 router.post('/station-auto-slots', (req, res) => {
   try {
     const db = getDb();
-    const { family, auto_slots_config } = req.body;
+    const { order_no, config } = req.body;
 
-    if (!family || !family.trim()) {
-      return err(res, 400, 'family is required');
+    if (!order_no || !order_no.trim()) {
+      return err(res, 400, 'order_no is required');
     }
 
-    if (!auto_slots_config || typeof auto_slots_config !== 'object') {
-      return err(res, 400, 'auto_slots_config must be a valid JSON object');
+    if (!config || typeof config !== 'object') {
+      return err(res, 400, 'config must be a valid JSON object');
     }
+
+    // Infer slot/subslot types from the catalogue so the UI never needs a type field
+    inferAutoSlotTypes(db, config);
 
     // Validate JSON-serializability
     let configJson;
     try {
-      configJson = JSON.stringify(auto_slots_config);
+      configJson = JSON.stringify(config);
     } catch (e) {
-      return err(res, 400, `Invalid auto_slots_config JSON: ${e.message}`);
+      return err(res, 400, `Invalid config JSON: ${e.message}`);
     }
 
-    const existing = db.prepare('SELECT id FROM hw_station_auto_slots WHERE family=?').get(family.trim());
+    const existing = db.prepare('SELECT id FROM hw_station_auto_slots WHERE order_no=?').get(order_no.trim());
 
     if (existing) {
       db.prepare(
-        'UPDATE hw_station_auto_slots SET auto_slots_config=?, updated_at=datetime("now") WHERE family=?'
-      ).run(configJson, family.trim());
-      return res.json({ ok: true, action: 'updated', family: family.trim() });
+        'UPDATE hw_station_auto_slots SET auto_slots_config=?, updated_at=datetime("now") WHERE order_no=?'
+      ).run(configJson, order_no.trim());
+      return res.json({ ok: true, action: 'updated', order_no: order_no.trim() });
     } else {
       const r = db.prepare(
-        'INSERT INTO hw_station_auto_slots (family, auto_slots_config) VALUES (?, ?)'
-      ).run(family.trim(), configJson);
-      return res.status(201).json({ ok: true, action: 'created', family: family.trim(), id: r.lastInsertRowid });
+        'INSERT INTO hw_station_auto_slots (order_no, auto_slots_config) VALUES (?, ?)'
+      ).run(order_no.trim(), configJson);
+      return res.status(201).json({ ok: true, action: 'created', order_no: order_no.trim(), id: r.lastInsertRowid });
     }
   } catch (e) { err(res, 500, e.message); }
 });
 
-// PUT /station-auto-slots/:family — Update auto-slot config (full replace)
-// Body: auto_slots_config JSON object
-router.put('/station-auto-slots/:family', (req, res) => {
+// PUT /station-auto-slots/:orderNo — Update auto-slot config (full replace)
+// If config doesn't exist, creates a new one. This allows users to save
+// configurations for any station order_no, not just pre-seeded ones.
+// Body: config JSON object
+router.put('/station-auto-slots/:orderNo', (req, res) => {
   try {
     const db = getDb();
-    const family = (req.params.family || '').trim();
-    const auto_slots_config = req.body;
+    const orderNo = (req.params.orderNo || '').trim();
+    const config = req.body;
 
-    if (!family) return err(res, 400, 'family parameter required');
-    if (!auto_slots_config || typeof auto_slots_config !== 'object') {
+    if (!orderNo) return err(res, 400, 'orderNo parameter required');
+    if (!config || typeof config !== 'object') {
       return err(res, 400, 'Request body must be a valid JSON object');
     }
+
+    // Infer slot/subslot types from the catalogue so the UI never needs a type field
+    inferAutoSlotTypes(db, config);
 
     // Validate JSON-serializability
     let configJson;
     try {
-      configJson = JSON.stringify(auto_slots_config);
+      configJson = JSON.stringify(config);
     } catch (e) {
       return err(res, 400, `Invalid JSON: ${e.message}`);
     }
 
-    const existing = db.prepare('SELECT id FROM hw_station_auto_slots WHERE family=?').get(family);
+    const existing = db.prepare('SELECT id FROM hw_station_auto_slots WHERE order_no=?').get(orderNo);
 
-    if (!existing) {
-      return err(res, 404, `No auto-slot config found for family "${family}"`);
+    if (existing) {
+      // Update existing config
+      db.prepare(
+        'UPDATE hw_station_auto_slots SET auto_slots_config=?, updated_at=datetime("now") WHERE order_no=?'
+      ).run(configJson, orderNo);
+      res.json({ ok: true, action: 'updated', order_no: orderNo });
+    } else {
+      // Create new config if it doesn't exist
+      const r = db.prepare(
+        'INSERT INTO hw_station_auto_slots (order_no, auto_slots_config) VALUES (?, ?)'
+      ).run(orderNo, configJson);
+      res.status(201).json({ ok: true, action: 'created', order_no: orderNo, id: r.lastInsertRowid });
     }
-
-    db.prepare(
-      'UPDATE hw_station_auto_slots SET auto_slots_config=?, updated_at=datetime("now") WHERE family=?'
-    ).run(configJson, family);
-
-    res.json({ ok: true, action: 'updated', family });
   } catch (e) { err(res, 500, e.message); }
 });
 
-// DELETE /station-auto-slots/:family — Delete auto-slot config for a family
-router.delete('/station-auto-slots/:family', (req, res) => {
+// DELETE /station-auto-slots/:orderNo — Delete auto-slot config for a station
+router.delete('/station-auto-slots/:orderNo', (req, res) => {
   try {
     const db = getDb();
-    const family = (req.params.family || '').trim();
+    const orderNo = (req.params.orderNo || '').trim();
 
-    if (!family) return err(res, 400, 'family parameter required');
+    if (!orderNo) return err(res, 400, 'orderNo parameter required');
 
-    const existing = db.prepare('SELECT id FROM hw_station_auto_slots WHERE family=?').get(family);
+    const existing = db.prepare('SELECT id FROM hw_station_auto_slots WHERE order_no=?').get(orderNo);
 
     if (!existing) {
-      return err(res, 404, `No auto-slot config found for family "${family}"`);
+      return err(res, 404, `No auto-slot config found for station order_no "${orderNo}"`);
     }
 
-    db.prepare('DELETE FROM hw_station_auto_slots WHERE family=?').run(family);
+    db.prepare('DELETE FROM hw_station_auto_slots WHERE order_no=?').run(orderNo);
 
-    res.json({ ok: true, deleted: family });
+    res.json({ ok: true, deleted: orderNo });
   } catch (e) { err(res, 500, e.message); }
 });
 

@@ -27,6 +27,7 @@ import StepController from "./StepController.jsx";
 import HwConfigGrid from "./HwConfigGrid.tsx";
 import CatalogueGrid from "./CatalogueGrid.jsx";
 import SymbolTableModal from "./SymbolTableModal.jsx";
+import StationAutoSlotsEditor from "./StationAutoSlotsEditor.jsx";
 
 
 export default function StepHWConfig({ projectId }) {
@@ -618,10 +619,6 @@ export default function StepHWConfig({ projectId }) {
           />
         )}
 
-        {/* Protocol Mapping (Tier 2 Hardware Resolution) */}
-        {hwTab === "protocolMapping" && (
-          <ProtocolMappingPanel templates={templates} setError={setError} />
-        )}
 
         {/* Controller — sub-tabs when a controller is selected */}
         {(hwTab === "controller" || hwTab === "config" || hwTab === "mrp") && (
@@ -1824,9 +1821,8 @@ function NavPanel({ hwTab, setHwTab, controllers, selectedId, onSelect }) {
 
       {/* Global actions */}
       <div style={{ paddingBottom: 8, borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
-        {navBtn("import", "⬆ Import")}
-        {navBtn("catalogue", "📋 Catalogue")}
-        {navBtn("protocolMapping", "🔗 Protocol Mapping")}
+        {navBtn("import", "Import")}
+        {navBtn("catalogue", "Catalogue")}
       </div>
 
       {/* Controllers section */}
@@ -2084,13 +2080,14 @@ function CategoryBadge({ category }) {
 const SIG_TYPES = ['DI', 'DO', 'AI', 'AO', 'PA', 'INFRA', 'MIXED'];
 
 // ── Protocol Mapping Panel (Tier 2 Hardware Resolution admin UI) ─────────────
-function ProtocolMappingPanel({ templates, setError }) {
+function HwImportMappingPanel({ templates }) {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState("");
   const [showAdd, setShowAdd] = useState(false);
   const [editRow, setEditRow] = useState(null); // row being edited, or null
   const [deleteTarget, setDeleteTarget] = useState(null);
+  const [error, setError] = useState("");
   const csvInputRef = useRef();
 
   function reload() {
@@ -2144,10 +2141,12 @@ function ProtocolMappingPanel({ templates, setError }) {
 
   return (
     <div>
+      {error && <div style={{ ...alertStyle("#ffeaea", "#e88", "#b00"), marginBottom: 16 }}>{error}</div>}
+
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
         <div>
-          <h3 style={{ margin: 0, fontSize: 15, fontWeight: 700 }}>Protocol Mapping — Tier 2 Hardware Resolution</h3>
-          <p style={{ margin: "4px 0 0 0", fontSize: 12, color: "var(--color-text-secondary)" }}>
+          <h4 style={{ margin: 0, fontSize: 14, fontWeight: 600 }}>Tier 2 Hardware Resolution</h4>
+          <p style={{ margin: "4px 0 0 0", fontSize: 12, color: "#666" }}>
             Maps Protocol + Signal Type combinations to a Card MLFB. Used during Excel import when the
             "Card MLFB" column is not mapped — the parser derives the card (and station) from these entries instead.
           </p>
@@ -2155,7 +2154,7 @@ function ProtocolMappingPanel({ templates, setError }) {
         <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
           <input type="file" accept=".csv" ref={csvInputRef} style={{ display: "none" }}
             onChange={e => { if (e.target.files[0]) handleCsvImport(e.target.files[0]); e.target.value = ""; }} />
-          <button onClick={() => csvInputRef.current?.click()} style={btnSecondary}>⬆ Import CSV</button>
+          <button onClick={() => csvInputRef.current?.click()} style={btnSecondary}>Import CSV</button>
           <a href={exportHwHardwareResolutionUrl()} style={{ ...btnSecondary, textDecoration: "none", display: "inline-flex", alignItems: "center" }}>⬇ Export CSV</a>
           <button onClick={() => setShowAdd(true)} style={btnPrimary}>+ Add Mapping</button>
         </div>
@@ -2358,6 +2357,8 @@ function ProtocolMappingDeleteConfirm({ title, message, onCancel, onConfirm }) {
 
 function CataloguePanel({ templates, slotCompat, sigTypes, onTemplatesChanged, onPatchTemplate, onAddSigType, onAddCompat, onRemoveCompat, onDeleteTemplate }) {
   const [showImport, setShowImport] = useState(false);
+  const [catalogueTab, setCatalogueTab] = useState("modules"); // "modules" or "hwImportMapping"
+  const [autoSlotConfigOrderNo, setAutoSlotConfigOrderNo] = useState(null); // order_no for auto-slot modal
   const cfgImportRef = useRef();
 
   // All known signal types come from the DB (sigTypes prop).
@@ -2366,30 +2367,65 @@ function CataloguePanel({ templates, slotCompat, sigTypes, onTemplatesChanged, o
 
   return (
     <div>
-      {/* Hidden .cfg file input, triggered from the grid toolbar's Import button */}
-      <input type="file" accept=".cfg" ref={cfgImportRef} style={{ display: "none" }}
-        onChange={e => { if (e.target.files[0]) setShowImport(e.target.files[0]); e.target.value = ""; }} />
+      {/* Tab bar */}
+      <div style={{ display: "flex", gap: 4, marginBottom: 20, borderBottom: "2px solid #dde" }}>
+        {[["modules", "Modules"], ["hwImportMapping", "HW Import Mapping"]].map(([id, label]) => (
+          <button key={id} onClick={() => setCatalogueTab(id)}
+            style={{
+              padding: "7px 18px", border: "none", background: "none", cursor: "pointer",
+              fontWeight: catalogueTab === id ? 700 : 400, fontSize: 14,
+              color: catalogueTab === id ? "#2255cc" : "#555",
+              borderBottom: catalogueTab === id ? "2px solid #2255cc" : "2px solid transparent",
+              marginBottom: -2,
+            }}
+          >{label}</button>
+        ))}
+      </div>
 
-      <CatalogueGrid
-        templates={templates}
-        slotCompat={slotCompat}
-        sigTypes={sigTypes}
-        onPatchTemplate={onPatchTemplate}
-        onAddSigType={onAddSigType}
-        onAddCompat={onAddCompat}
-        onRemoveCompat={onRemoveCompat}
-        onDeleteTemplate={onDeleteTemplate}
-        onImportClick={() => cfgImportRef.current?.click()}
-      />
+      {/* Modules Tab */}
+      {catalogueTab === "modules" && (
+        <>
+          {/* Hidden .cfg file input, triggered from the grid toolbar's Import button */}
+          <input type="file" accept=".cfg" ref={cfgImportRef} style={{ display: "none" }}
+            onChange={e => { if (e.target.files[0]) setShowImport(e.target.files[0]); e.target.value = ""; }} />
 
-      {/* Import modal */}
-      {showImport && (
-        <CfgImportModal
-          file={showImport}
-          sigTypes={allSigTypes}
-          onClose={() => setShowImport(false)}
-          onDone={() => { setShowImport(false); onTemplatesChanged?.(); }}
-        />
+          <CatalogueGrid
+            templates={templates}
+            slotCompat={slotCompat}
+            sigTypes={sigTypes}
+            onPatchTemplate={onPatchTemplate}
+            onAddSigType={onAddSigType}
+            onAddCompat={onAddCompat}
+            onRemoveCompat={onRemoveCompat}
+            onDeleteTemplate={onDeleteTemplate}
+            onAutoSlotConfig={(template) => setAutoSlotConfigOrderNo(template.order_no)}
+            onImportClick={() => cfgImportRef.current?.click()}
+          />
+
+          {/* ── Auto-Slot Config Modal ── */}
+          {autoSlotConfigOrderNo != null && (
+            <StationAutoSlotsEditor
+              station={{ orderNo: autoSlotConfigOrderNo }}
+              catalogue={templates}
+              onClose={() => setAutoSlotConfigOrderNo(null)}
+            />
+          )}
+
+          {/* Import modal */}
+          {showImport && (
+            <CfgImportModal
+              file={showImport}
+              sigTypes={allSigTypes}
+              onClose={() => setShowImport(false)}
+              onDone={() => { setShowImport(false); onTemplatesChanged?.(); }}
+            />
+          )}
+        </>
+      )}
+
+      {/* HW Import Mapping Tab */}
+      {catalogueTab === "hwImportMapping" && (
+        <HwImportMappingPanel templates={templates} />
       )}
     </div>
   );
@@ -2489,6 +2525,7 @@ function CfgImportModal({ file, sigTypes, onClose, onDone }) {
         hw_category: c.hw_category || null,
         subslot_defaults: c.subslot_defaults || null,
         port_config: c.port_config || null,
+        mlfb: c.mlfb || null,
         action: deriveAction(c),
       });
 
@@ -2642,10 +2679,11 @@ function CfgImportModal({ file, sigTypes, onClose, onDone }) {
           )}
           {stage === "done" && <div style={{ flex: 1 }} />}
           {(stage === "preview" || stage === "done") && (
-            <button onClick={onClose}
-              style={{ padding: "7px 16px", fontSize: 13, border: "1px solid #ccd",
-                       borderRadius: 6, background: "#fff", cursor: "pointer" }}>
-              {stage === "done" ? "Close" : "Cancel"}
+            <button onClick={() => stage === "done" ? onDone() : onClose()}
+              style={{ padding: "7px 16px", fontSize: 13, border: stage === "done" ? "none" : "1px solid #ccd",
+                       borderRadius: 6, background: stage === "done" ? "#2255cc" : "#fff",
+                       color: stage === "done" ? "#fff" : "#333", cursor: "pointer" }}>
+              {stage === "done" ? "Done" : "Cancel"}
             </button>
           )}
           {stage === "preview" && candidates.length > 0 && (willAdd + willOverwrite) > 0 && (
@@ -2660,7 +2698,7 @@ function CfgImportModal({ file, sigTypes, onClose, onDone }) {
             <button onClick={onDone}
               style={{ padding: "7px 18px", fontSize: 13, fontWeight: 600,
                        background: "#2255cc", color: "#fff", border: "none",
-                       borderRadius: 6, cursor: "pointer" }}>
+                       borderRadius: 6, cursor: "pointer", display: "none" }}>
               Done
             </button>
           )}
@@ -3447,6 +3485,7 @@ function ConfigurationPanel({
           onClose={() => setConfigureAddr(null)}
         />
       )}
+
     </div>
   );
 }
@@ -3459,8 +3498,20 @@ function StationDetailPanel({
   onDeleteSlot, onSaveSlotPip, onSaveSlotPotentialGroup, onSaveSlotPaProfile, onSaveSlotSubslotProfile,
   isEditing, onStartEdit, onChangeEdit, onCommitEdit, onCancelEdit,
 }) {
+  const [autoSlotConfig, setAutoSlotConfig] = React.useState(null);
   const addSlotRow = addingSlot === station.address;
   const allRows    = station.slots.length > 0 ? station.slots : [null];
+
+  // Load auto-slot config for this station if it exists (for ET200SP port display)
+  React.useEffect(() => {
+    const imSlot = station.slots.find(s => s.slot === 0);
+    if (imSlot && imSlot.orderNo) {
+      fetch(`/api/hw-config/station-auto-slots/${encodeURIComponent(imSlot.orderNo)}`)
+        .then(r => r.json())
+        .then(data => setAutoSlotConfig(data.config))
+        .catch(() => setAutoSlotConfig(null));
+    }
+  }, [station]);
 
   // Determine station family by looking up the IM (slot 0) template.
   const imSlot = station.slots.find(s => s.slot === 0);
@@ -3488,14 +3539,17 @@ function StationDetailPanel({
     try { scalancePorts = JSON.parse(imTpl.port_config); } catch (_) {}
   }
 
-  // Parse port_config for ET200 / CFU stations — stored at catalogue import time.
-  // These are SLOT 0 port subslots (subslot ≥ 2); subslot 1 = PN-IO interface (skip).
+  // Get ports from auto-slot configuration only (no fallbacks to template)
   let imPorts = [];
-  if (!isScalanceStation && imTpl && imTpl.port_config) {
-    try {
-      const parsed = JSON.parse(imTpl.port_config);
-      imPorts = parsed.filter(p => p.subslot >= 2);
-    } catch (_) {}
+  if (autoSlotConfig && autoSlotConfig.slots) {
+    const slot0 = autoSlotConfig.slots.find(s => s.slot === 0);
+    if (slot0 && slot0.subslots && Array.isArray(slot0.subslots)) {
+      imPorts = slot0.subslots.map(ss => ({
+        subslot: ss.subslot,
+        label: ss.port_label || ss.label,
+        orderNo: ss.order_no,
+      }));
+    }
   }
 
   return (
@@ -3551,7 +3605,7 @@ function StationDetailPanel({
           </div>
         </div>
         <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
-          {!addSlotRow && !isScalanceStation && (
+          {!addSlotRow && (
             <button onClick={() => onOpenAddSlot(station.address)}
               style={{ ...btnStyle, fontSize: 12, padding: "4px 12px", color: "#2255cc" }}>
               + Add Slot
@@ -3569,7 +3623,7 @@ function StationDetailPanel({
         </div>
       </div>
 
-      {/* Scalance port list — PCS7-style view (read-only) */}
+      {/* GSDML/Scalance station view — PCS7-style, data-driven from actual station slots + auto-slot config */}
       {isScalanceStation && (
         <div style={{ padding: "12px 16px" }}>
           <table style={{ ...tableStyle, fontSize: 13 }}>
@@ -3581,50 +3635,45 @@ function StationDetailPanel({
               </tr>
             </thead>
             <tbody>
-              {/* Slot 0 — device head (DAP) */}
-              <tr style={{ background: "#dde8ff" }}>
-                <td style={{ ...tdStyle, fontWeight: 700 }}>
-                  {/* Prefer module_name from hw_signals (always set), fall back to template display_name */}
-                  {imSlot ? imSlot.name : (imTpl ? imTpl.display_name : "—")}
-                </td>
-                <td style={{ ...tdStyle, fontFamily: "monospace", fontSize: 11 }}>
-                  {imTpl ? imTpl.order_no : "—"}
-                </td>
-                <td style={{ ...tdStyle, color: "#aaa", textAlign: "center" }}>—</td>
-                <td style={{ ...tdStyle, color: "#aaa", textAlign: "center" }}>—</td>
-                <td style={{ ...tdStyle, color: "#aaa", textAlign: "center" }}>—</td>
-              </tr>
-              {/* Subslots from port_config (PN-IO interface + ports) */}
-              {scalancePorts.map((p, i) => (
-                <tr key={p.subslot} style={{ background: i % 2 === 0 ? "#fff" : "#f7f9fc" }}>
-                  <td style={{ ...tdStyle, paddingLeft: 24 }}>
-                    {p.name}
-                    {p.medium && (
-                      <span style={{
-                        marginLeft: 6, fontSize: 9, padding: "1px 5px", borderRadius: 3,
-                        background: p.medium === 'FO' ? "#fef3c7" : "#e0f2fe",
-                        color: p.medium === 'FO' ? "#92400e" : "#0369a1",
-                        fontWeight: 600, verticalAlign: "middle",
-                      }}>{p.medium}</span>
-                    )}
-                    <span style={{ marginLeft: 6, fontSize: 9, color: "#aaa", background: "#f0f0f0",
-                                   borderRadius: 3, padding: "1px 4px", verticalAlign: "middle" }}>
-                      AUTO
-                    </span>
-                  </td>
-                  <td style={{ ...tdStyle, color: "#aaa", textAlign: "center" }}>—</td>
-                  <td style={{ ...tdStyle, color: "#aaa", textAlign: "center" }}>—</td>
-                  <td style={{ ...tdStyle, color: "#aaa", textAlign: "center" }}>—</td>
-                  <td style={{ ...tdStyle, color: "#aaa", textAlign: "center" }}>—</td>
-                </tr>
-              ))}
-              {scalancePorts.length === 0 && (
-                <tr>
-                  <td colSpan={5} style={{ ...tdStyle, color: "#aaa", fontStyle: "italic" }}>
-                    No port config — re-import template from .cfg to populate ports
-                  </td>
-                </tr>
-              )}
+              {/* Render every slot in the station (from hw_signals), plus slot 0 subslots from the auto-slot config */}
+              {[...station.slots].sort((a, b) => a.slot - b.slot).flatMap((slot) => {
+                const isHead = slot.slot === 0;
+                const rows = [];
+                // Slot main row
+                rows.push(
+                  <tr key={`slot-${slot.slot}`} style={{ background: isHead ? "#dde8ff" : "#eef3fb" }}>
+                    <td style={{ ...tdStyle, fontWeight: isHead ? 700 : 600 }}>
+                      {isHead ? (slot.name || (imTpl ? imTpl.display_name : "—"))
+                              : `Slot ${slot.slot} — ${slot.name || slot.orderNo}`}
+                    </td>
+                    <td style={{ ...tdStyle, fontFamily: "monospace", fontSize: 11 }}>{slot.orderNo || "—"}</td>
+                    <td style={{ ...tdStyle, color: "#aaa", textAlign: "center" }}>—</td>
+                    <td style={{ ...tdStyle, color: "#aaa", textAlign: "center" }}>—</td>
+                    <td style={{ ...tdStyle, color: "#aaa", textAlign: "center" }}>—</td>
+                  </tr>
+                );
+                // Subslots: for slot 0, pull from auto-slot config; for other slots, from config too
+                const cfgSlot = autoSlotConfig && autoSlotConfig.slots
+                  ? autoSlotConfig.slots.find(s => s.slot === slot.slot) : null;
+                if (cfgSlot && Array.isArray(cfgSlot.subslots)) {
+                  for (const ss of cfgSlot.subslots) {
+                    rows.push(
+                      <tr key={`slot-${slot.slot}-ss-${ss.subslot}`} style={{ background: "#fff" }}>
+                        <td style={{ ...tdStyle, paddingLeft: 24 }}>
+                          {ss.port_label || ss.label || `Subslot ${ss.subslot}`}
+                          <span style={{ marginLeft: 6, fontSize: 9, color: "#aaa", background: "#f0f0f0",
+                                         borderRadius: 3, padding: "1px 4px", verticalAlign: "middle" }}>AUTO</span>
+                        </td>
+                        <td style={{ ...tdStyle, fontFamily: "monospace", fontSize: 11 }}>{ss.order_no || "—"}</td>
+                        <td style={{ ...tdStyle, color: "#aaa", textAlign: "center" }}>—</td>
+                        <td style={{ ...tdStyle, color: "#aaa", textAlign: "center" }}>—</td>
+                        <td style={{ ...tdStyle, color: "#aaa", textAlign: "center" }}>—</td>
+                      </tr>
+                    );
+                  }
+                }
+                return rows;
+              })}
             </tbody>
           </table>
         </div>
@@ -3785,8 +3834,8 @@ function StationDetailPanel({
               </tr>
               );
 
-              // Slot 0 (IM module) for ET200/CFU stations: append port sub-rows from baseline CFG
-              if (slot && slot.slot === 0 && !isScalanceStation && imPorts.length > 0) {
+              // Append subslot rows from auto-slot configuration (if any exist for slot 0)
+              if (slot && slot.slot === 0 && imPorts.length > 0) {
                 const portSsTdBase = {
                   ...tdStyle, fontSize: 11, color: "#666",
                   paddingTop: 2, paddingBottom: 2,
@@ -3800,11 +3849,11 @@ function StationDetailPanel({
                     <td style={{ ...portSsTdBase, fontFamily: "monospace" }}>
                       <span style={{ fontSize: 10, padding: "1px 5px", borderRadius: 3,
                                      background: "#dbeafe", color: "#1d4ed8", fontWeight: 600 }}>
-                        PORT
+                        {port.orderNo ? "SUBSLOT" : "—"}
                       </span>
                     </td>
                     <td style={{ ...portSsTdBase }}>
-                      {port.label || `Port ${pi + 1}`}
+                      {port.label || "—"}
                     </td>
                     <td style={{ ...portSsTdBase, color: "#aaa" }}>—</td>
                     <td style={{ ...portSsTdBase, textAlign: "center", color: "#aaa" }}>—</td>
