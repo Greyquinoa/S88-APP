@@ -646,7 +646,7 @@ function ensureSchema() {
   // ── HW Engineering Extension ─────────────────────────────────────────────────
   _db.run(`CREATE TABLE IF NOT EXISTS hw_module_templates (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_no       TEXT NOT NULL UNIQUE,
+    order_no       TEXT NOT NULL,
     display_name   TEXT NOT NULL,
     family         TEXT NOT NULL,
     signal_type    TEXT,
@@ -661,7 +661,8 @@ function ensureSchema() {
     dap_id         TEXT,
     hw_category    TEXT,
     in_identifier  TEXT,
-    out_identifier TEXT
+    out_identifier TEXT,
+    UNIQUE (order_no, hw_category)
   )`);
 
   _db.run(`CREATE TABLE IF NOT EXISTS hw_imports (
@@ -845,6 +846,45 @@ function ensureSchema() {
       )`);
   }
 
+  // Migration: allow order_no to repeat with different hw_category (composite unique constraint)
+  // Check if the old UNIQUE(order_no) constraint exists and recreate the table with the new constraint
+  {
+    const hasOldConstraint = rawGet(
+      `SELECT sql FROM sqlite_master WHERE type='table' AND name='hw_module_templates' AND sql LIKE '%order_no TEXT NOT NULL UNIQUE%'`
+    );
+    if (hasOldConstraint) {
+      // Recreate table with composite UNIQUE(order_no, hw_category) constraint
+      _db.run(`
+        CREATE TABLE hw_module_templates_new (
+          id             INTEGER PRIMARY KEY AUTOINCREMENT,
+          order_no       TEXT NOT NULL,
+          display_name   TEXT NOT NULL,
+          family         TEXT NOT NULL,
+          signal_type    TEXT,
+          channel_count  INTEGER DEFAULT 0,
+          input_bytes    INTEGER DEFAULT 0,
+          output_bytes   INTEGER DEFAULT 0,
+          in_addr_fmt    TEXT,
+          out_addr_fmt   TEXT,
+          param_template TEXT,
+          version        TEXT,
+          gsdml_file     TEXT,
+          dap_id         TEXT,
+          hw_category    TEXT,
+          in_identifier  TEXT,
+          out_identifier TEXT,
+          subslot_defaults TEXT,
+          port_config    TEXT,
+          UNIQUE (order_no, hw_category)
+        )
+      `);
+      _db.run(`INSERT INTO hw_module_templates_new SELECT * FROM hw_module_templates`);
+      _db.run(`DROP TABLE hw_module_templates`);
+      _db.run(`ALTER TABLE hw_module_templates_new RENAME TO hw_module_templates`);
+      console.log('[DB] Migration: Changed hw_module_templates UNIQUE constraint to (order_no, hw_category)');
+    }
+  }
+
   // Migration: add device_name to hw_imports (PROFINET device name for the station head)
   const hwImpCols = rawAll('PRAGMA table_info(hw_imports)').map(c => c.name);
   if (!hwImpCols.includes('baseline_info')) {
@@ -941,6 +981,9 @@ function ensureSchema() {
         null, null, null, 'V1.1', null, null, 'station'],
       ['6ES7 155-6AU00-0CN0', 'ET200SP IM 155-6 PN HF V4.2', 'ET200SP', 'INFRA', 0, 0, 0,
         null, null, null, 'V4.2', null, null, 'station'],
+      // Same module used as Slot 0 within ET200SP stations
+      ['6ES7 155-6AU00-0CN0', 'ET200SP IM 155-6 PN HF V4.2 (Slot 0)', 'ET200SP', 'INFRA', 0, 0, 0,
+        null, null, null, 'V4.2', null, null, 'slot'],
 
       // ── CFU_PA (Common Foundation Unit – PROFIBUS PA) ─────────────────────────
       // Station IM — "V_2_0_PA:6ES7 655-5PX11-0XX0"
