@@ -247,9 +247,12 @@ function renderEt200sp(station, templateMap, ioNo, diag, warnings, autoSlotConfi
     }));
   }
 
-  // PCS7 always inserts the server module as the last slot — add it if the IO
-  // list did not already include one. Server module order is hardcoded (not DB-configurable).
-  if (!hasServer) {
+  // Server module attachment is controlled by the station's auto-slot config.
+  // PCS7 standard: always place server module as the last slot.
+  // Auto-add only if: (1) not already in the user's slot list, AND (2) enabled in config.
+  // If config is missing or flag is null/false, skip auto-addition (safe default).
+  const serverModuleEnabled = autoSlotConfig?.rules?.server_module_enabled === true;
+  if (!hasServer && serverModuleEnabled) {
     const serverModuleOrder = 'V1_1:6ES7 193-6PA00-0AA0';
     out.push(blocks.serverModuleBlock({ ioNo, addr, slot: maxSlot + 1, diag: diag.ptr-- }));
   }
