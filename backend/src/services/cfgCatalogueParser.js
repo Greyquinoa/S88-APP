@@ -175,12 +175,13 @@ function extractScalanceDevices(lines) {
     if (!/^GSDML/i.test(orderNo) || ioAddr === null) { i++; continue; }
 
     // Parse the GSDML path: "GSDML-V2.42-...-SCALANCE_XC200-20230619.xml<DAP 87>EXTENDED"
-    // → gsdmlFile = "GSDML-V2.42-...-SCALANCE_XC200-20230619.xml", dapId = "87"
-    const gsdmlBase  = orderNo.replace(/EXTENDED$/i, '').replace(/<DAP\s*\d+>/i, '').trim();
+    // or "GSDML-V2.35-Festo-CPX-AP-I-20240606.xml<DAP AP-I rev1>"
+    // → gsdmlFile = "GSDML-V2.42-...-SCALANCE_XC200-20230619.xml", dapId = "87" or "AP-I rev1"
+    const gsdmlBase  = orderNo.replace(/EXTENDED$/i, '').replace(/<DAP\s*[^>]+>/i, '').trim();
     const gsdmlFileM = gsdmlBase.match(/(GSDML[^<]+\.xml)/i);
     const gsdmlFile  = gsdmlFileM ? gsdmlFileM[1] : gsdmlBase;
-    const dapM       = orderNo.match(/<DAP\s*(\d+)>/i);
-    const dapId      = dapM ? dapM[1] : null;
+    const dapM       = orderNo.match(/<DAP\s*([^>]+)>/i);
+    const dapId      = dapM ? dapM[1].trim() : null;
     const gsdmlPath  = dapId ? `${gsdmlFile}<DAP ${dapId}>` : gsdmlFile;
 
     const version = (quoted.length >= 3 && /^V\d/i.test(quoted[1])) ? quoted[1] : null;
@@ -246,7 +247,18 @@ function extractScalanceDevices(lines) {
       continue;
     }
 
-    // Other SLOT entries (slot ≠ 0) — not relevant for Scalance
+    // ── Case 4: SLOT ≥ 1 — modular device (e.g. Festo CPX) with real I/O modules ──
+    // A GSDML device that has slots ≥ 1 is NOT a plain switch: each slot carries its
+    // own MLFB and possibly I/O signals. Flag it so the collapsed single-station
+    // Scalance candidate is suppressed and the main parser handles slots individually.
+    if (slotM && parseInt(slotM[1], 10) >= 1) {
+      if (!devices.has(ioAddr)) devices.set(ioAddr, { gsdmlPath, gsdmlFile, dapId, version, name: '', mlfb: null, ports: [],
+        vendorId: null, deviceId: null, minVersion: null, hwRelease: null, swRelease: null, isModular: false });
+      devices.get(ioAddr).isModular = true;
+      continue;
+    }
+
+    // Other SLOT entries — not relevant for Scalance
   }
 
   return devices;
@@ -308,8 +320,9 @@ function parseCfgForCatalogue(text) {
         }
       }
 
-      // Collect SLOT 0 port subslots (≥2) for non-GSDML ET200 IM modules.
-      // SUBSLOT 1 is the PN-IO interface head; SUBSLOT ≥ 2 are physical ports.
+      // Collect SLOT 0 subslots (≥1) for IM modules (any hardware type).
+      // SUBSLOT 1 = PN-IO interface head; SUBSLOT ≥ 2 = ports or other submodules.
+      // Import ALL subslots regardless of order_no format (GSDML, _S7H_, standard, etc.)
       const slotMpre   = l.match(/\bSLOT\s+(\d+)/i);
       const ssNoPre    = ssm ? parseInt(ssm[1], 10) : null;
       const ioAddrMpre = l.match(/\bIOADDRESS\s+(\d+)/i);
@@ -317,13 +330,11 @@ function parseCfgForCatalogue(text) {
         const qsPre = []; const qRePre = /"([^"]*)"/g; let qmPre;
         while ((qmPre = qRePre.exec(l)) !== null) qsPre.push(qmPre[1]);
         const portOrderNo = qsPre[0] || '';
-        const portLabel   = qsPre[qsPre.length - 1] || `Port ${ssNoPre}`;
-        // Skip GSDML-path entries (handled by extractScalanceDevices) and _S7H_ iface heads
-        if (!/^GSDML/i.test(portOrderNo)) {
-          const addr = parseInt(ioAddrMpre[1], 10);
-          if (!imPortsByAddr.has(addr)) imPortsByAddr.set(addr, []);
-          imPortsByAddr.get(addr).push({ subslot: ssNoPre, name: portLabel, orderNo: portOrderNo });
-        }
+        const portLabel   = qsPre[qsPre.length - 1] || `Subslot ${ssNoPre}`;
+        // Import ALL subslots regardless of type (GSDML, _S7H_, ET200, etc.)
+        const addr = parseInt(ioAddrMpre[1], 10);
+        if (!imPortsByAddr.has(addr)) imPortsByAddr.set(addr, []);
+        imPortsByAddr.get(addr).push({ subslot: ssNoPre, name: portLabel, orderNo: portOrderNo });
       }
 
       const headerLine = l;
@@ -389,6 +400,10 @@ function parseCfgForCatalogue(text) {
         slotInfo = 'Station head';
       }
 
+      // Extract slot and subslot numbers for determining hw_category
+      const slotNum = slotM ? parseInt(slotM[1], 10) : null;
+      const subslotNum = subslotM ? parseInt(subslotM[1], 10) : null;
+
       // Version may be a separate quoted token immediately after order_no
       // e.g. "6ES7 155-6AU00-0CN0" "V4.2" — two adjacent quoted strings before comma+label
       if (quoted.length >= 3) {
@@ -402,12 +417,8 @@ function parseCfgForCatalogue(text) {
       // Skip if order_no is suspiciously empty or internal
       if (!order_no || order_no.length < 4) continue;
 
-      // Skip GSDML-path blocks that belong to a detected Scalance device — those are
-      // handled by extractScalanceDevices() and injected as a single 'Scalance' candidate.
-      if (/^GSDML/i.test(order_no)) {
-        const ioAddrN = ioAddrM ? parseInt(ioAddrM[1], 10) : null;
-        if (ioAddrN !== null && scalanceDevices.has(ioAddrN)) continue;
-      }
+      // Import ALL blocks generically - no special handling for GSDML or any other type
+      // Each block becomes a candidate (station, slot, or subslot) regardless of format
 
       // ── Parse the block body ──────────────────────────────────────────────
       const body = bodyLines.join('\n');
@@ -499,8 +510,18 @@ function parseCfgForCatalogue(text) {
       // regardless of byte count heuristics which incorrectly classify them as AI.
       if (/^META[/\\]/i.test(order_no)) signal_type = 'PA';
 
-      // Family: COMMENT override > order-number derivation
-      const derivedFamily = deriveFamily(order_no);
+      // Family: COMMENT override > modular-device inheritance > order-number derivation
+      let derivedFamily = deriveFamily(order_no);
+      // Slots (SLOT ≥ 1) of a modular GSDML device (e.g. Festo CPX) carry numeric MLFBs
+      // that don't match any family rule. Inherit the parent device's GSDML-derived family.
+      const modDev = ioAddrM ? scalanceDevices.get(parseInt(ioAddrM[1], 10)) : null;
+      if (modDev && modDev.isModular && (derivedFamily === 'Unknown' || derivedFamily === 'GSDML')) {
+        const gf = modDev.gsdmlFile || modDev.gsdmlPath || '';
+        if (/SCALANCE/i.test(gf)) derivedFamily = 'SCALANCE';
+        else if (/Festo|CPX/i.test(gf)) derivedFamily = 'Festo';
+        else if (/HMI|_PP[-_]/i.test(gf)) derivedFamily = 'HMI';
+        else derivedFamily = 'GSDML';
+      }
       const family = commentFamily || derivedFamily;
       const familySource = commentFamily ? 'comment' : (derivedFamily === 'Unknown' ? 'unknown' : 'auto');
 
@@ -511,13 +532,15 @@ function parseCfgForCatalogue(text) {
 
       // Determine if this subslot is the service module (highest-numbered subslot for this slot).
       // Service modules are infrastructure-only (AUTOCREATED in PCS7) — not user-importable.
+      // EXCEPTION: SLOT 0 (interface/station head) entries are never service modules — they're always importable.
+      // Generic logic: applies to all hardware types equally
       let isServiceModule = false;
-      if (slotM && subslotNo !== null && subslotNo >= 1) {
-        const compatKey  = `${ioAddress}:${slotM[1]}`;
+      if (slotNum !== null && slotNum !== 0 && subslotNum !== null && subslotNum >= 1) {
+        const compatKey  = `${ioAddress}:${slotNum}`;
         const servicePos = maxSubslotByKey.get(compatKey) || 0;
         // Only mark as service module if there are multiple subslots (servicePos > 1),
         // meaning this is truly the highest = AUTOCREATED one; single-subslot slots are not service modules.
-        if (servicePos > 1 && subslotNo === servicePos) isServiceModule = true;
+        if (servicePos > 1 && subslotNum === servicePos) isServiceModule = true;
       }
 
       // SUBSLOT 1 IFACE infrastructure heads have order_no starting with "_S7H_".
@@ -526,25 +549,38 @@ function parseCfgForCatalogue(text) {
       // real function subslots — they should be visible and importable independently.
       const isIfaceHead = !!(slotM && subslotNo === 1 && order_no.startsWith('_S7H_'));
 
+      // Determine hw_category generically based on presence of SLOT and SUBSLOT
+      // No family-specific logic - same rules apply to all hardware types
       let hw_category;
-      if (subslotNo !== null) {
+      if (subslotNum !== null) {
         hw_category = 'subslot';
-      } else if (slotM) {
+      } else if (slotNum !== null) {
         hw_category = 'slot';
       } else {
         hw_category = 'station';
       }
 
-      // For station-head entries (hw_category === 'station'), attach any SLOT 0 port subslots
-      // collected in the pre-pass so the template can display port sub-rows in the UI.
-      // Only applies to non-GSDML (ET200/CFU) IM modules; Scalance gets port_config via extractScalanceDevices.
+      // For station-head entries (hw_category === 'station'), attach any SLOT 0 subslots
+      // collected in the pre-pass. These are stored as port_config so the auto-slot system
+      // can use them. Applies to ALL hardware types (ET200, CFU, GSDML, etc.)
       let port_config = null;
-      if (hw_category === 'station' && !(/^GSDML/i.test(order_no))) {
+      if (hw_category === 'station') {
         const imPorts = imPortsByAddr.get(ioAddress);
         if (imPorts && imPorts.length > 0) {
           const sorted = [...imPorts].sort((a, b) => a.subslot - b.subslot);
           port_config = JSON.stringify(sorted);
         }
+      }
+
+      // Extract MLFB from block body (applies to all hw_category types: station, slot, subslot)
+      // For station entries, also try the pre-pass scalanceDevices map as fallback
+      let mlfbValue = null;
+      const mlfbM = body.match(/\bMLFB\s+"([^"]+)"/);
+      if (mlfbM) {
+        mlfbValue = mlfbM[1];
+      } else if (hw_category === 'station' && scalanceDevices.has(ioAddress)) {
+        // Fallback for stations: check if pre-pass found MLFB from SLOT 0 block
+        mlfbValue = scalanceDevices.get(ioAddress).mlfb || null;
       }
 
       const candidate = {
@@ -560,8 +596,9 @@ function parseCfgForCatalogue(text) {
         out_addr_fmt,
         param_template,
         channel_count,
-        subslot_defaults, // CFU_PA slot only: JSON array [{ssNo,paProfile},...] from CFG — null for all others
-        port_config,   // ET200/CFU station heads: JSON [{subslot, name, orderNo},...] — null otherwise
+        subslot_defaults, // For slots with function subslots: JSON array [{ssNo,paProfile},...] — null for others
+        port_config,   // For station heads: JSON [{subslot, name, orderNo},...] of all SLOT 0 subslots
+        mlfb: mlfbValue,  // Module type ID extracted directly from SLOT block
         slotInfo,      // e.g. "Slot 1", "Station head", "Slot 3 / Subslot 2" — for display only
         ioAddress,     // numeric IO station address — used to group entries in the import UI
         hw_category,   // 'station' | 'slot' | 'subslot'
@@ -577,18 +614,28 @@ function parseCfgForCatalogue(text) {
       // Service modules are AUTOCREATED infrastructure — never import them
       if (isServiceModule) continue;
 
-      // Dedup by order_no — one row per unique type regardless of how many slots use it.
-      // For visible subslots (SUBSLOT ≥ 2), the same type (e.g. "Analog Input (AI)short")
-      // may appear in many slots; show it once only.
-      if (byOrderNo.has(order_no)) {
-        const existing = byOrderNo.get(order_no);
+      // Dedup by (order_no, hw_category, slot, subslot) — allow same order_no in different categories.
+      // For subslots, include (slot, subslot) in the key so SUBSLOT 2 and SUBSLOT 3 of the same type
+      // are both imported (e.g., two ports with identical GSDML path).
+      // For non-subslots, include only (order_no, hw_category) to avoid duplicates across instances.
+      let dedupKey;
+      if (hw_category === 'subslot' && slotM && subslotM) {
+        // Include slot and subslot numbers for uniqueness per (slot, subslot) position
+        dedupKey = `${order_no}|${hw_category}|${slotM[1]}|${subslotM[1]}`;
+      } else {
+        // Station and slot: deduplicate by order_no + category only
+        dedupKey = `${order_no}|${hw_category}`;
+      }
+
+      if (byOrderNo.has(dedupKey)) {
+        const existing = byOrderNo.get(dedupKey);
         // Prefer the entry that has address info
         if ((input_bytes > 0 || output_bytes > 0) &&
             existing.input_bytes === 0 && existing.output_bytes === 0) {
-          byOrderNo.set(order_no, candidate);
+          byOrderNo.set(dedupKey, candidate);
         }
       } else {
-        byOrderNo.set(order_no, candidate);
+        byOrderNo.set(dedupKey, candidate);
       }
     } catch (e) {
       // One bad block shouldn't abort everything; emit a parse-error candidate
@@ -603,51 +650,10 @@ function parseCfgForCatalogue(text) {
     }
   }
 
-  // ── Inject Scalance GSDML device candidates ──────────────────────────────────
-  // One catalogue entry per unique MLFB (order number). The GSDML path + port_config
-  // are stored as template metadata so the CFG generator can reconstruct the full block.
-  for (const [, dev] of scalanceDevices) {
-    if (!dev.mlfb) continue; // no MLFB found — skip incomplete records
-
-    const order_no = dev.mlfb;
-    if (byOrderNo.has(order_no)) continue; // already seen (multi-instance in same CFG)
-
-    dev.ports.sort((a, b) => a.subslot - b.subslot);
-    const portCount = dev.ports.filter(p => p.type === 'port').length;
-    const portConfig = dev.ports.length > 0 ? JSON.stringify(dev.ports) : null;
-    const paramMeta = JSON.stringify({
-      PN_VENDOR_ID: dev.vendorId, PN_DEVICE_ID: dev.deviceId,
-      PN_MIN_VERSION: dev.minVersion, PN_HW_RELEASE: dev.hwRelease, PN_SW_RELEASE: dev.swRelease,
-    });
-
-    byOrderNo.set(order_no, {
-      order_no,
-      version:       dev.version || null,
-      display_name:  dev.name.replace(/-/g, ' ').trim() || order_no,
-      family:        'Scalance',
-      familySource:  'auto',
-      signal_type:   null,
-      input_bytes:   0,
-      output_bytes:  0,
-      in_addr_fmt:   null,
-      out_addr_fmt:  null,
-      param_template: paramMeta,
-      channel_count: portCount,
-      subslot_defaults: null,
-      port_config:   portConfig,
-      gsdml_file:    dev.gsdmlFile || null,
-      dap_id:        dev.dapId || null,
-      hw_category:   'station',
-      slotInfo:      'Station head',
-      ioAddress:     0,
-      subslotNo:     null,
-      isBackground:  false,
-      isServiceModule: false,
-      parseError:    null,
-    });
-  }
-
-  return { error: null, candidates: [...byOrderNo.values()] };
+  // All IOSUBSYSTEM blocks are handled generically by the main parser above.
+  // No special injection needed for any hardware type (Scalance, Festo, ET200, CFU, etc.)
+  const candidates = [...byOrderNo.values()];
+  return { error: null, candidates };
 }
 
 module.exports = { parseCfgForCatalogue, deriveFamily };
