@@ -980,10 +980,6 @@ function ensureSchema() {
   fixTpl('6ES7 134-6HD00-0BA1', null, null);                       // AI4 ST V1.0 — no PARAMETER, no version str
   fixTpl('6ES7 135-6TD00-0CA1', '  POTENTIAL_GROUP, "NEW_GROUP"', null); // AQ4 HART
 
-  // Migration: 6ES7 155-6AU00-0CN0 hw_category must be 'station', not 'slot'
-  // (it was marked as 'slot' by the fallback migration if imported before seeding)
-  _db.run("UPDATE hw_module_templates SET hw_category='station' WHERE order_no='6ES7 155-6AU00-0CN0' AND hw_category='slot'");
-
   // Migration: DIQ8 channel_count was seeded as 8 (DI only) — must be 16 (8 DI + 8 DO)
   {
     const diq8 = rawGet("SELECT channel_count FROM hw_module_templates WHERE order_no='_S7H_HSP_CFU_PA_V2_0_DI8_DQ8_CT'");
@@ -1092,174 +1088,85 @@ function ensureSchema() {
   }
 
   // ── Station Auto-Slot Configuration ────────────────────────────────────────────
-  // Each station (by order_no) has a JSON config defining which slots auto-create,
-  // their order numbers, subslots, and rendering rules.
-  // Keyed by station order_no (e.g., 'V_2_0_PA_ETER:6ES7 655-5PX11-0XX0') not by family.
+  // Each station family (ET200SP, CFU_PA, Scalance) has a JSON config defining which
+  // slots auto-create, their order numbers, subslots, and rendering rules.
   _db.run(`CREATE TABLE IF NOT EXISTS hw_station_auto_slots (
     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_no              TEXT NOT NULL UNIQUE,
+    family                TEXT NOT NULL UNIQUE,
     auto_slots_config     TEXT NOT NULL,
     created_at            TEXT DEFAULT (datetime('now')),
     updated_at            TEXT DEFAULT (datetime('now'))
   )`);
 
-  // ── Module Auto-Created Slots Metadata ──────────────────────────────────────────
-  // Stores which slots/subslots are marked AUTOCREATED in catalogue modules.
-  // Extracted from baseline CFG during module import.
-  _db.run(`CREATE TABLE IF NOT EXISTS hw_module_autocreated_slots (
-    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_no              TEXT NOT NULL,
-    slot                  INTEGER NOT NULL,
-    subslot               INTEGER,
-    autocreated           BOOLEAN NOT NULL DEFAULT 1,
-    created_at            TEXT DEFAULT (datetime('now')),
-    UNIQUE(order_no, slot, subslot)
-  )`);
+  // Seed auto-slot configurations from the existing hardcoded logic
+  const autoSlotConfigCount = rawGet('SELECT COUNT(*) AS n FROM hw_station_auto_slots').n;
+  if (!autoSlotConfigCount) {
+    const autoSlotConfigs = [
+      {
+        family: 'ET200SP',
+        config: {
+          family: 'ET200SP',
+          slots: [
+            {
+              slot: 0,
+              type: 'interface',
+              is_autocreated: true,
+              use_from_station_slot: true,
+              subslots: [
+                { subslot: 1, type: 'iface', is_autocreated: true },
+                { subslot: 2, type: 'port', port_label: 'Port 1 RJ45', order_no: 'DEFAULT:6ES7 193-6AR00-0AA0', is_autocreated: true },
+                { subslot: 3, type: 'port', port_label: 'Port 2 RJ45', order_no: 'DEFAULT:6ES7 193-6AR00-0AA0', is_autocreated: true }
+              ]
+            }
+          ],
+          rules: {
+            server_module_enabled: true,
+            server_module_order: 'V1_1:6ES7 193-6PA00-0AA0',
+            server_module_placement: 'after_last_io'
+          }
+        }
+      },
+      {
+        family: 'CFU_PA',
+        config: {
+          family: 'CFU_PA',
+          slots: [
+            {
+              slot: 0,
+              type: 'interface',
+              is_autocreated: true,
+              order_no: 'V_2_0_PA_ETER:6ES7 655-5PX11-0XX0',
+              subslots: [
+                { subslot: 1, type: 'iface', is_autocreated: true },
+                { subslot: 2, type: 'port', port_label: 'Port 1 RJ45', order_no: 'V_2_0_PORT_1:6DL1 193-6AR00-0AA0', is_autocreated: true },
+                { subslot: 3, type: 'port', port_label: 'Port 2 RJ45', order_no: 'V_2_0_PORT_2:6DL1 193-6AR00-0AA0', is_autocreated: true }
+              ]
+            },
+            {
+              slot: 2,
+              type: 'pa_master',
+              is_autocreated: true,
+              subslots: [
+                { subslot: 1, type: 'pa_master_param', is_autocreated: true },
+                { subslot: 2, type: 'pa_master_status', is_autocreated: true }
+              ]
+            }
+          ],
+          rules: {
+            server_module_enabled: false
+          }
+        }
+      }
+    ];
 
-  // Migration: Rename family column to order_no in hw_station_auto_slots (if old schema exists)
-  // This handles existing databases that were created before the refactoring to use order_no
-  try {
-    const tableInfo = rawAll('PRAGMA table_info(hw_station_auto_slots)');
-    const hasFamily = tableInfo.some(col => col.name === 'family');
-    const hasOrderNo = tableInfo.some(col => col.name === 'order_no');
-
-    if (hasFamily && !hasOrderNo) {
-      // Old schema exists: migrate by recreating the table
-      console.log('[DB] Migrating hw_station_auto_slots: family → order_no');
-      _db.run(`ALTER TABLE hw_station_auto_slots RENAME TO hw_station_auto_slots_old`);
-      _db.run(`CREATE TABLE hw_station_auto_slots (
-        id                    INTEGER PRIMARY KEY AUTOINCREMENT,
-        order_no              TEXT NOT NULL UNIQUE,
-        auto_slots_config     TEXT NOT NULL,
-        created_at            TEXT DEFAULT (datetime('now')),
-        updated_at            TEXT DEFAULT (datetime('now'))
-      )`);
-      // Copy data: use old family names as order_no for backward compatibility
-      _db.run(`INSERT INTO hw_station_auto_slots (id, order_no, auto_slots_config, created_at, updated_at)
-               SELECT id, family, auto_slots_config, created_at, updated_at FROM hw_station_auto_slots_old`);
-      _db.run(`DROP TABLE hw_station_auto_slots_old`);
+    const insAutoSlot = _db.prepare(
+      'INSERT INTO hw_station_auto_slots (family, auto_slots_config) VALUES (?, ?)'
+    );
+    for (const item of autoSlotConfigs) {
+      insAutoSlot.run([item.family, JSON.stringify(item.config)]);
     }
-  } catch (migErr) {
-    console.log('[DB] Migration check failed (expected if table doesnt exist):', migErr.message);
+    insAutoSlot.free();
   }
-
-  // Seed auto-slot configurations with the new order_no-keyed format
-  // Delete old family-keyed records and replace with new station order_no-keyed configs
-  const oldFamilyConfigs = rawAll('SELECT id FROM hw_station_auto_slots WHERE order_no IN ("ET200SP", "CFU_PA", "Scalance", "V_2_0_PA_ETER:6ES7 655-5PX11-0XX0")');
-  if (oldFamilyConfigs.length > 0) {
-    console.log('[DB] Removing old family-keyed auto-slot configs...');
-    _db.run('DELETE FROM hw_station_auto_slots WHERE order_no IN ("ET200SP", "CFU_PA", "Scalance", "V_2_0_PA_ETER:6ES7 655-5PX11-0XX0")');
-  }
-
-  // Insert new order_no-keyed configurations
-  // Key is the STATION order_no (interface module), not the slot subtype
-  const autoSlotConfigs = [
-    {
-      order_no: '6ES7 155-6AU00-0CN0',  // Station (ET200SP interface module)
-      config: {
-        slots: [
-          {
-            slot: 0,
-            type: 'interface',
-            order_no: '6ES7 155-6AU00-0CN0',  // Slot 0 order_no (same as station for ET200SP)
-            version: 'V4.2',
-            label: 'IM155-6PN-HF-V4.2',
-            subslots: [
-              { subslot: 1, type: 'iface', order_no: '_S7H_HSP_155_6AU00_0CN0_V4_2_IFACE_CT', label: 'PN-IO' },
-              { subslot: 2, type: 'port', port_label: 'Port 1 RJ45', order_no: 'DEFAULT:6ES7 193-6AR00-0AA0' },
-              { subslot: 3, type: 'port', port_label: 'Port 2 RJ45', order_no: 'DEFAULT:6ES7 193-6AR00-0AA0' }
-            ]
-          }
-        ],
-        rules: {
-          server_module_enabled: true
-        }
-      }
-    },
-    {
-      order_no: 'V_2_0_PA:6ES7 655-5PX11-0XX0',  // Station (CFU_PA interface module) - WITHOUT the ETER suffix
-      config: {
-        slots: [
-          {
-            slot: 0,
-            type: 'interface',
-            order_no: 'V_2_0_PA_ETER:6ES7 655-5PX11-0XX0',  // Slot 0 order_no (WITH the ETER suffix variant)
-            version: 'V2.0',
-            label: 'cfu-pa',
-            subslots: [
-              { subslot: 1, type: 'iface', order_no: '_S7H_HSP_CFU_PA_V2_0_IFACE_CT', label: 'cfu-pa' },
-              { subslot: 2, type: 'port', port_label: 'Port 1 RJ45', order_no: 'V_2_0_PORT_1:6DL1 193-6AR00-0AA0' },
-              { subslot: 3, type: 'port', port_label: 'Port 2 RJ45', order_no: 'V_2_0_PORT_2:6DL1 193-6AR00-0AA0' }
-            ]
-          },
-          {
-            slot: 2,
-            type: 'pa_master',
-            order_no: '_S7H_HSP_CFU_PA_V2_0_PA_MASTER_CT',
-            subslots: [
-              { subslot: 1, type: 'pa_master_param', order_no: '_S7H_HSP_CFU_PA_V2_0_SUB_PARAM_DIAG_CT', label: 'PROFIBUS PA Master' },
-              { subslot: 2, type: 'pa_master_status', order_no: '_S7H_HSP_CFU_PA_V2_0_SUB_STATUS_NOTIF_CT', label: 'Status + Notifications' }
-            ]
-          }
-        ],
-        rules: {
-          server_module_enabled: false
-        }
-      }
-    },
-    {
-      order_no: 'GSDML-V2.35-Festo-CPX-AP-I-20240606.xml<DAP AP-I rev1>',  // Station (Festo CPX-AP interface module)
-      config: {
-        slots: [
-          {
-            slot: 0,
-            type: 'interface',
-            order_no: 'CPX-AP-I',  // Slot 0 MLFB from CFG
-            version: 'V2.35',
-            label: 'CPX-AP-I',
-            subslots: [
-              { subslot: 1, type: 'iface', order_no: '_S7H_FESTO_CPX_AP_I_IFACE_CT', label: 'Festo CPX' }
-            ]
-          }
-        ],
-        rules: {
-          server_module_enabled: false
-        }
-      }
-    }
-  ];
-
-  const insAutoSlot = _db.prepare(
-    'INSERT OR REPLACE INTO hw_station_auto_slots (order_no, auto_slots_config) VALUES (?, ?)'
-  );
-  for (const item of autoSlotConfigs) {
-    insAutoSlot.run([item.order_no, JSON.stringify(item.config)]);
-  }
-  insAutoSlot.free();
-
-  // Seed hw_module_autocreated_slots with metadata for these stations
-  // These are extracted from baseline CFGs when modules are imported
-  // Key is STATION order_no, not slot subtype
-  const insAutoCreated = _db.prepare(
-    'INSERT OR REPLACE INTO hw_module_autocreated_slots (order_no, slot, subslot, autocreated) VALUES (?, ?, ?, 1)'
-  );
-  // ET200SP station (6ES7 155-6AU00-0CN0): slot 0 and subslots 0.1, 0.2, 0.3 are autocreated
-  insAutoCreated.run(['6ES7 155-6AU00-0CN0', 0, null]);
-  insAutoCreated.run(['6ES7 155-6AU00-0CN0', 0, 1]);
-  insAutoCreated.run(['6ES7 155-6AU00-0CN0', 0, 2]);
-  insAutoCreated.run(['6ES7 155-6AU00-0CN0', 0, 3]);
-  // CFU_PA station (V_2_0_PA:6ES7 655-5PX11-0XX0): slot 0 and subslots, slot 2 and subslots are autocreated
-  insAutoCreated.run(['V_2_0_PA:6ES7 655-5PX11-0XX0', 0, null]);
-  insAutoCreated.run(['V_2_0_PA:6ES7 655-5PX11-0XX0', 0, 1]);
-  insAutoCreated.run(['V_2_0_PA:6ES7 655-5PX11-0XX0', 0, 2]);
-  insAutoCreated.run(['V_2_0_PA:6ES7 655-5PX11-0XX0', 0, 3]);
-  insAutoCreated.run(['V_2_0_PA:6ES7 655-5PX11-0XX0', 2, null]);
-  insAutoCreated.run(['V_2_0_PA:6ES7 655-5PX11-0XX0', 2, 1]);
-  insAutoCreated.run(['V_2_0_PA:6ES7 655-5PX11-0XX0', 2, 2]);
-  // Festo station (GSDML-V2.35-Festo-CPX-AP-I-20240606.xml<DAP AP-I rev1>): slot 0 and subslot 0.1 are autocreated
-  insAutoCreated.run(['GSDML-V2.35-Festo-CPX-AP-I-20240606.xml<DAP AP-I rev1>', 0, null]);
-  insAutoCreated.run(['GSDML-V2.35-Festo-CPX-AP-I-20240606.xml<DAP AP-I rev1>', 0, 1]);
-  insAutoCreated.free();
 
   // ── Slot ↔ Subslot compatibility (M2M) ───────────────────────────────────────
   _db.run(`CREATE TABLE IF NOT EXISTS hw_slot_subslot_compat (
