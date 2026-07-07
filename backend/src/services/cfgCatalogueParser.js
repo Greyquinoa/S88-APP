@@ -572,15 +572,12 @@ function parseCfgForCatalogue(text) {
         }
       }
 
-      // Extract MLFB from block body (applies to all hw_category types: station, slot, subslot)
-      // For station entries, also try the pre-pass scalanceDevices map as fallback
+      // Extract MLFB from block body
+      // MLFB only appears in SLOT blocks, not in station/device-level headers
       let mlfbValue = null;
       const mlfbM = body.match(/\bMLFB\s+"([^"]+)"/);
       if (mlfbM) {
         mlfbValue = mlfbM[1];
-      } else if (hw_category === 'station' && scalanceDevices.has(ioAddress)) {
-        // Fallback for stations: check if pre-pass found MLFB from SLOT 0 block
-        mlfbValue = scalanceDevices.get(ioAddress).mlfb || null;
       }
 
       const candidate = {
