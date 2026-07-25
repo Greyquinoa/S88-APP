@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { loadHwColumnMapping, saveHwColumnMapping } from './api.js';
 
 /**
  * HwColumnMappingPanel — Two-step column mapping workflow
@@ -36,8 +37,28 @@ export default function HwColumnMappingPanel({ importId, excelHeaders, selectedC
 
   // Load raw Excel rows from DB on mount (no file re-upload needed)
   useEffect(() => {
-    if (importId) loadPreview();
+    if (importId) {
+      loadPreview();
+      loadSavedMapping();
+    }
   }, [importId]);
+
+  async function loadSavedMapping() {
+    try {
+      const data = await loadHwColumnMapping(importId);
+      if (data.mapping && Object.keys(data.mapping).length > 0) {
+        setMapping(data.mapping);
+        // Restore selected columns from saved mapping — these are the Excel column names
+        const selectedCols = new Set(Object.values(data.mapping).filter(Boolean));
+        setSelectedColumns(selectedCols);
+        // Auto-advance to mapping step if we have a saved mapping
+        // The user can see their previous selections immediately
+      }
+    } catch (e) {
+      // Silent fail - no saved mapping is fine
+      console.debug('No saved column mapping found');
+    }
+  }
 
   async function loadPreview() {
     setLoading('Loading preview…');
@@ -139,6 +160,9 @@ export default function HwColumnMappingPanel({ importId, excelHeaders, selectedC
       // Build the column map: app field → Excel column name
       const columnMap = mapping; // mapping already has this structure
 
+      // Save the mapping configuration for future loads
+      await saveHwColumnMapping(importId, columnMap);
+
       // Fetch preview with the mapping applied (no file needed, using stored raw rows)
       const resp = await fetch(`/api/hw-config/imports/${importId}/preview-mapped?columnMap=${encodeURIComponent(JSON.stringify(columnMap))}`, {
         method: 'GET',
@@ -147,6 +171,7 @@ export default function HwColumnMappingPanel({ importId, excelHeaders, selectedC
 
       const data = await resp.json();
       // data contains: { summary, items, parsedRows, fileName, stationCount, resolutionStats }
+      // Each item may include stationConflicts array for highlighting conflicted rows
       // Pass to parent to show review modal
       if (onMappingComplete) {
         onMappingComplete({
@@ -267,7 +292,7 @@ export default function HwColumnMappingPanel({ importId, excelHeaders, selectedC
                       </tr>
                     </thead>
                     <tbody>
-                      {excelData.slice(0, 20).map((row, i) => (
+                      {excelData.map((row, i) => (
                         <tr key={i} style={{ borderBottom: '1px solid var(--color-border-tertiary)' }}>
                           {selectedList.map(col => {
                             const val = row[col];
@@ -284,11 +309,6 @@ export default function HwColumnMappingPanel({ importId, excelHeaders, selectedC
                       ))}
                     </tbody>
                   </table>
-                  {excelData.length > 20 && (
-                    <div style={{ padding: '8px 12px', fontSize: 10, color: 'var(--color-text-secondary)', textAlign: 'center', background: 'var(--color-background-secondary)' }}>
-                      … and {excelData.length - 20} more rows
-                    </div>
-                  )}
                 </div>
               )}
             </div>

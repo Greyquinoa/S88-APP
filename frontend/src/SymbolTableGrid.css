@@ -1,0 +1,102 @@
+/* SymbolTableGrid — professional data grid for signal display */
+
+.st-root {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  font-family: var(--font-sans, system-ui, -apple-system, sans-serif);
+}
+
+/* Grid wrapper IS the scroll container — domLayout=autoHeight expands the
+   grid to fit its rows, and this box scrolls when it overflows. */
+.st-grid-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  border: 0.5px solid var(--color-border-tertiary, rgba(0,0,0,0.10));
+}
+
+.st-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 300px;
+  gap: 12px;
+  color: var(--color-text-secondary, #6b7280);
+  font-size: 14px;
+}
+
+.st-spinner {
+  font-size: 24px;
+  animation: st-spin 2s linear infinite;
+}
+
+@keyframes st-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.st-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 300px;
+  gap: 12px;
+  color: var(--color-text-secondary, #6b7280);
+  padding: 40px;
+}
+
+.st-empty-icon {
+  font-size: 40px;
+  opacity: 0.5;
+}
+
+.st-empty-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--color-text-primary, #1a1a1a);
+}
+
+.st-empty-message {
+  font-size: 13px;
+  text-align: center;
+  max-width: 400px;
+  line-height: 1.5;
+}
+
+.st-status {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 8px 12px;
+  background: var(--color-background-secondary, #f5f5f5);
+  border-top: 0.5px solid var(--color-border-tertiary, rgba(0,0,0,0.10));
+  font-size: 11px;
+  color: var(--color-text-secondary, #6b7280);
+  flex-shrink: 0;
+}
+
+.st-row-count {
+  font-weight: 500;
+}
+
+/* ── AG Grid theme tweaks via CSS ────────────────────────────────────────────── */
+
+.st-grid-wrap .ag-header-cell-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.st-grid-wrap .ag-floating-filter-input {
+  font-size: 11px;
+}
+
+.st-grid-wrap .ag-cell {
+  font-size: 12px;
+}

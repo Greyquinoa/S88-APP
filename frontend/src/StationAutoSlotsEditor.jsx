@@ -82,8 +82,12 @@ export default function StationAutoSlotsEditor({ station, catalogue: preloadedCa
 
   function addSlot() {
     if (!config) return;
+    // ET200SP: slot 0 is the interface module, then slots 1+ are IO modules
+    // If no slots exist, start with slot 0; otherwise add after the max
+    const existingSlots = config.slots || [];
+    const newSlotNum = existingSlots.length === 0 ? 0 : Math.max(...existingSlots.map(s => s.slot || 0)) + 1;
     const newSlot = {
-      slot: Math.max(0, ...config.slots.map(s => s.slot || 0)) + 1,
+      slot: newSlotNum,
       type: '',
       order_no: '',
       label: '',

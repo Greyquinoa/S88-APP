@@ -3,7 +3,7 @@ import MRPTopologyView from "./MRPTopologyView.jsx";
 import HwImportReview from "./HwImportReview.jsx";
 import HwColumnMappingPanel from "./HwColumnMappingPanel.jsx";
 import {
-  listHwImports, uploadHwBaseline, uploadHwIoList, previewHwIoList,
+  listHwImports, uploadHwBaseline, uploadHwIoList, previewHwIoList, previewHwMapped,
   getHwStations, getHwAddressPreview, generateHwCfg, listHwCfgs, hwCfgDownloadUrl,
   backfillFromCfg, getColumnMappingSuggestions,
   updateHwStation, updateHwSlot,
@@ -21,6 +21,7 @@ import {
   mrpGetDevices, mrpGetConfig, mrpSaveConfig, mrpDownloadCfg,
   listHwHardwareResolutions, upsertHwHardwareResolution, deleteHwHardwareResolution,
   exportHwHardwareResolutionUrl, importHwHardwareResolutionCsv,
+  getModuleParameters, getModuleParametersGrouped,
 } from "./api.js";
 
 import StepController from "./StepController.jsx";
@@ -30,7 +31,13 @@ import SymbolTableModal from "./SymbolTableModal.jsx";
 import StationAutoSlotsEditor from "./StationAutoSlotsEditor.jsx";
 
 
-export default function StepHWConfig({ projectId }) {
+// Postgres returns is_visible as a boolean (true/false); older SQLite data used
+// integers (1/0). A parameter is hidden only when explicitly falsy (false, 0).
+function paramVisible(p) {
+  return p.is_visible !== 0 && p.is_visible !== false;
+}
+
+export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwMappingConsumed }) {
   const [hwTab,        setHwTab]        = useState("import");
   const [importId,     setImportId]     = useState(null);
   const [baselineOk,   setBaselineOk]   = useState(false);
@@ -47,6 +54,7 @@ export default function StepHWConfig({ projectId }) {
   const [cfgs,         setCfgs]         = useState([]);
   const [loading,      setLoading]      = useState("");
   const [error,        setError]        = useState("");
+  const [conflictRows, setConflictRows] = useState(null);  // tabular detail for duplicate-station errors
   const [genWarnings,  setGenWarnings]  = useState([]);   // identifier diagnostics from last CFG generate
 
   // Inline-edit state
@@ -126,6 +134,46 @@ export default function StepHWConfig({ projectId }) {
       .catch(() => {});
   }, [projectId]);
 
+  // Unified import handoff: when the IO Import screen sends hardware mappings,
+  // rows have already been ingested into hw_excel_raw by App.jsx. Run the mapped
+  // preview and open the review modal so the user can confirm the hardware import.
+  useEffect(() => {
+    if (!pendingHwMapping || !pendingHwMapping.hardwareMappings) return;
+    // Prefer the HW import id supplied with the handoff; fall back to loaded importId.
+    const hwId = pendingHwMapping.hwImportId || importId;
+    if (!hwId) return;
+
+    let cancelled = false;
+    (async () => {
+      setLoading("Preparing hardware import…");
+      setError("");
+      try {
+        // hardwareMappings is { column: hw_field }. preview-mapped expects
+        // { hw_field: column }, so invert before sending.
+        const columnMap = {};
+        for (const [col, field] of Object.entries(pendingHwMapping.hardwareMappings)) {
+          columnMap[field] = col;
+        }
+        const data = await previewHwMapped(hwId, columnMap);
+        if (cancelled) return;
+        setImportId(hwId);
+        setBaselineOk(true);
+        setExcelHeaders([]);       // headers came from IO sheet; not needed here
+        setHwTab("import");
+        setReviewData(data);       // opens HwImportReview modal
+      } catch (e) {
+        if (!cancelled) setError(e.message);
+      } finally {
+        if (!cancelled) {
+          setLoading("");
+          onPendingHwMappingConsumed?.();
+        }
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [pendingHwMapping, importId]); // eslint-disable-line react-hooks/exhaustive-deps
+
   async function loadStations(id) {
     try {
       const [sts, addrs] = await Promise.all([
@@ -193,6 +241,7 @@ export default function StepHWConfig({ projectId }) {
     if (!file)     { setError("No CFG file selected."); return; }
     setLoading("Reading device data from CFG…");
     setError("");
+    setConflictRows(null);
     try {
       const result = await backfillFromCfg(importId, file);
       setIoListOk(true);
@@ -200,7 +249,7 @@ export default function StepHWConfig({ projectId }) {
       await loadStations(importId);
       await loadCfgs(importId);
       setHwTab("config");
-    } catch (e) { setError(e.message); }
+    } catch (e) { setError(e.message); setConflictRows(e.conflictRows || null); }
     finally { setLoading(""); }
   }
 
@@ -318,6 +367,7 @@ export default function StepHWConfig({ projectId }) {
     if (!newStation.imOrderNo) { setError("Select an Interface Module (Slot 0) type."); return; }
     setLoading("Adding station…");
     setError("");
+    setConflictRows(null);
     try {
       await addHwStation(importId, {
         address: addr,
@@ -330,7 +380,7 @@ export default function StepHWConfig({ projectId }) {
       await loadStations(importId);
       setAddingStation(false);
       setNewStation({ address: "", name: "", ip: "", subsystemNo: 100, imOrderNo: "", imName: "" });
-    } catch (e) { setError(e.message); }
+    } catch (e) { setError(e.message); setConflictRows(e.conflictRows || null); }
     finally { setLoading(""); }
   }
 
@@ -509,7 +559,12 @@ export default function StepHWConfig({ projectId }) {
       <div style={{ flex: 1, minWidth: 0, paddingLeft: 24 }}>
         <h2 style={{ marginTop: 0, marginBottom: 12 }}>Hardware Configuration Generator</h2>
 
-        {error && <div style={alertStyle("#ffeaea", "#e88", "#b00")}>{error}</div>}
+        {error && (
+          <div style={alertStyle("#ffeaea", "#e88", "#b00")}>
+            <div>{error}</div>
+            {conflictRows && conflictRows.length > 0 && <ConflictTable rows={conflictRows} />}
+          </div>
+        )}
         {loading && <div style={alertStyle("#eef4ff", "#99b", "#336")}>{loading}</div>}
         {genWarnings.length > 0 && (
           <div style={alertStyle("#fffbeb", "#fcd34d", "#92400e")}>
@@ -3518,20 +3573,20 @@ function StationDetailPanel({
   let imTpl = imSlot ? templates.find(t => t.order_no === imSlot.orderNo) : null;
 
   // Fallback: station was created with GSDML path as order_no (e.g. pre-refactor or imported from CFG directly).
-  // Detect by pattern and try to find a matching Scalance template by gsdml_file.
+  // Try to find matching template by gsdml_file. Note: only match Scalance if family is explicitly Scalance.
   const isGsdmlOrderNo = imSlot && imSlot.orderNo && /^GSDML-.*\.xml<DAP/.test(imSlot.orderNo);
-  if (isGsdmlOrderNo && (!imTpl || imTpl.family !== 'Scalance')) {
+  if (isGsdmlOrderNo && !imTpl) {
     const gsdmlFile = imSlot.orderNo.replace(/<DAP[\s\S]*/, '').trim(); // "GSDML-V2.42-....xml"
-    const byGsdml = templates.find(t => t.family === 'Scalance' && t.gsdml_file === gsdmlFile);
-    if (byGsdml) imTpl = byGsdml;
+    imTpl = templates.find(t => t.gsdml_file === gsdmlFile);
   }
 
-  const stationFamily    = imTpl ? imTpl.family : (isGsdmlOrderNo ? 'Scalance' : null);
+  const stationFamily    = imTpl ? imTpl.family : null;
   const isEt200Station   = stationFamily ? stationFamily.startsWith("ET200") : false;
   const isCfuPaStation   = stationFamily === 'CFU_PA';
-  // isGsdmlOrderNo covers old stations created before MLFB refactor (slot 0 order_no is a GSDML path).
-  // 'SCALANCE' (uppercase) comes from old FAMILY_RULES — treat it the same as the new 'Scalance'.
-  const isScalanceStation = isGsdmlOrderNo || stationFamily === 'Scalance' || stationFamily === 'SCALANCE';
+  // GSDML devices (Festo transmitters, valves, analyzers) — treated like CFU_PA with I/O modules
+  const isGsdmlStation   = stationFamily && /^GSDML/i.test(stationFamily);
+  // Scalance network switches — ONLY when family is explicitly 'Scalance' or 'SCALANCE'
+  const isScalanceStation = stationFamily === 'Scalance' || stationFamily === 'SCALANCE';
 
   // Parse port_config for Scalance stations
   let scalancePorts = [];
@@ -3623,7 +3678,7 @@ function StationDetailPanel({
         </div>
       </div>
 
-      {/* GSDML/Scalance station view — PCS7-style, data-driven from actual station slots + auto-slot config */}
+      {/* Scalance network switch view — ports only, no I/O module slots */}
       {isScalanceStation && (
         <div style={{ padding: "12px 16px" }}>
           <table style={{ ...tableStyle, fontSize: 13 }}>
@@ -3674,12 +3729,61 @@ function StationDetailPanel({
                 }
                 return rows;
               })}
+              {/* Inline add-slot form for Scalance stations */}
+              {addSlotRow && (
+                <tr style={{ background: "#f0f6ff" }}>
+                  <td colSpan={5} style={{ ...tdStyle, padding: "12px 16px" }}>
+                    <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+                      <div style={{ display: "flex", gap: 8, flex: 1, flexWrap: "wrap" }}>
+                        <div style={{ minWidth: 60 }}>
+                          <label style={{ display: "block", fontSize: 11, color: "#667", marginBottom: 2 }}>Slot</label>
+                          <input type="number" value={newSlot.slot}
+                            onChange={e => onSetNewSlot(p => ({ ...p, slot: e.target.value }))}
+                            min={1}
+                            style={{ ...inputSx, width: 54, textAlign: "center" }} placeholder="#" />
+                        </div>
+                        <div style={{ flex: 1, minWidth: 200 }}>
+                          <label style={{ display: "block", fontSize: 11, color: "#667", marginBottom: 2 }}>Module Order No</label>
+                          <select value={newSlot.moduleOrderNo} onChange={e => onModuleSelect(e.target.value)}
+                            style={{ ...inputSx, width: "100%", fontFamily: "monospace", fontSize: 11 }}>
+                            <option value="">— select module —</option>
+                            {templates
+                              .filter(t => {
+                                if (t.order_no.startsWith("V1_1:") || t.order_no.includes("PLACEHOLDER")) return false;
+                                return true;
+                              })
+                              .map(t => (
+                                <option key={t.id} value={t.order_no}>
+                                  {t.order_no} — {t.display_name}
+                                </option>
+                              ))
+                            }
+                          </select>
+                        </div>
+                        <div style={{ flex: 1, minWidth: 200 }}>
+                          <label style={{ display: "block", fontSize: 11, color: "#667", marginBottom: 2 }}>Module Name</label>
+                          <input
+                            value={newSlot.moduleName}
+                            onChange={e => onSetNewSlot(p => ({ ...p, moduleName: e.target.value }))}
+                            style={{ ...inputSx, width: "100%", borderColor: newSlot.moduleName.trim() ? undefined : "#e88" }}
+                            placeholder="module name *"
+                          />
+                        </div>
+                      </div>
+                      <div style={{ display: "flex", gap: 6, marginTop: 24 }}>
+                        <button onClick={() => onCommitAddSlot(station.address)} style={miniBtn("#2255cc", "#fff")} title="Save slot">✓</button>
+                        <button onClick={onCancelAddSlot} style={miniBtn("#aaa", "#fff")} title="Cancel">✗</button>
+                      </div>
+                    </div>
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>
       )}
 
-      {/* Slot table (ET200 / CFU_PA / other) */}
+      {/* Slot table (ET200 / CFU_PA / GSDML / other) */}
       {!isScalanceStation && <div style={{ padding: "12px 16px", overflowX: "auto" }}>
         <table style={{ ...tableStyle, fontSize: 13 }}>
           <thead>
@@ -3867,7 +3971,8 @@ function StationDetailPanel({
               }
 
               // CFU_PA PA device slots (≥3): append function subslot rows + service row
-              if (!isPaDevSlot || slot === null) return [mainRow];
+              // GSDML devices do NOT have PA function subslots on I/O modules (unlike CFU_PA)
+              if (!isPaDevSlot || slot === null || isGsdmlStation) return [mainRow];
 
               const ssRowStyle = {
                 background: "#f3f0ff",
@@ -3981,56 +4086,53 @@ function StationDetailPanel({
               return [mainRow, ...funcRows, serviceRow];
             })}
 
-            {/* Inline add-slot form */}
+            {/* Inline add-slot form — render after all existing slots */}
             {addSlotRow && (
               <tr style={{ background: "#f0f6ff" }}>
-                <td style={{ ...tdStyle, textAlign: "center" }}>
-                  <input type="number" value={newSlot.slot}
-                    onChange={e => onSetNewSlot(p => ({ ...p, slot: e.target.value }))}
-                    min={isCfuPaStation ? 3 : 1}
-                    style={{ ...inputSx, width: 48, textAlign: "center" }} placeholder="#" />
-                </td>
-                <td style={{ ...tdStyle }}>
-                  <select value={newSlot.moduleOrderNo} onChange={e => onModuleSelect(e.target.value)}
-                    style={{ ...inputSx, width: "100%", fontFamily: "monospace", fontSize: 11 }}>
-                    <option value="">— select module —</option>
-                    {templates
-                      .filter(t => {
-                        if (t.order_no.startsWith("V1_1:") || t.order_no.includes("PLACEHOLDER")) return false;
-                        // CFU_PA stations: show only PA slot-level profiles.
-                        // Accept signal_type='PA' (newly parsed) OR META\ prefix (already-stored rows that
-                        // were imported before the parser forced signal_type='PA').
-                        if (isCfuPaStation) return t.family === 'CFU_PA' && t.hw_category === 'slot' &&
-                          (t.signal_type === 'PA' || /^META[/\\]/i.test(t.order_no));
-                        return true;
-                      })
-                      .map(t => (
-                        <option key={t.id} value={t.order_no}>
-                          {t.order_no} — {t.display_name}
-                        </option>
-                      ))
-                    }
-                  </select>
-                </td>
-                <td style={{ ...tdStyle }}>
-                  <input
-                    value={newSlot.moduleName}
-                    onChange={e => onSetNewSlot(p => ({ ...p, moduleName: e.target.value }))}
-                    style={{ ...inputSx, width: "100%", borderColor: newSlot.moduleName.trim() ? undefined : "#e88" }}
-                    placeholder="module name *"
-                  />
-                </td>
-                <td style={{ ...tdStyle, textAlign: "center", color: "#bbb" }}>—</td>
-                {isEt200Station && (
-                  <td style={{ ...tdStyle, textAlign: "center", color: "#bbb", fontSize: 11 }}>—</td>
-                )}
-                <td style={{ ...tdStyle, textAlign: "center", color: "#bbb" }}>—</td>
-                <td style={{ ...tdStyle, textAlign: "center", color: "#bbb" }}>—</td>
-                <td style={{ ...tdStyle, textAlign: "center", color: "#bbb" }}>—</td>
-                <td style={{ ...tdStyle }}>
-                  <div style={{ display: "flex", gap: 6 }}>
-                    <button onClick={() => onCommitAddSlot(station.address)} style={miniBtn("#2255cc", "#fff")}>✓</button>
-                    <button onClick={onCancelAddSlot} style={miniBtn("#aaa", "#fff")}>✗</button>
+                <td colSpan={isEt200Station ? 9 : 8} style={{ ...tdStyle, padding: "12px 16px" }}>
+                  <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+                    <div style={{ display: "flex", gap: 8, flex: 1, flexWrap: "wrap" }}>
+                      <div style={{ minWidth: 60 }}>
+                        <label style={{ display: "block", fontSize: 11, color: "#667", marginBottom: 2 }}>Slot</label>
+                        <input type="number" value={newSlot.slot}
+                          onChange={e => onSetNewSlot(p => ({ ...p, slot: e.target.value }))}
+                          min={isCfuPaStation ? 3 : 1}
+                          style={{ ...inputSx, width: 54, textAlign: "center" }} placeholder="#" />
+                      </div>
+                      <div style={{ flex: 1, minWidth: 200 }}>
+                        <label style={{ display: "block", fontSize: 11, color: "#667", marginBottom: 2 }}>Module Order No</label>
+                        <select value={newSlot.moduleOrderNo} onChange={e => onModuleSelect(e.target.value)}
+                          style={{ ...inputSx, width: "100%", fontFamily: "monospace", fontSize: 11 }}>
+                          <option value="">— select module —</option>
+                          {templates
+                            .filter(t => {
+                              if (t.order_no.startsWith("V1_1:") || t.order_no.includes("PLACEHOLDER")) return false;
+                              if (isCfuPaStation) return t.family === 'CFU_PA' && t.hw_category === 'slot' &&
+                                (t.signal_type === 'PA' || /^META[/\\]/i.test(t.order_no));
+                              return true;
+                            })
+                            .map(t => (
+                              <option key={t.id} value={t.order_no}>
+                                {t.order_no} — {t.display_name}
+                              </option>
+                            ))
+                          }
+                        </select>
+                      </div>
+                      <div style={{ flex: 1, minWidth: 200 }}>
+                        <label style={{ display: "block", fontSize: 11, color: "#667", marginBottom: 2 }}>Module Name</label>
+                        <input
+                          value={newSlot.moduleName}
+                          onChange={e => onSetNewSlot(p => ({ ...p, moduleName: e.target.value }))}
+                          style={{ ...inputSx, width: "100%", borderColor: newSlot.moduleName.trim() ? undefined : "#e88" }}
+                          placeholder="module name *"
+                        />
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", gap: 6, marginTop: 24 }}>
+                      <button onClick={() => onCommitAddSlot(station.address)} style={miniBtn("#2255cc", "#fff")} title="Save slot">✓</button>
+                      <button onClick={onCancelAddSlot} style={miniBtn("#aaa", "#fff")} title="Cancel">✗</button>
+                    </div>
                   </div>
                 </td>
               </tr>
@@ -4093,40 +4195,6 @@ function BaselinePanel({ info, controllerTagName }) {
             )}
           </div>
 
-          {/* PIP Mapping Table */}
-          {info.pipMappings && info.pipMappings.length > 0 && (
-            <div style={{ minWidth: 260 }}>
-              <div style={{ fontWeight: 700, fontSize: 11, color: "#446", textTransform: "uppercase",
-                            letterSpacing: "0.04em", marginBottom: 6 }}>
-                Process Image Partitions
-              </div>
-              <table style={{ borderCollapse: "collapse", fontSize: 12, width: "100%" }}>
-                <thead>
-                  <tr>
-                    {["PIP", "Cyclic Update OB", "Execution Time"].map(h => (
-                      <th key={h} style={{ ...thStyle, padding: "4px 10px", fontSize: 11 }}>{h}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {info.pipMappings.map((p, i) => (
-                    <tr key={p.pipNo} style={{ background: i % 2 === 0 ? "#fff" : "#f4f8ff" }}>
-                      <td style={{ ...tdStyle, fontWeight: 700, color: "#2255cc", padding: "3px 10px",
-                                   fontFamily: "monospace" }}>
-                        PIP{p.pipNo}
-                      </td>
-                      <td style={{ ...tdStyle, fontFamily: "monospace", padding: "3px 10px", color: "#446" }}>
-                        OB{p.ob}
-                      </td>
-                      <td style={{ ...tdStyle, padding: "3px 10px", color: "#224" }}>
-                        {p.executionTime} {p.timeScale}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
         </div>
       )}
     </div>
@@ -4347,6 +4415,9 @@ function SlotSignalPanel({ importId, stationAddr, slot, slotName, orderNo, templ
   const [loading,  setLoading]  = useState(true);
   const [saving,   setSaving]   = useState(null); // channel index being saved
   const [drafts,   setDrafts]   = useState({});   // { [ch]: { tag, description } }
+  const [params,   setParams]   = useState(null); // module parameters { moduleLevel, channelLevel, metadata }
+  const [paramsLoading, setParamsLoading] = useState(false);
+  const [activeTab, setActiveTab] = useState('channels'); // 'channels' or 'parameters'
 
   const tpl = templates.find(t => t.order_no === orderNo);
   const ioType      = tpl ? tpl.signal_type : null;
@@ -4368,6 +4439,19 @@ function SlotSignalPanel({ importId, stationAddr, slot, slotName, orderNo, templ
       .catch(() => {})
       .finally(() => setLoading(false));
   }, [importId, stationAddr, slot]);
+
+  // Load module parameters if template has an id
+  useEffect(() => {
+    if (!tpl || !tpl.id) {
+      setParams(null);
+      return;
+    }
+    setParamsLoading(true);
+    getModuleParametersGrouped(tpl.id)
+      .then(data => setParams(data))
+      .catch(e => { console.warn("Failed to load parameters:", e); setParams(null); })
+      .finally(() => setParamsLoading(false));
+  }, [tpl?.id]);
 
   const setDraft = (ch, field, val) =>
     setDrafts(prev => ({ ...prev, [ch]: { ...prev[ch], [field]: val } }));
@@ -4439,8 +4523,121 @@ function SlotSignalPanel({ importId, stationAddr, slot, slotName, orderNo, templ
         </button>
       </div>
 
-      {/* Table */}
-      <div style={{ overflowY: "auto", maxHeight: "70vh" }}>
+      {/* Tabs */}
+      <div style={{
+        display: "flex", gap: 0,
+        padding: "0", background: "#eef2ff",
+        borderBottom: "1px solid #c8d4f0",
+      }}>
+        <button
+          onClick={() => setActiveTab('channels')}
+          style={{
+            flex: 1, padding: "8px 12px", fontSize: 12, fontWeight: 600,
+            color: activeTab === 'channels' ? '#224' : '#669',
+            background: activeTab === 'channels' ? '#f5f7ff' : '#eef2ff',
+            border: 'none', cursor: 'pointer', textTransform: 'uppercase',
+            letterSpacing: '0.04em', borderBottom: activeTab === 'channels' ? '2px solid #2563eb' : '2px solid transparent',
+            transition: 'all 0.2s'
+          }}
+        >
+          Channels & Signals
+        </button>
+        {(params || paramsLoading) && (
+          <button
+            onClick={() => setActiveTab('parameters')}
+            style={{
+              flex: 1, padding: "8px 12px", fontSize: 12, fontWeight: 600,
+              color: activeTab === 'parameters' ? '#224' : '#669',
+              background: activeTab === 'parameters' ? '#f5f7ff' : '#eef2ff',
+              border: 'none', cursor: 'pointer', textTransform: 'uppercase',
+              letterSpacing: '0.04em', borderBottom: activeTab === 'parameters' ? '2px solid #2563eb' : '2px solid transparent',
+              transition: 'all 0.2s'
+            }}
+          >
+            Parameters
+          </button>
+        )}
+      </div>
+
+      {/* Parameters Tab */}
+      {activeTab === 'parameters' && (params || paramsLoading) && (
+        <div style={{
+          padding: "12px 14px", background: "#f5f7ff",
+          overflowY: "auto", maxHeight: "calc(100vh - 280px)", fontSize: 12,
+        }}>
+          {paramsLoading ? (
+            <div style={{ color: "#669", fontStyle: "italic" }}>Loading module parameters…</div>
+          ) : !params || (!params.moduleLevel?.filter(paramVisible).length && !params.channelLevel?.filter(paramVisible).length) ? (
+            <div style={{ color: "#669" }}>No selected parameters for this module</div>
+          ) : (
+            <>
+              {params.moduleLevel && params.moduleLevel.filter(paramVisible).length > 0 && (
+                <div style={{ marginBottom: 10 }}>
+                  <div style={{ fontWeight: 700, color: "#224", marginBottom: 4, fontSize: 11, textTransform: "uppercase", letterSpacing: "0.04em" }}>
+                    Module Parameters
+                  </div>
+                  <div style={{ display: "grid", gap: 3 }}>
+                    {params.moduleLevel.filter(paramVisible).map(p => (
+                      <div key={p.id} style={{ display: "flex", gap: 8, fontSize: 11, color: "#446" }}>
+                        <span style={{ fontFamily: "monospace", fontWeight: 600, color: "#224", minWidth: 140 }}>
+                          {p.parameter_name}
+                        </span>
+                        <span style={{ fontFamily: "monospace", color: "#669" }}>
+                          {p.parameter_value || "—"}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {params.channelLevel && params.channelLevel.filter(paramVisible).length > 0 && (
+                <div>
+                  <div style={{ fontWeight: 700, color: "#224", marginBottom: 4, fontSize: 11, textTransform: "uppercase", letterSpacing: "0.04em" }}>
+                    Channel Parameters
+                  </div>
+                  <div style={{ display: "grid", gap: 3 }}>
+                    {params.channelLevel.filter(paramVisible).map(p => {
+                      // Determine actual value based on channel assignment
+                      const channelRow = channels.find(ch => ch.channel === p.channel_no);
+                      const isAssigned = channelRow && channelRow.tag; // Has a symbol assigned
+                      const actualValue = p.is_dynamic && !isAssigned ? (p.spare_value || "—") : (p.parameter_value || "—");
+                      const isDeactivated = p.is_dynamic && !isAssigned && p.spare_value === "0";
+
+                      return (
+                        <div key={p.id} style={{ display: "flex", gap: 8, fontSize: 11, color: "#446", alignItems: "center" }}>
+                          <span style={{ fontFamily: "monospace", fontWeight: 600, color: "#224", minWidth: 100 }}>
+                            {p.parameter_name}
+                          </span>
+                          <span style={{ fontFamily: "monospace", color: "#669", minWidth: 40 }}>
+                            {p.channel_type} {p.channel_no}
+                          </span>
+                          <span style={{ fontFamily: "monospace", color: isDeactivated ? "#d97706" : "#669" }}>
+                            = {actualValue}
+                          </span>
+                          {isDeactivated && (
+                            <span style={{ fontSize: 9, fontWeight: 600, color: "#d97706", background: "#fef3c7", padding: "2px 6px", borderRadius: 3, marginLeft: "auto" }}>
+                              DEACTIVATED
+                            </span>
+                          )}
+                          {p.is_dynamic && !isDeactivated && (
+                            <span style={{ fontSize: 9, fontWeight: 600, color: "#2563eb", background: "#dbeafe", padding: "2px 6px", borderRadius: 3, marginLeft: "auto" }}>
+                              {isAssigned ? "ASSIGNED" : "SPARE"}
+                            </span>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {/* Channels Tab */}
+      {activeTab === 'channels' && (
+      <div style={{ overflowY: "auto", maxHeight: "calc(100vh - 280px)" }}>
         {loading ? (
           <div style={{ padding: 24, textAlign: "center", color: "#aaa", fontSize: 13 }}>Loading…</div>
         ) : channels.length === 0 ? (
@@ -4560,6 +4757,7 @@ function SlotSignalPanel({ importId, stationAddr, slot, slotName, orderNo, templ
           </table>
         )}
       </div>
+      )}
     </div>
   );
 }
@@ -4585,6 +4783,33 @@ function miniBtn(bg, color) {
 function alertStyle(bg, border, color) {
   return { background: bg, border: `1px solid ${border}`, borderRadius: 6,
            padding: "10px 16px", marginBottom: 16, color };
+}
+
+// Tabular breakdown of stations involved in a "Duplicate stations" error — shows which
+// field(s) collided per station instead of forcing the user to parse a run-on sentence.
+function ConflictTable({ rows }) {
+  return (
+    <table style={{ marginTop: 8, borderCollapse: "collapse", fontSize: 12, width: "100%" }}>
+      <thead>
+        <tr style={{ borderBottom: "1px solid #e88" }}>
+          <th style={{ textAlign: "left", padding: "4px 8px" }}>Address</th>
+          <th style={{ textAlign: "left", padding: "4px 8px" }}>Name</th>
+          <th style={{ textAlign: "left", padding: "4px 8px" }}>IP</th>
+          <th style={{ textAlign: "left", padding: "4px 8px" }}>Conflict</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((r, i) => (
+          <tr key={i} style={{ borderBottom: "1px solid #f3d0d0" }}>
+            <td style={{ padding: "4px 8px", fontFamily: "var(--font-mono)" }}>{r.address}</td>
+            <td style={{ padding: "4px 8px", fontFamily: "var(--font-mono)" }}>{r.name || "—"}</td>
+            <td style={{ padding: "4px 8px", fontFamily: "var(--font-mono)" }}>{r.ip || "—"}</td>
+            <td style={{ padding: "4px 8px" }}>{r.reasons.join(", ")}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
 }
 
 function tagStyle(bg, color) {

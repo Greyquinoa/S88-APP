@@ -1,12 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
-import { AgGridReact } from "ag-grid-react";
-import { AllCommunityModule, ModuleRegistry, themeQuartz } from "ag-grid-community";
-import "ag-grid-community/styles/ag-grid.css";
-import "ag-grid-community/styles/ag-theme-quartz.css";
 import { listHwImports, listHwControllers, listHwFieldbuses, mrpGetDevices, mrpGetConfig, mrpSaveConfig, mrpDownloadCfg, mrpImportFromCfg } from "./api.js";
 import MRPTopologyView from "./MRPTopologyView.jsx";
-
-ModuleRegistry.registerModules([AllCommunityModule]);
 
 // MRP role definitions
 const ROLES = [
@@ -17,193 +11,6 @@ const ROLES = [
 
 function roleLabel(v) {
   return ROLES.find(r => r.value === v)?.label ?? "Off";
-}
-
-// ─── Device Roles Grid Component ──────────────────────────────────────────────
-function DeviceRolesGrid({ filteredDevices, roles, domainName, setRole }) {
-  const gridRef = useRef(null);
-
-  // Flatten devices into grid rows (one row per port pair)
-  const gridRows = useMemo(() => {
-    return filteredDevices.flatMap(dev => {
-      const currentRole = roles.get(dev.alias)?.role ?? 0;
-      const ports = dev.ports || [];
-      const pairs = [];
-      for (let i = 0; i < Math.max(ports.length, 1); i += 2) {
-        pairs.push(ports.slice(i, i + 2));
-      }
-      return pairs.map((pair, pairIdx) => ({
-        key: `${dev.alias}-${pairIdx}`,
-        alias: dev.alias,
-        ioAddress: dev.ioAddress,
-        rackSlot: dev.rackSlot,
-        isSwitch: dev.isSwitch,
-        pairIdx,
-        pairCount: pairs.length,
-        pair,
-        currentRole,
-        ringPort1: pair[0]?.label || (pair[0] ? `Port ${pair[0].subslot}` : null),
-        ringPort2: pair[1]?.label || (pair[1] ? `Port ${pair[1].subslot}` : null),
-      }));
-    });
-  }, [filteredDevices, roles]);
-
-  const theme = useMemo(
-    () =>
-      themeQuartz.withParams({
-        fontSize: 12,
-        rowHeight: 36,
-        headerHeight: 36,
-        fontFamily: "system-ui, -apple-system, sans-serif",
-        accentColor: "#2255cc",
-        browserColorScheme: "light",
-      }),
-    []
-  );
-
-  const columnDefs = useMemo(() => [
-    {
-      headerName: "Station / Device",
-      field: "alias",
-      sortable: true,
-      filter: "agTextColumnFilter",
-      floatingFilter: true,
-      resizable: true,
-      flex: 1.5,
-      minWidth: 180,
-      valueGetter: (p) => p.data.alias,
-      cellRenderer: (p) => (
-        p.data.pairIdx === 0 && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-            <div style={{ fontWeight: 600, color: "#224" }}>{p.data.alias}</div>
-            <div style={{ fontSize: 11, color: "#6b7280" }}>
-              {p.data.ioAddress != null ? `(${p.data.ioAddress})` : `rack ${p.data.rackSlot}`}
-              {p.data.isSwitch ? " SW" : ""}
-            </div>
-          </div>
-        )
-      ),
-    },
-    {
-      headerName: "MRP inst.",
-      field: "pairIdx",
-      sortable: true,
-      filter: false,
-      resizable: true,
-      width: 110,
-      valueGetter: (p) => p.data.pairIdx + 1,
-      cellStyle: { textAlign: "center", color: "#6b7280" },
-    },
-    {
-      headerName: "MRP Domain",
-      sortable: true,
-      filter: "agTextColumnFilter",
-      floatingFilter: true,
-      resizable: true,
-      width: 140,
-      valueGetter: (p) => (p.data.currentRole !== 0 ? domainName : ""),
-      cellRenderer: (p) =>
-        p.value ? (
-          <span style={{ color: "#447", fontWeight: 500 }}>{p.value}</span>
-        ) : (
-          <span style={{ color: "#d1d5db" }}>—</span>
-        ),
-    },
-    {
-      headerName: "Role",
-      sortable: false,
-      filter: false,
-      resizable: true,
-      width: 200,
-      cellRenderer: (p) =>
-        p.data.pairIdx === 0 && (
-          <select
-            value={p.data.currentRole}
-            onChange={(e) => setRole(p.data.alias, parseInt(e.target.value, 10))}
-            style={{
-              padding: "6px 10px",
-              borderRadius: 4,
-              border: "1px solid #d1d5db",
-              fontSize: 13,
-              fontFamily: "inherit",
-              cursor: "pointer",
-              backgroundColor: "#fff",
-              minWidth: 180,
-            }}
-          >
-            {ROLES.map(r => (
-              <option key={r.value} value={r.value}>
-                {r.label}
-              </option>
-            ))}
-          </select>
-        ),
-    },
-    {
-      headerName: "Ring port 1",
-      sortable: true,
-      filter: "agTextColumnFilter",
-      floatingFilter: true,
-      resizable: true,
-      width: 140,
-      valueGetter: (p) => p.data.ringPort1 || "",
-      cellRenderer: (p) =>
-        p.value ? (
-          <span style={{ color: "#447", fontFamily: "var(--font-mono, ui-monospace, monospace)", fontSize: 12 }}>
-            {p.value}
-          </span>
-        ) : (
-          <span style={{ color: "#d1d5db" }}>—</span>
-        ),
-    },
-    {
-      headerName: "Ring port 2",
-      sortable: true,
-      filter: "agTextColumnFilter",
-      floatingFilter: true,
-      resizable: true,
-      width: 140,
-      valueGetter: (p) => p.data.ringPort2 || "",
-      cellRenderer: (p) =>
-        p.value ? (
-          <span style={{ color: "#447", fontFamily: "var(--font-mono, ui-monospace, monospace)", fontSize: 12 }}>
-            {p.value}
-          </span>
-        ) : (
-          <span style={{ color: "#d1d5db" }}>—</span>
-        ),
-    },
-  ], [domainName, setRole]);
-
-  const defaultColDef = useMemo(() => ({ suppressMovable: false }), []);
-
-  const getRowStyle = useCallback(
-    (p) => {
-      if (p.data.currentRole !== 0) {
-        return { background: "#fffbeb", borderLeft: "3px solid #f59e0b" };
-      }
-      return {};
-    },
-    []
-  );
-
-  return (
-    <div style={{ borderRadius: 8, overflow: "hidden" }} className="ag-theme-quartz">
-      <AgGridReact
-        ref={gridRef}
-        theme={theme}
-        rowData={gridRows}
-        columnDefs={columnDefs}
-        defaultColDef={defaultColDef}
-        getRowStyle={getRowStyle}
-        headerHeight={36}
-        rowHeight={36}
-        suppressCellFocus={false}
-        animateRows={false}
-        domLayout="autoHeight"
-      />
-    </div>
-  );
 }
 
 // ─── Screen 3 wrapper (handles fullscreen) ────────────────────────────────────
@@ -901,12 +708,84 @@ export default function StepMRP({ projectId }) {
             <div style={styles.notice}>No devices found. Check that the baseline CFG has IOSUBSYSTEM devices.</div>
           )}
 
-          <DeviceRolesGrid
-            filteredDevices={filteredDevices}
-            roles={roles}
-            domainName={domainName}
-            setRole={setRole}
-          />
+          <table style={styles.table}>
+            <thead>
+              <tr>
+                <th style={styles.th}>Station / Device</th>
+                <th style={styles.th}>MRP inst.</th>
+                <th style={styles.th}>MRP Domain</th>
+                <th style={styles.th}>Role</th>
+                <th style={styles.th}>Ring port 1</th>
+                <th style={styles.th}>Ring port 2</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredDevices.flatMap(dev => {
+                const currentRole = roles.get(dev.alias)?.role ?? 0;
+                const ports = dev.ports || [];
+                // Split ports into pairs of 2; each pair = one row (one MRP instance)
+                const pairs = [];
+                for (let i = 0; i < Math.max(ports.length, 1); i += 2) {
+                  pairs.push(ports.slice(i, i + 2));
+                }
+
+                return pairs.map((pair, pairIdx) => (
+                  <tr
+                    key={`${dev.alias}-${pairIdx}`}
+                    style={currentRole !== 0 ? styles.rowActive : {}}
+                  >
+                    {/* Station/Device — only on first row for this device */}
+                    {pairIdx === 0 ? (
+                      <td style={styles.td} rowSpan={pairs.length}>
+                        <b>{dev.alias}</b>
+                        <span style={{ color: "#9ca3af", fontSize: 12, marginLeft: 6 }}>
+                          {dev.ioAddress != null ? `(${dev.ioAddress})` : `rack ${dev.rackSlot}`}
+                          {dev.isSwitch ? " SW" : ""}
+                        </span>
+                      </td>
+                    ) : null}
+
+                    {/* MRP inst — 1-based pair index */}
+                    <td style={{ ...styles.td, color: "#6b7280", fontSize: 13 }}>{pairIdx + 1}</td>
+
+                    {/* MRP Domain — show domain name when role is active */}
+                    <td style={{ ...styles.td, fontSize: 13 }}>
+                      {currentRole !== 0 ? domainName : <span style={{ color: "#d1d5db" }}>—</span>}
+                    </td>
+
+                    {/* Role — only on first row; subsequent rows are "Not a node in the ring" */}
+                    {pairIdx === 0 ? (
+                      <td style={styles.td} rowSpan={pairs.length}>
+                        <select
+                          style={styles.select}
+                          value={currentRole}
+                          onChange={e => setRole(dev.alias, parseInt(e.target.value, 10))}
+                        >
+                          {ROLES.map(r => (
+                            <option key={r.value} value={r.value}>{r.label}</option>
+                          ))}
+                        </select>
+                      </td>
+                    ) : null}
+
+                    {/* Ring port 1 */}
+                    <td style={{ ...styles.td, fontSize: 13 }}>
+                      {pair[0]
+                        ? <span>{pair[0].label || `Port ${pair[0].subslot}`}</span>
+                        : <span style={{ color: "#d1d5db" }}>—</span>}
+                    </td>
+
+                    {/* Ring port 2 */}
+                    <td style={{ ...styles.td, fontSize: 13 }}>
+                      {pair[1]
+                        ? <span>{pair[1].label || `Port ${pair[1].subslot}`}</span>
+                        : <span style={{ color: "#d1d5db" }}>—</span>}
+                    </td>
+                  </tr>
+                ));
+              })}
+            </tbody>
+          </table>
 
           <div style={styles.row}>
             <button style={styles.btnSecondary} onClick={() => setScreen(1)}>← Back</button>

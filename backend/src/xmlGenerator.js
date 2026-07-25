@@ -10,7 +10,16 @@ const mkBlock = () => `DT0003006D${_h8()}`;
 const mkVar   = () => `DT0003006E${_h8()}`;
 const mkMsg   = () => `DT0003003E${_h8()}`;
 const appId   = id => 'DT0000' + id.slice(6);
-const resetCtr = () => { _ctr = 0x00400000; };
+const resetCtr = () => { _ctr = 0x00400000; resetIOTagCtr(); };
+
+// ── IOTag ID generator ────────────────────────────────────────────────────────
+// Generate IOTag IDs following PCS7 convention: OD00113002:{unique hex}:{parent type}:{parent hex}
+let _iotagCtr = 0x00000000;
+const mkIOTag = (parentTypeHex, parentIdHex) => {
+  const unique = (_iotagCtr++).toString(16).padStart(8, '0').toUpperCase();
+  return `OD00113002:${unique}:${parentTypeHex}:${parentIdHex}`;
+};
+const resetIOTagCtr = () => { _iotagCtr = 0x00000000; };
 
 // ── Fixed project/hardware IDs (fallback defaults) ────────────────────────────
 const FX_DEFAULT = {
@@ -231,7 +240,10 @@ function emitMatrixInstanceLines(matrixDef, counters, preAllocatedId, fx) {
 //                 so destinations can look up source IDs
 // exposedVarIdOut: optional mutable map — filled with { varName -> varId } for vars
 //                 in varIdRequests[instanceName], so downstream instances can reference them
-function emitInstanceLines(inst, counters, preAllocatedId, instanceIdMap, fx, wireSpec, exposedVarIds, exposedVarIdOut) {
+// signalMap:      optional — { "<block>.<var>" -> { tag } } signal bindings for this
+//                 instance. When a var is bound, it is emitted as a signal variable
+//                 (<SignalName> + VariableType=Signal, no <Value>, no LinkList).
+function emitInstanceLines(inst, counters, preAllocatedId, instanceIdMap, fx, wireSpec, exposedVarIds, exposedVarIdOut, signalMap) {
   fx = fx || FX_DEFAULT;
   const lines = [];
   const { cmTypeDef, instanceName, enabledBlocks, samplingTime, libType, roleAssignments } = inst;
@@ -294,6 +306,25 @@ function emitInstanceLines(inst, counters, preAllocatedId, instanceIdMap, fx, wi
   if (activeBlocks.length || roleEntries.length) {
     lines.push(`\t\t\t\t\t\t<ObjectList>`);
     for (const blk of activeBlocks) {
+      // Block-omission rule: drop a block when it carries a REQUIRED dummy signal
+      // that went unmatched (no hardware bound) and has no real signal — i.e.
+      // "no block if required+unmatched". A real (hardware-matched) signal keeps
+      // the block; a non-required unmatched dummy leaves the block in place with
+      // the pin simply unbound. Dummies default to required when the flag is absent
+      // (back-compat with rules created before reconciliation existed).
+      const blockHasRealSignal = (blk.vars || []).some(v2 => {
+        const s = signalMap?.[`${blk.name}.${v2.name}`];
+        return s && !s.dummy;
+      });
+      const blockHasRequiredUnmatched = (blk.vars || []).some(v2 => {
+        const s = signalMap?.[`${blk.name}.${v2.name}`];
+        return s && s.dummy && (s.required ?? 1);
+      });
+      if (blockHasRequiredUnmatched && !blockHasRealSignal) {
+        // Required signal(s) for this block are unmatched → omit the block.
+        continue;
+      }
+
       const { id: bid, aid: baid } = blockIds[blk.name];
       counters.blocks++;
       lines.push(`\t\t\t\t\t\t\t<PlantHierarchyFolder Name="${esc(blk.name)}" Type="ControlModule" ID="${bid}">`);
@@ -334,6 +365,11 @@ function emitInstanceLines(inst, counters, preAllocatedId, instanceIdMap, fx, wi
             }
           }
 
+          // Signal binding: only REAL (non-dummy) signals emit to XML.
+          // Dummy signals never emit — they are internal coverage markers only.
+          const rawSig = signalMap?.[`${blk.name}.${v.name}`];
+          const sig = (rawSig && !rawSig.dummy) ? rawSig : null;
+
           lines.push(`\t\t\t\t\t\t\t\t\t<ControlVariable Name="${esc(v.name)}" Type="${esc(v.dir)}" ID="${vid}">`);
           lines.push(`\t\t\t\t\t\t\t\t\t\t<AppId AppName="SIMATIC" Value="${appId(vid)}"/>`);
           lines.push(`\t\t\t\t\t\t\t\t\t\t<AttributeList>`);
@@ -341,11 +377,19 @@ function emitInstanceLines(inst, counters, preAllocatedId, instanceIdMap, fx, wi
           if (v.dtype)       lines.push(`\t\t\t\t\t\t\t\t\t\t\t<DataType>${esc(v.dtype)}</DataType>`);
           if (v.enumeration) lines.push(`\t\t\t\t\t\t\t\t\t\t\t<Enumeration>${esc(v.enumeration)}</Enumeration>`);
           if (v.negation)    lines.push(`\t\t\t\t\t\t\t\t\t\t\t<Negation>true</Negation>`);
-          if (effectiveVal)  lines.push(`\t\t\t\t\t\t\t\t\t\t\t<Value>${esc(effectiveVal)}</Value>`);
-          if (v.vtype)       lines.push(`\t\t\t\t\t\t\t\t\t\t\t<VariableType>${esc(v.vtype)}</VariableType>`);
+          if (sig) {
+            lines.push(`\t\t\t\t\t\t\t\t\t\t\t<SignalName>${esc(sig.tag)}</SignalName>`);
+            lines.push(`\t\t\t\t\t\t\t\t\t\t\t<VariableType>Signal</VariableType>`);
+          } else {
+            if (effectiveVal)  lines.push(`\t\t\t\t\t\t\t\t\t\t\t<Value>${esc(effectiveVal)}</Value>`);
+            if (v.vtype)       lines.push(`\t\t\t\t\t\t\t\t\t\t\t<VariableType>${esc(v.vtype)}</VariableType>`);
+          }
           lines.push(`\t\t\t\t\t\t\t\t\t\t</AttributeList>`);
-          // Library-internal interconnections (within the same CM type)
-          if (resolvedLinks.length) {
+          // Library-internal interconnections (within the same CM type).
+          // Suppressed when the variable is signal-bound.
+          if (sig) {
+            // no LinkList for signal variables
+          } else if (resolvedLinks.length) {
             lines.push(`\t\t\t\t\t\t\t\t\t\t<LinkList>`);
             for (const tId of resolvedLinks)
               lines.push(`\t\t\t\t\t\t\t\t\t\t\t<InterconnectionSource TargetID="#${tId}"/>`);
@@ -408,7 +452,7 @@ function emitInstanceLines(inst, counters, preAllocatedId, instanceIdMap, fx, wi
 // `depth` is the tab depth of the folder's own opening line. Existing per-instance
 // baseline is 5 tabs, so for a folder at depth D the instances live at D+2 (inside
 // its ObjectList), and we prepend (D+2 - 5) extra tabs to each instance line.
-function emitFolder(b, folder, depth, childrenOf, instsByFolder, counters, useLegacyId, instanceIdMap, legacyPcId, fx, wireSpecs, exposedVarIds) {
+function emitFolder(b, folder, depth, childrenOf, instsByFolder, counters, useLegacyId, instanceIdMap, legacyPcId, fx, wireSpecs, exposedVarIds, signalMaps) {
   fx = fx || FX_DEFAULT;
   const prefix = '\t'.repeat(depth);
   const folderId = useLegacyId ? (legacyPcId || FX_DEFAULT.PC) : mkBlock();
@@ -430,7 +474,7 @@ function emitFolder(b, folder, depth, childrenOf, instsByFolder, counters, useLe
   const insts = instsByFolder[folder.id] || [];
   if (kids.length || insts.length) {
     b.raw(`${prefix}\t<ObjectList>`);
-    for (const kid of kids) emitFolder(b, kid, depth + 2, childrenOf, instsByFolder, counters, false, instanceIdMap, legacyPcId, fx, wireSpecs, exposedVarIds);
+    for (const kid of kids) emitFolder(b, kid, depth + 2, childrenOf, instsByFolder, counters, false, instanceIdMap, legacyPcId, fx, wireSpecs, exposedVarIds, signalMaps);
     if (insts.length) {
       const targetDepth = depth + 2;
       const baseDepth   = 5;
@@ -439,7 +483,8 @@ function emitFolder(b, folder, depth, childrenOf, instsByFolder, counters, useLe
         const instLines = inst.isMatrix
           ? emitMatrixInstanceLines(inst.matrixDef, counters, instanceIdMap?.[inst.instanceName], fx)
           : emitInstanceLines(inst, counters, instanceIdMap?.[inst.instanceName], instanceIdMap, fx,
-              wireSpecs?.[inst.instanceName], exposedVarIds, (exposedVarIds ? (exposedVarIds[inst.instanceName] ||= {}) : undefined));
+              wireSpecs?.[inst.instanceName], exposedVarIds, (exposedVarIds ? (exposedVarIds[inst.instanceName] ||= {}) : undefined),
+              signalMaps?.[inst.instanceName]);
         for (const l of instLines) b.raw(extra + l);
       }
     }
@@ -487,8 +532,11 @@ function buildWireSpecs(connGroups) {
 // instanceFolderMap: { [instanceName]: folderId }                      (optional)
 // projectConfig:     row from project_config table (optional — falls back to FX_DEFAULT)
 // connGroups:        composite connection groups (optional — see buildWireSpecs)
+// signalMaps:        signal-to-instance mappings (optional — additive). Shape:
+//                    { [instanceName]: { "<block>.<var>": { tag, varDtype, signalType } } }
+//                    When empty, output is byte-identical to the pre-feature export.
 // Returns: { xml: string, stats: { blocks, vars, msgs, links } }
-function generateXML(instances, projectName, hierarchy, instanceFolderMap, projectConfig, connGroups) {
+function generateXML(instances, projectName, hierarchy, instanceFolderMap, projectConfig, connGroups, signalMaps = {}) {
   resetCtr();
   const FX  = buildFX(projectConfig);
   const b   = makeBuilder();
@@ -536,7 +584,50 @@ function generateXML(instances, projectName, hierarchy, instanceFolderMap, proje
   b.raw(`\t\t\t\t\t\t\t<Attribute Name="SubDevice"><Value>0</Value></Attribute>`);
   b.raw(`\t\t\t\t\t\t\t<Attribute Name="SubSystem"><Value>0</Value></Attribute>`);
   b.raw(`\t\t\t\t\t\t</AttributeList>`);
-  b.raw(`\t\t\t\t\t\t<ObjectList><IOTagFolder ID="${FX.IOTAG}" Version="V6.0"/></ObjectList>`);
+
+  // ── IOTag Folder with reconciled signal tags ────────────────────────────────
+  // Collect all REAL (hardware-matched) signals from signalMaps and emit IOTag
+  // elements with resolved I/O addresses.
+  // Collect all REAL (hardware-matched) signals from signalMaps, deduplicating by tag
+  // name (multiple block-pins may bind the same physical signal).
+  const ioTagsSeen = new Set();
+  const ioTags = [];
+  for (const pins of Object.values(signalMaps || {})) {
+    for (const entry of Object.values(pins || {})) {
+      if (entry.dummy || !entry.tag || !entry.ioAddress) continue;
+      if (ioTagsSeen.has(entry.tag)) continue;
+      ioTagsSeen.add(entry.tag);
+      ioTags.push({
+        name:     entry.tag,
+        address:  entry.ioAddress,
+        comment:  entry.comment || null,
+        dataType: entry.varDtype || 'Bool',
+      });
+    }
+  }
+
+  // Extract parent IOTagFolder's type and ID for child IOTag IDs
+  const parentTypeHex = '00113001';
+  const parentIdHex = FX.IOTAG.split(':')[1] || '00006407';
+
+  b.raw(`\t\t\t\t\t\t<ObjectList>`);
+  b.raw(`\t\t\t\t\t\t\t<IOTagFolder ID="${FX.IOTAG}" Version="V6.0">`);
+  b.raw(`\t\t\t\t\t\t\t\t<ObjectList>`);
+  for (const tag of ioTags) {
+    const tagId = mkIOTag(parentTypeHex, parentIdHex);
+    b.raw(`\t\t\t\t\t\t\t\t\t<IOTag Name="${esc(tag.name)}" ID="${tagId}" Version="V6.0">`);
+    b.raw(`\t\t\t\t\t\t\t\t\t\t<AttributeList>`);
+    b.raw(`\t\t\t\t\t\t\t\t\t\t\t<Address>${esc(tag.address)}</Address>`);
+    b.raw(tag.comment
+      ? `\t\t\t\t\t\t\t\t\t\t\t<Comment>${esc(tag.comment)}</Comment>`
+      : `\t\t\t\t\t\t\t\t\t\t\t<Comment/>`);
+    b.raw(`\t\t\t\t\t\t\t\t\t\t\t<DataType>${esc(tag.dataType)}</DataType>`);
+    b.raw(`\t\t\t\t\t\t\t\t\t\t</AttributeList>`);
+    b.raw(`\t\t\t\t\t\t\t\t\t</IOTag>`);
+  }
+  b.raw(`\t\t\t\t\t\t\t\t</ObjectList>`);
+  b.raw(`\t\t\t\t\t\t\t</IOTagFolder>`);
+  b.raw(`\t\t\t\t\t\t</ObjectList>`);
   b.raw(`\t\t\t\t\t</DeviceItem>`);
   b.raw(`\t\t\t\t</ObjectList>`);
   b.raw(`\t\t\t</Device>`);
@@ -597,7 +688,7 @@ function generateXML(instances, projectName, hierarchy, instanceFolderMap, proje
     }
 
     for (const root of roots) {
-      emitFolder(b, root, 3, childrenOf, instsByFolder, counters, false, instanceIdMap, FX.PC, FX, wireSpecs, exposedVarIds);
+      emitFolder(b, root, 3, childrenOf, instsByFolder, counters, false, instanceIdMap, FX.PC, FX, wireSpecs, exposedVarIds, signalMaps);
     }
   } else {
     // Legacy: single Process cell(1) containing all instances (byte-identical to pre-feature output).
@@ -610,7 +701,8 @@ function generateXML(instances, projectName, hierarchy, instanceFolderMap, proje
       const instLines = inst.isMatrix
         ? emitMatrixInstanceLines(inst.matrixDef, counters, instanceIdMap[inst.instanceName], FX)
         : emitInstanceLines(inst, counters, instanceIdMap[inst.instanceName], instanceIdMap, FX,
-            wireSpecs[inst.instanceName], exposedVarIds, (exposedVarIds[inst.instanceName] ||= {}));
+            wireSpecs[inst.instanceName], exposedVarIds, (exposedVarIds[inst.instanceName] ||= {}),
+            signalMaps[inst.instanceName]);
       for (const l of instLines) b.raw(l);
     }
     b.raw(`\t\t\t\t</ObjectList>`);

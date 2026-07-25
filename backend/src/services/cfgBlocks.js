@@ -66,8 +66,8 @@ function deviceHeaderBlock({ ioNo, addr, imOrder, imVersion, name, posX, posY })
 }
 
 // ── SLOT 0 (IM head, AUTOCREATED) with IP + diagnostic address ────────────────
-function slot0Block({ ioNo, addr, imOrder, name, hexIp, hexRouter, diag }) {
-  return [
+function slot0Block({ ioNo, addr, imOrder, name, hexIp, hexRouter, diag, mlfb }) {
+  const lines = [
     `IOSUBSYSTEM ${ioNo}, IOADDRESS ${addr}, SLOT 0, "${imOrder}", "${name}"`,
     `AUTOCREATED `,
     `BEGIN `,
@@ -92,12 +92,18 @@ function slot0Block({ ioNo, addr, imOrder, name, hexIp, hexRouter, diag }) {
     `  CREATOR ""`,
     `  COMMENT ""`,
     `  IRT_GROUP_NR "1"`,
+  ];
+  if (mlfb) {
+    lines.push(`  MLFB "${mlfb}"`);
+  }
+  lines.push(
     `LOCAL_IN_ADDRESSES `,
     `  ADDRESS  ${diag}, 0, 0, 0, 0, 0`,
     `PARAMETER `,
     `  Option_Handling, "0"`,
     `END `,
-  ].join('\n');
+  );
+  return lines.join('\n');
 }
 
 // ── SLOT 0 SUBSLOT 1 (PN-IO interface submodule, AUTOCREATED) ─────────────────
@@ -214,7 +220,7 @@ function portBlock({ ioNo, addr, subslot, portLabel, portOrder, diag }) {
  *                       ['LOCAL_OUT_ADDRESSES', '  ADDRESS  512, 0, 8, 0, 2, 0']
  * @param paramLines    optional array, e.g. ['PARAMETER', '  POTENTIAL_GROUP, "NEW_GROUP"']
  */
-function ioModuleBlock({ ioNo, addr, slot, order, version, name, redundant, addressLines, paramLines }) {
+function ioModuleBlock({ ioNo, addr, slot, order, version, name, redundant, addressLines, paramLines, mlfb }) {
   const ver = version ? ` "${version}"` : '';
   const out = [
     `IOSUBSYSTEM ${ioNo}, IOADDRESS ${addr}, SLOT ${slot}, "${order}"${ver}, "${name}"`,
@@ -240,6 +246,10 @@ function ioModuleBlock({ ioNo, addr, slot, order, version, name, redundant, addr
     `  COMMENT ""`,
     `  PLANT_DESIGNATION ""`,
   );
+  // Include MLFB (module type ID) if present
+  if (mlfb) {
+    out.push(`  MLFB "${mlfb}"`);
+  }
   if (addressLines && addressLines.length) {
     // Keyword lines (LOCAL_IN_ADDRESSES, LOCAL_OUT_ADDRESSES, PARAMETER) get trailing space
     out.push(...addressLines.map(l =>

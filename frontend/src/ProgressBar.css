@@ -1,0 +1,50 @@
+/* Top-pinned, non-blocking generation progress bar */
+
+.app-progress {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  background: var(--color-background-primary, #ffffff);
+  border-bottom: 0.5px solid var(--color-border-tertiary, rgba(0, 0, 0, 0.1));
+  padding: 8px 12px 6px;
+  margin-bottom: 8px;
+}
+
+.app-progress-track {
+  position: relative;
+  height: 6px;
+  width: 100%;
+  background: var(--color-background-secondary, #f5f5f5);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.app-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #0C447C, #2f79c4);
+  border-radius: 999px;
+  transition: width 0.25s ease;
+}
+
+.app-progress-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--color-text-secondary, #6b7280);
+}
+
+.app-progress-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-progress-pct {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--color-text-primary, #1a1a1a);
+  margin-left: 12px;
+  flex-shrink: 0;
+}

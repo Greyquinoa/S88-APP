@@ -10,11 +10,14 @@ const { generateCfg, hexToIp } = require('../services/cfgGenerator');
 const { parseCfgForCatalogue } = require('../services/cfgCatalogueParser');
 const { parseMrpConfig } = require('../services/mrpCfgParser');
 const { loadStationAutoSlotConfig } = require('../services/autoSlotResolver');
+const ModuleParameterExtractor = require('../services/moduleParameterExtractor');
+const ModuleParameterDb = require('../services/moduleParameterDb');
+const { findStationConflicts, loadExistingStations, buildConflictTable } = require('../services/stationUniqueness');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
-function err(res, code, msg) { return res.status(code).json({ error: msg }); }
+function err(res, code, msg, extra) { return res.status(code).json({ error: msg, ...(extra || {}) }); }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
@@ -30,37 +33,37 @@ router.get('/utils/hex-to-ip', (req, res) => {
 // ── Signal Types ──────────────────────────────────────────────────────────────
 
 // GET /signal-types  — return all signal types ordered by sort_order
-router.get('/signal-types', (_req, res) => {
+router.get('/signal-types', async (_req, res) => {
   try {
     const db   = getDb();
-    const rows = db.prepare('SELECT name FROM hw_signal_types ORDER BY sort_order, name').all();
+    const rows = await db.prepare('SELECT name FROM hw_signal_types ORDER BY sort_order, name').all();
     res.json(rows.map(r => r.name));
   } catch (e) { err(res, 500, e.message); }
 });
 
 // POST /signal-types  — add a new custom signal type (idempotent)
-router.post('/signal-types', (req, res) => {
+router.post('/signal-types', async (req, res) => {
   try {
     const name = (req.body.name || '').trim().toUpperCase();
     if (!name) return err(res, 400, 'name required');
     const db = getDb();
-    db.prepare('INSERT OR IGNORE INTO hw_signal_types (name) VALUES (?)').run(name);
-    const rows = db.prepare('SELECT name FROM hw_signal_types ORDER BY sort_order, name').all();
+    await db.prepare('INSERT INTO hw_signal_types (name) VALUES (?) ON CONFLICT (name) DO NOTHING').run(name);
+    const rows = await db.prepare('SELECT name FROM hw_signal_types ORDER BY sort_order, name').all();
     res.json(rows.map(r => r.name));
   } catch (e) { err(res, 500, e.message); }
 });
 
 // ── Module Templates ──────────────────────────────────────────────────────────
 
-router.get('/module-templates', (_req, res) => {
+router.get('/module-templates', async (_req, res) => {
   try {
     const db   = getDb();
-    const rows = db.prepare('SELECT * FROM hw_module_templates ORDER BY family, display_name').all();
+    const rows = await db.prepare('SELECT * FROM hw_module_templates ORDER BY family, display_name').all();
     res.json(rows);
   } catch (e) { err(res, 500, e.message); }
 });
 
-router.post('/module-templates', (req, res) => {
+router.post('/module-templates', async (req, res) => {
   try {
     const db = getDb();
     const {
@@ -84,14 +87,14 @@ router.post('/module-templates', (req, res) => {
     // Fall back to (order_no, hw_category) only when no id is given (fresh upsert from import).
     let existing = null;
     if (id != null) {
-      existing = db.prepare('SELECT id FROM hw_module_templates WHERE id=?').get(id);
+      existing = await db.prepare('SELECT id FROM hw_module_templates WHERE id=?').get(id);
     } else {
-      existing = db.prepare(
-        'SELECT id FROM hw_module_templates WHERE order_no=? AND (hw_category IS ? OR hw_category=?)'
+      existing = await db.prepare(
+        'SELECT id FROM hw_module_templates WHERE order_no=? AND (hw_category IS NOT DISTINCT FROM ? OR hw_category=?)'
       ).get(order_no, hw_category || null, hw_category || null);
     }
     if (existing) {
-      db.prepare(`UPDATE hw_module_templates SET
+      await db.prepare(`UPDATE hw_module_templates SET
         order_no=?, display_name=?, family=?, signal_type=?, channel_count=?,
         input_bytes=?, output_bytes=?, in_addr_fmt=?, out_addr_fmt=?,
         param_template=?, version=?, gsdml_file=?, dap_id=?, hw_category=?, subslot_defaults=?, port_config=?,
@@ -104,7 +107,7 @@ router.post('/module-templates', (req, res) => {
       );
       res.json({ id: existing.id, updated: true });
     } else {
-      const r = db.prepare(`INSERT INTO hw_module_templates
+      const r = await db.prepare(`INSERT INTO hw_module_templates
         (order_no, display_name, family, signal_type, channel_count, input_bytes, output_bytes,
          in_addr_fmt, out_addr_fmt, param_template, version, gsdml_file, dap_id, hw_category, subslot_defaults, port_config,
          in_identifier, out_identifier)
@@ -120,14 +123,14 @@ router.post('/module-templates', (req, res) => {
 });
 
 // GET /module-templates/:id/usage — list every station that uses this module
-router.get('/module-templates/:id/usage', (req, res) => {
+router.get('/module-templates/:id/usage', async (req, res) => {
   try {
     const db  = getDb();
     const id  = parseInt(req.params.id, 10);
-    const tpl = db.prepare('SELECT order_no, display_name FROM hw_module_templates WHERE id=?').get(id);
+    const tpl = await db.prepare('SELECT order_no, display_name FROM hw_module_templates WHERE id=?').get(id);
     if (!tpl) return err(res, 404, 'Module template not found');
 
-    const rows = db.prepare(`
+    const rows = await db.prepare(`
       SELECT hs.hw_import_id, hi.excel_name, p.name AS project_name,
              hs.station_address, hs.station_name, hs.slot,
              COUNT(*) AS row_count
@@ -135,25 +138,25 @@ router.get('/module-templates/:id/usage', (req, res) => {
       JOIN hw_imports hi ON hi.id = hs.hw_import_id
       LEFT JOIN projects p ON p.id = hi.project_id
       WHERE hs.module_order_no = ?
-      GROUP BY hs.hw_import_id, hs.station_address, hs.slot
+      GROUP BY hs.hw_import_id, hi.excel_name, p.name, hs.station_address, hs.station_name, hs.slot
       ORDER BY hs.hw_import_id, hs.station_address, hs.slot
     `).all(tpl.order_no);
 
-    res.json({ order_no: tpl.order_no, display_name: tpl.display_name, usage: rows });
+    res.json({ order_no: tpl.order_no, display_name: tpl.display_name, usage: rows.map(r => ({ ...r, row_count: Number(r.row_count) })) });
   } catch (e) { err(res, 500, e.message); }
 });
 
 // DELETE /module-templates/:id — remove a catalogue entry if not referenced in any import
-router.delete('/module-templates/:id', (req, res) => {
+router.delete('/module-templates/:id', async (req, res) => {
   try {
     const db  = getDb();
     const id  = parseInt(req.params.id, 10);
-    const tpl = db.prepare('SELECT order_no, display_name FROM hw_module_templates WHERE id=?').get(id);
+    const tpl = await db.prepare('SELECT order_no, display_name FROM hw_module_templates WHERE id=?').get(id);
     if (!tpl) return err(res, 404, 'Module template not found');
-    const { n } = db.prepare('SELECT COUNT(*) AS n FROM hw_signals WHERE module_order_no=?').get(tpl.order_no);
-    if (n > 0)
+    const { n } = await db.prepare('SELECT COUNT(*) AS n FROM hw_signals WHERE module_order_no=?').get(tpl.order_no);
+    if (Number(n) > 0)
       return err(res, 409, `Cannot delete — "${tpl.order_no}" is used in ${n} signal row(s). Remove it from all stations first.`);
-    db.prepare('DELETE FROM hw_module_templates WHERE id=?').run(id);
+    await db.prepare('DELETE FROM hw_module_templates WHERE id=?').run(id);
     res.json({ ok: true });
   } catch (e) { err(res, 500, e.message); }
 });
@@ -161,15 +164,15 @@ router.delete('/module-templates/:id', (req, res) => {
 // ── Tier 2 Hardware Resolution (Protocol + SignalType → Card MLFB) ────────────────
 
 // GET /hardware-resolution — List all mappings with pagination
-router.get('/hardware-resolution', (req, res) => {
+router.get('/hardware-resolution', async (req, res) => {
   try {
     const db = getDb();
     const page = parseInt(req.query.page, 10) || 0;
     const limit = parseInt(req.query.limit, 10) || 50;
     const offset = page * limit;
 
-    const total = db.prepare('SELECT COUNT(*) AS n FROM hw_hardware_resolution').get().n;
-    const rows = db.prepare(`
+    const total = Number((await db.prepare('SELECT COUNT(*) AS n FROM hw_hardware_resolution').get()).n);
+    const rows = await db.prepare(`
       SELECT hr.id, hr.protocol, hr.signal_type, hr.card_mlfb, hr.station_mlfb, hr.description, hr.created_at,
              ht.display_name, ht.family
       FROM hw_hardware_resolution hr
@@ -183,7 +186,7 @@ router.get('/hardware-resolution', (req, res) => {
 });
 
 // POST /hardware-resolution — Add or update a mapping
-router.post('/hardware-resolution', (req, res) => {
+router.post('/hardware-resolution', async (req, res) => {
   try {
     const db = getDb();
     const { id, protocol, signal_type, card_mlfb, station_mlfb, description } = req.body;
@@ -194,19 +197,19 @@ router.post('/hardware-resolution', (req, res) => {
 
     // If id provided: update by id
     if (id) {
-      db.prepare('UPDATE hw_hardware_resolution SET protocol=?, signal_type=?, card_mlfb=?, station_mlfb=?, description=? WHERE id=?')
+      await db.prepare('UPDATE hw_hardware_resolution SET protocol=?, signal_type=?, card_mlfb=?, station_mlfb=?, description=? WHERE id=?')
         .run(protocol.trim(), signal_type.trim(), card_mlfb.trim(), station_mlfb.trim(), description?.trim() || null, id);
       return res.json({ ok: true, action: 'updated' });
     }
 
     // No id: insert or update by unique key
     try {
-      db.prepare('INSERT INTO hw_hardware_resolution (protocol, signal_type, card_mlfb, station_mlfb, description) VALUES (?,?,?,?,?)')
+      await db.prepare('INSERT INTO hw_hardware_resolution (protocol, signal_type, card_mlfb, station_mlfb, description) VALUES (?,?,?,?,?)')
         .run(protocol.trim(), signal_type.trim(), card_mlfb.trim(), station_mlfb.trim(), description?.trim() || null);
       res.status(201).json({ ok: true, action: 'inserted' });
     } catch (e) {
-      if (e.message.includes('UNIQUE')) {
-        db.prepare('UPDATE hw_hardware_resolution SET card_mlfb=?, station_mlfb=?, description=? WHERE protocol=? AND signal_type=?')
+      if (e.message.toLowerCase().includes('unique') || e.code === '23505') {
+        await db.prepare('UPDATE hw_hardware_resolution SET card_mlfb=?, station_mlfb=?, description=? WHERE protocol=? AND signal_type=?')
           .run(card_mlfb.trim(), station_mlfb.trim(), description?.trim() || null, protocol.trim(), signal_type.trim());
         res.json({ ok: true, action: 'updated' });
       } else {
@@ -217,22 +220,22 @@ router.post('/hardware-resolution', (req, res) => {
 });
 
 // DELETE /hardware-resolution/:id — Remove a mapping
-router.delete('/hardware-resolution/:id', (req, res) => {
+router.delete('/hardware-resolution/:id', async (req, res) => {
   try {
     const db = getDb();
     const id = parseInt(req.params.id, 10);
-    const row = db.prepare('SELECT protocol, signal_type FROM hw_hardware_resolution WHERE id=?').get(id);
+    const row = await db.prepare('SELECT protocol, signal_type FROM hw_hardware_resolution WHERE id=?').get(id);
     if (!row) return err(res, 404, 'Mapping not found');
-    db.prepare('DELETE FROM hw_hardware_resolution WHERE id=?').run(id);
+    await db.prepare('DELETE FROM hw_hardware_resolution WHERE id=?').run(id);
     res.json({ ok: true, deleted: { protocol: row.protocol, signal_type: row.signal_type } });
   } catch (e) { err(res, 500, e.message); }
 });
 
 // GET /hardware-resolution/export — Export all mappings as CSV
-router.get('/hardware-resolution/export', (req, res) => {
+router.get('/hardware-resolution/export', async (req, res) => {
   try {
     const db = getDb();
-    const rows = db.prepare(`
+    const rows = await db.prepare(`
       SELECT protocol, signal_type, card_mlfb, station_mlfb, description
       FROM hw_hardware_resolution
       ORDER BY protocol, signal_type
@@ -248,7 +251,7 @@ router.get('/hardware-resolution/export', (req, res) => {
 });
 
 // POST /hardware-resolution/import — Bulk import from CSV
-router.post('/hardware-resolution/import', upload.single('csv'), (req, res) => {
+router.post('/hardware-resolution/import', upload.single('csv'), async (req, res) => {
   try {
     if (!req.file) return err(res, 400, 'No CSV file uploaded');
     const db = getDb();
@@ -273,8 +276,13 @@ router.post('/hardware-resolution/import', upload.single('csv'), (req, res) => {
       const [protocol, signal_type, card_mlfb, station_mlfb, description] = parts;
       try {
         // Upsert
-        db.prepare('INSERT OR REPLACE INTO hw_hardware_resolution (protocol, signal_type, card_mlfb, station_mlfb, description) VALUES (?,?,?,?,?)')
-          .run(protocol?.trim() || '', signal_type?.trim() || '', card_mlfb?.trim() || '', station_mlfb?.trim() || '', description?.trim() || null);
+        await db.prepare(`
+          INSERT INTO hw_hardware_resolution (protocol, signal_type, card_mlfb, station_mlfb, description) VALUES (?,?,?,?,?)
+          ON CONFLICT (protocol, signal_type) DO UPDATE SET
+            card_mlfb = EXCLUDED.card_mlfb,
+            station_mlfb = EXCLUDED.station_mlfb,
+            description = EXCLUDED.description
+        `).run(protocol?.trim() || '', signal_type?.trim() || '', card_mlfb?.trim() || '', station_mlfb?.trim() || '', description?.trim() || null);
         imported++;
       } catch (e) {
         errors.push(`Row ${i}: ${e.message}`);
@@ -291,7 +299,7 @@ router.post('/hardware-resolution/import', upload.single('csv'), (req, res) => {
 // POST /module-templates/parse-cfg
 // Upload a .cfg file, parse IOSUBSYSTEM blocks, return candidates + conflict flags.
 // Does NOT write to DB — preview only.
-router.post('/module-templates/parse-cfg', upload.single('cfg'), (req, res) => {
+router.post('/module-templates/parse-cfg', upload.single('cfg'), async (req, res) => {
   try {
     if (!req.file) return err(res, 400, 'No file uploaded');
     const text = req.file.buffer.toString('utf8');
@@ -300,11 +308,12 @@ router.post('/module-templates/parse-cfg', upload.single('cfg'), (req, res) => {
 
     // Check each candidate against existing catalogue
     const db = getDb();
-    const withStatus = candidates.map(c => {
-      if (c.parseError) return { ...c, status: 'error' };
-      const existing = db.prepare('SELECT id, display_name, version FROM hw_module_templates WHERE order_no=?').get(c.order_no);
-      return { ...c, status: existing ? 'conflict' : 'new', existingName: existing ? existing.display_name : null };
-    });
+    const withStatus = [];
+    for (const c of candidates) {
+      if (c.parseError) { withStatus.push({ ...c, status: 'error' }); continue; }
+      const existing = await db.prepare('SELECT id, display_name, version FROM hw_module_templates WHERE order_no=?').get(c.order_no);
+      withStatus.push({ ...c, status: existing ? 'conflict' : 'new', existingName: existing ? existing.display_name : null });
+    }
 
     res.json({ warning: error, candidates: withStatus });
   } catch (e) { err(res, 500, e.message); }
@@ -313,7 +322,7 @@ router.post('/module-templates/parse-cfg', upload.single('cfg'), (req, res) => {
 // POST /module-templates/bulk-upsert
 // Body: { devices: [{ order_no, display_name, family, ..., action: 'add'|'overwrite'|'skip' }] }
 // Writes confirmed devices to the catalogue.
-router.post('/module-templates/bulk-upsert', (req, res) => {
+router.post('/module-templates/bulk-upsert', async (req, res) => {
   try {
     const db = getDb();
     const { devices } = req.body;
@@ -333,15 +342,17 @@ router.post('/module-templates/bulk-upsert', (req, res) => {
       input_bytes=?, output_bytes=?, in_addr_fmt=?, out_addr_fmt=?,
       param_template=?, version=?, gsdml_file=?, dap_id=?, hw_category=?, subslot_defaults=?, port_config=?,
       in_identifier=?, out_identifier=?, mlfb=?
-      WHERE order_no=? AND (hw_category IS ? OR hw_category=?)`);
+      WHERE order_no=? AND (hw_category IS NOT DISTINCT FROM ? OR hw_category=?)`);
 
-    const upsert = db.transaction((devices) => {
+    let paramRows = 0;   // ADDITIVE: count of normalized parameter rows written
+
+    const upsert = db.transaction(async (devices) => {
       for (const d of devices) {
         if (d.action === 'skip') { skipped++; continue; }
         // Existence check must match the UNIQUE (order_no, hw_category) constraint.
         // The same order_no can exist as station, slot, and subslot — each is a distinct row.
-        const existing = db.prepare(
-          'SELECT id FROM hw_module_templates WHERE order_no=? AND (hw_category IS ? OR hw_category=?)'
+        const existing = await db.prepare(
+          'SELECT id FROM hw_module_templates WHERE order_no=? AND (hw_category IS NOT DISTINCT FROM ? OR hw_category=?)'
         ).get(d.order_no, d.hw_category || null, d.hw_category || null);
         if (existing && d.action !== 'overwrite') { skipped++; continue; }
 
@@ -359,32 +370,55 @@ router.post('/module-templates/bulk-upsert', (req, res) => {
           inIdent, outIdent, d.mlfb || null,
         ];
 
+        // Resolve the template id (existing on overwrite, or the new insert's rowid)
+        let templateId;
         if (existing) {
           // Update by unique (order_no, hw_category) pair, not order_no alone
-          updSql.run(...vals, d.order_no, d.hw_category || null, d.hw_category || null);
+          await updSql.run(...vals, d.order_no, d.hw_category || null, d.hw_category || null);
           overwritten++;
+          templateId = existing.id;
         } else {
-          insSql.run(d.order_no, ...vals);
+          const r = await insSql.run(d.order_no, ...vals);
           added++;
+          templateId = r.lastInsertRowid;
+        }
+
+        // ── ADDITIVE: normalize param_template into hw_module_parameters ──────────
+        // Existing param_template text column is left untouched; this is a parallel,
+        // queryable representation linked to the template via template_id.
+        if (templateId && d.param_template) {
+          try {
+            const extractor = new ModuleParameterExtractor();
+            const params = extractor.parseParamTemplate(d.param_template);
+            if (params.length > 0) {
+              // Clear stale rows first so re-import stays idempotent
+              await ModuleParameterDb.deleteParametersForTemplate(templateId);
+              paramRows += await ModuleParameterDb.insertModuleParameters(templateId, params);
+            }
+          } catch (pErr) {
+            console.warn(`[Catalogue] Parameter extraction skipped for ${d.order_no}:`, pErr.message);
+          }
         }
       }
     });
 
-    upsert(devices);
-    res.json({ ok: true, added, overwritten, skipped });
+    await upsert(devices);
+    console.log(`[Catalogue] bulk-upsert: added=${added} overwritten=${overwritten} skipped=${skipped} paramRows=${paramRows}`);
+    res.json({ ok: true, added, overwritten, skipped, paramRows });
   } catch (e) { err(res, 500, e.message); }
 });
 
 // ── HW Imports per project ────────────────────────────────────────────────────
 
-router.get('/project/:id/imports', (req, res) => {
+router.get('/project/:id/imports', async (req, res) => {
   try {
     const db        = getDb();
     const projectId = parseInt(req.params.id, 10);
-    const rows = db.prepare(
+    const rows = await db.prepare(
       'SELECT id, excel_name, status, imported_at, baseline_info, baseline_cfg FROM hw_imports WHERE project_id=? ORDER BY id DESC'
     ).all(projectId);
-    res.json(rows.map(r => {
+    const out = [];
+    for (const r of rows) {
       const info = r.baseline_info ? JSON.parse(r.baseline_info) : null;
       // Back-fill pipMappings for records stored before this feature was added
       if (info && !info.pipMappings && r.baseline_cfg) {
@@ -392,12 +426,13 @@ router.get('/project/:id/imports', (req, res) => {
           const parsed = parseCfg(r.baseline_cfg);
           info.pipMappings = parsed.pipMappings || [];
           // Persist the enriched baseline_info so future loads are instant
-          db.prepare('UPDATE hw_imports SET baseline_info=? WHERE id=?')
+          await db.prepare('UPDATE hw_imports SET baseline_info=? WHERE id=?')
             .run(JSON.stringify(info), r.id);
         } catch (_) { info.pipMappings = []; }
       }
-      return { id: r.id, excel_name: r.excel_name, status: r.status, imported_at: r.imported_at, baseline_info: info };
-    }));
+      out.push({ id: r.id, excel_name: r.excel_name, status: r.status, imported_at: r.imported_at, baseline_info: info });
+    }
+    res.json(out);
   } catch (e) { err(res, 500, e.message); }
 });
 
@@ -406,7 +441,7 @@ router.post('/project/:id/upload-baseline', upload.single('baseline'), async (re
   try {
     const db        = getDb();
     const projectId = parseInt(req.params.id, 10);
-    if (!db.prepare('SELECT id FROM projects WHERE id=?').get(projectId))
+    if (!(await db.prepare('SELECT id FROM projects WHERE id=?').get(projectId)))
       return err(res, 404, 'Project not found');
     if (!req.file) return err(res, 400, 'No file uploaded');
 
@@ -428,14 +463,14 @@ router.post('/project/:id/upload-baseline', upload.single('baseline'), async (re
       pipMappings:   parsed.pipMappings,   // [{pipNo, ob, executionTime, timeScale}]
     };
 
-    const existing = db.prepare('SELECT id FROM hw_imports WHERE project_id=? ORDER BY id DESC LIMIT 1').get(projectId);
+    const existing = await db.prepare('SELECT id FROM hw_imports WHERE project_id=? ORDER BY id DESC LIMIT 1').get(projectId);
     let importId;
     if (existing) {
-      db.prepare('UPDATE hw_imports SET baseline_cfg=?, status=?, baseline_info=? WHERE id=?')
+      await db.prepare('UPDATE hw_imports SET baseline_cfg=?, status=?, baseline_info=? WHERE id=?')
         .run(cfgText, 'pending', JSON.stringify(baselineInfo), existing.id);
       importId = existing.id;
     } else {
-      const r = db.prepare(
+      const r = await db.prepare(
         'INSERT INTO hw_imports (project_id, baseline_cfg, status, baseline_info) VALUES (?,?,?,?)'
       ).run(projectId, cfgText, 'pending', JSON.stringify(baselineInfo));
       importId = r.lastInsertRowid;
@@ -465,16 +500,16 @@ router.post('/project/:id/upload-baseline', upload.single('baseline'), async (re
 
     // Match by station name so re-uploading the same CFG updates the same record
     const existingCtrl = parsed.stationName
-      ? db.prepare('SELECT id FROM hw_controllers WHERE project_id=? AND T16_Controller_TagName=?')
+      ? await db.prepare('SELECT id FROM hw_controllers WHERE project_id=? AND T16_Controller_TagName=?')
           .get(projectId, parsed.stationName)
-      : db.prepare('SELECT id FROM hw_controllers WHERE project_id=? ORDER BY id LIMIT 1').get(projectId);
+      : await db.prepare('SELECT id FROM hw_controllers WHERE project_id=? ORDER BY id LIMIT 1').get(projectId);
 
     let controllerId;
     if (existingCtrl) {
-      db.prepare(`UPDATE hw_controllers SET
+      await db.prepare(`UPDATE hw_controllers SET
         T16_Controller_TagName=?, T16_Station_Type=?,
         T15_IP_Address=?, T50_Rack_Order_No=?, T50_Rack_Name=?,
-        T50_PS_Order_No=?, T50_PS_Name=?, updated_at=datetime('now')
+        T50_PS_Order_No=?, T50_PS_Name=?, updated_at=NOW()
         WHERE id=?`).run(
         ctrlFields.T16_Controller_TagName, ctrlFields.T16_Station_Type,
         ctrlFields.T15_IP_Address,
@@ -484,7 +519,7 @@ router.post('/project/:id/upload-baseline', upload.single('baseline'), async (re
       );
       controllerId = existingCtrl.id;
     } else {
-      const r = db.prepare(`INSERT INTO hw_controllers
+      const r = await db.prepare(`INSERT INTO hw_controllers
         (project_id, T16_Controller_TagName, T16_Station_Type, T15_IP_Address,
          T50_Rack_Order_No, T50_Rack_Name, T50_PS_Order_No, T50_PS_Name)
         VALUES (?,?,?,?,?,?,?,?)`).run(
@@ -498,12 +533,12 @@ router.post('/project/:id/upload-baseline', upload.single('baseline'), async (re
     }
 
     // Replace fieldbuses: one row per PN IO controller found in the CFG
-    db.prepare('DELETE FROM hw_fieldbuses WHERE hw_controller_id=?').run(controllerId);
+    await db.prepare('DELETE FROM hw_fieldbuses WHERE hw_controller_id=?').run(controllerId);
     const fbIns = db.prepare(`INSERT INTO hw_fieldbuses
       (hw_controller_id, INT_DP_Subsystem, T50_Fieldbus_Name, T15_IP_Address)
       VALUES (?,?,?,?)`);
     for (const c of parsed.ioControllers) {
-      fbIns.run(controllerId, c.no, c.subnetName || null, c.ip || null);
+      await fbIns.run(controllerId, c.no, c.subnetName || null, c.ip || null);
     }
 
     res.json({ importId, ...baselineInfo });
@@ -513,11 +548,11 @@ router.post('/project/:id/upload-baseline', upload.single('baseline'), async (re
 // POST /api/hw-config/imports/:id/backfill-from-cfg
 // Accepts a generated CFG file upload and populates hw_signals + hw_slot_subslots
 // from its device blocks — a full round-trip import without needing an Excel sheet.
-router.post('/imports/:id/backfill-from-cfg', upload.single('cfg'), (req, res) => {
+router.post('/imports/:id/backfill-from-cfg', upload.single('cfg'), async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id, 10);
-    const hwImport = db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
+    const hwImport = await db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
     if (!hwImport) return err(res, 404, 'HW import not found');
     if (!req.file)  return err(res, 400, 'No CFG file uploaded');
 
@@ -529,30 +564,50 @@ router.post('/imports/:id/backfill-from-cfg', upload.single('cfg'), (req, res) =
       return err(res, 400, `No IO devices found in uploaded CFG. Sample IOSUBSYSTEM lines: ${JSON.stringify(ioLines)}`);
     }
 
+    // Additive import: validate the incoming CFG stations against the stations already
+    // stored for this import (and each other) for uniqueness of address / name / IP.
+    // Reject the whole backfill on any collision; add nothing.
+    const incomingCfgStations = new Map();
+    for (const dev of devices) {
+      if (dev.address == null) continue;
+      if (!incomingCfgStations.has(dev.address)) {
+        incomingCfgStations.set(dev.address, { address: dev.address, name: dev.name, ip: dev.ip });
+      }
+    }
+    const existingCfgStations = await loadExistingStations(db, importId);
+    const cfgConflictStations = [...existingCfgStations, ...incomingCfgStations.values()];
+    const cfgConflicts = findStationConflicts(cfgConflictStations);
+    if (cfgConflicts.length) {
+      return err(res, 400, 'Duplicate stations: ' + cfgConflicts.join('; '), {
+        conflictRows: buildConflictTable(cfgConflictStations),
+      });
+    }
+
     // Load template catalogue so we can resolve signal_type from order_no
-    const tplRows = db.prepare('SELECT order_no, signal_type FROM hw_module_templates').all();
+    const tplRows = await db.prepare('SELECT order_no, signal_type FROM hw_module_templates').all();
     const tplMap  = new Map(tplRows.map(t => [t.order_no, t]));
 
     const insertSignal = db.prepare(`
       INSERT INTO hw_signals
         (hw_import_id, station_address, station_name, ip_address, router_address,
          subsystem_no, slot, module_order_no, module_name, signal_type,
-         pip_no, potential_group, tag, description)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+         pip_no, potential_group, tag, description, station_mlfb)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
 
     const insertSubslot = db.prepare(`
-      INSERT OR REPLACE INTO hw_slot_subslots
+      INSERT INTO hw_slot_subslots
         (hw_import_id, station_address, slot, subslot_no, pa_profile)
-      VALUES (?,?,?,?,?)`);
+      VALUES (?,?,?,?,?)
+      ON CONFLICT (hw_import_id, station_address, slot, subslot_no) DO UPDATE SET
+        pa_profile = EXCLUDED.pa_profile`);
 
     let stationCount = 0;
     let slotCount    = 0;
 
-    db.transaction(() => {
-      // Clear existing signal rows for this import so backfill is idempotent
-      db.prepare('DELETE FROM hw_signals WHERE hw_import_id=?').run(importId);
-      db.prepare('DELETE FROM hw_slot_subslots WHERE hw_import_id=?').run(importId);
-
+    await db.transaction(async () => {
+      // Additive backfill: existing rows are kept. Uniqueness of incoming stations was
+      // validated above, so new devices are simply inserted alongside any existing ones.
+      // (hw_slot_subslots uses ON CONFLICT DO UPDATE, so re-inserting a subslot is safe.)
       for (const dev of devices) {
         stationCount++;
 
@@ -564,12 +619,13 @@ router.post('/imports/:id/backfill-from-cfg', upload.single('cfg'), (req, res) =
         const slot0OrderNo = (dev.mlfbNo && !tplMap.has(dev.orderNo))
           ? dev.mlfbNo
           : dev.orderNo;
-        insertSignal.run(
+        await insertSignal.run(
           importId,
           dev.address, dev.name, dev.ip, dev.routerAddress,
           dev.subsystemNo, 0,
           slot0OrderNo, dev.name,
           null, null, null, null, null,
+          dev.mlfbNo || null,
         );
 
         for (const slot of dev.slots) {
@@ -582,7 +638,7 @@ router.post('/imports/:id/backfill-from-cfg', upload.single('cfg'), (req, res) =
 
           if (slot.symbols.length === 0) {
             // No SYMBOL lines — insert one representative row for the slot
-            insertSignal.run(
+            await insertSignal.run(
               importId,
               dev.address, dev.name, dev.ip, dev.routerAddress,
               dev.subsystemNo, slot.slot,
@@ -590,12 +646,13 @@ router.post('/imports/:id/backfill-from-cfg', upload.single('cfg'), (req, res) =
               signalType,
               slot.pipNo, slot.potentialGroup,
               null, null,
+              slot.mlfb || null,
             );
             slotCount++;
           } else {
             // Insert one row per SYMBOL (channel-level tag data)
             for (const sym of slot.symbols) {
-              insertSignal.run(
+              await insertSignal.run(
                 importId,
                 dev.address, dev.name, dev.ip, dev.routerAddress,
                 dev.subsystemNo, slot.slot,
@@ -603,6 +660,7 @@ router.post('/imports/:id/backfill-from-cfg', upload.single('cfg'), (req, res) =
                 signalType,
                 slot.pipNo, slot.potentialGroup,
                 sym.tag || null, sym.description || null,
+                slot.mlfb || null,
               );
             }
             slotCount++;
@@ -610,7 +668,7 @@ router.post('/imports/:id/backfill-from-cfg', upload.single('cfg'), (req, res) =
 
           // PA subslots — pass orderNo as pa_profile so CFU_PA function type round-trips
           for (const ss of slot.subslots) {
-            insertSubslot.run(importId, dev.address, slot.slot, ss.subslotNo, ss.orderNo || null);
+            await insertSubslot.run(importId, dev.address, slot.slot, ss.subslotNo, ss.orderNo || null);
           }
         }
       }
@@ -627,32 +685,33 @@ router.post('/imports/:id/backfill-from-cfg', upload.single('cfg'), (req, res) =
       const activeRoles = roles.filter(r => r.mrpRole !== 0);
       if (activeRoles.length > 0) {
         const fieldbusNo = activeRoles.find(r => r.subsystemNo != null)?.subsystemNo ?? null;
-        db.transaction(() => {
-          const existing = db.prepare(
+        await db.transaction(async () => {
+          const existing = await db.prepare(
             'SELECT id FROM mrp_configs WHERE hw_import_id=? ORDER BY id DESC LIMIT 1'
           ).get(importId);
           let configId;
           if (existing) {
-            db.prepare(
-              `UPDATE mrp_configs SET domain_name=?, fieldbus_no=?, station_name=?, updated_at=datetime('now') WHERE id=?`
+            await db.prepare(
+              `UPDATE mrp_configs SET domain_name=?, fieldbus_no=?, station_name=?, updated_at=NOW() WHERE id=?`
             ).run(domainName, fieldbusNo, stationName || '', existing.id);
             configId = existing.id;
           } else {
-            configId = db.prepare(
+            const r = await db.prepare(
               'INSERT INTO mrp_configs (hw_import_id, domain_name, fieldbus_no, station_name) VALUES (?,?,?,?)'
-            ).run(importId, domainName, fieldbusNo, stationName || '').lastInsertRowid;
+            ).run(importId, domainName, fieldbusNo, stationName || '');
+            configId = r.lastInsertRowid;
           }
 
-          db.prepare('DELETE FROM mrp_device_roles WHERE mrp_config_id=?').run(configId);
+          await db.prepare('DELETE FROM mrp_device_roles WHERE mrp_config_id=?').run(configId);
           const insRole = db.prepare(
             'INSERT INTO mrp_device_roles (mrp_config_id, device_alias, io_address, subsystem_no, mrp_role, mrp_instances, ring_port_1, ring_port_2) VALUES (?,?,?,?,?,?,?,?)'
           );
           for (const r of roles) {
-            insRole.run(configId, r.alias, r.ioAddress, r.subsystemNo,
+            await insRole.run(configId, r.alias, r.ioAddress, r.subsystemNo,
               r.mrpRole, r.mrpRole === 3 ? 1 : 0, r.ringPort1 ?? null, r.ringPort2 ?? null);
           }
 
-          db.prepare('DELETE FROM mrp_port_links WHERE mrp_config_id=?').run(configId);
+          await db.prepare('DELETE FROM mrp_port_links WHERE mrp_config_id=?').run(configId);
           const insLink = db.prepare(
             `INSERT INTO mrp_port_links
                (mrp_config_id, from_device, from_iface_subslot, from_port_subslot,
@@ -660,7 +719,7 @@ router.post('/imports/:id/backfill-from-cfg', upload.single('cfg'), (req, res) =
              VALUES (?,?,?,?,?,?,?)`
           );
           for (const l of links) {
-            insLink.run(configId, l.fromDevice, l.fromIfaceSubslot, l.fromPortSubslot,
+            await insLink.run(configId, l.fromDevice, l.fromIfaceSubslot, l.fromPortSubslot,
               l.toDevice, l.toIfaceSubslot, l.toPortSubslot);
           }
         })();
@@ -682,7 +741,7 @@ router.post('/imports/:id/parse-headers', upload.single('iolist'), async (req, r
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id, 10);
-    const hwImport = db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
+    const hwImport = await db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
     if (!hwImport) return err(res, 404, 'HW import not found');
     if (!req.file)  return err(res, 400, 'No file uploaded');
 
@@ -690,11 +749,53 @@ router.post('/imports/:id/parse-headers', upload.single('iolist'), async (req, r
     const { headers, rawExcelRows } = await parseHwExcel(req.file.buffer, sheetName);
 
     // Store raw Excel rows so they can be previewed without re-uploading
-    db.prepare('DELETE FROM hw_excel_raw WHERE hw_import_id=?').run(importId);
+    await db.prepare('DELETE FROM hw_excel_raw WHERE hw_import_id=?').run(importId);
     const insert = db.prepare('INSERT INTO hw_excel_raw (hw_import_id, row_index, row_json) VALUES (?,?,?)');
-    rawExcelRows.forEach((row, i) => insert.run(importId, i, JSON.stringify(row)));
+    for (let i = 0; i < rawExcelRows.length; i++) await insert.run(importId, i, JSON.stringify(rawExcelRows[i]));
 
     res.json({ headers, rowCount: rawExcelRows.length });
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// POST /api/hw-config/imports/:id/ingest-io-rows
+// Unified import: copy an IO import's raw rows into this HW import's hw_excel_raw
+// table so the Hardware column-mapping / preview flow can consume the SAME sheet
+// that was uploaded once on the IO Import screen — no file re-upload needed.
+// Body: { ioImportId }
+router.post('/imports/:id/ingest-io-rows', async (req, res) => {
+  try {
+    const db       = getDb();
+    const importId = parseInt(req.params.id, 10);
+    const { ioImportId } = req.body || {};
+
+    const hwImport = await db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
+    if (!hwImport) return err(res, 404, 'HW import not found');
+    if (!ioImportId) return err(res, 400, 'ioImportId required');
+
+    const ioImport = await db.prepare('SELECT id FROM io_imports WHERE id=?').get(parseInt(ioImportId, 10));
+    if (!ioImport) return err(res, 404, 'IO import not found');
+
+    // io_tags.raw_data is {column: value} JSON — identical shape to hw_excel_raw.row_json.
+    const ioRows = await db.prepare(
+      'SELECT raw_data FROM io_tags WHERE import_id=? ORDER BY row_number, id'
+    ).all(parseInt(ioImportId, 10));
+
+    if (ioRows.length === 0) {
+      return err(res, 400, 'IO import has no rows to ingest');
+    }
+
+    await db.prepare('DELETE FROM hw_excel_raw WHERE hw_import_id=?').run(importId);
+    const insert = db.prepare('INSERT INTO hw_excel_raw (hw_import_id, row_index, row_json) VALUES (?,?,?)');
+    const insertBatch = db.transaction(async (rows) => {
+      for (let i = 0; i < rows.length; i++) await insert.run(importId, i, rows[i].raw_data || '{}');
+    });
+    await insertBatch(ioRows);
+
+    // Derive headers from the first row for the response.
+    let headers = [];
+    try { headers = Object.keys(JSON.parse(ioRows[0].raw_data || '{}')); } catch (_) {}
+
+    res.json({ headers, rowCount: ioRows.length });
   } catch (e) { err(res, 500, e.message); }
 });
 
@@ -705,11 +806,11 @@ router.get('/imports/:id/excel-preview', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id, 10);
-    const hwImport = db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
+    const hwImport = await db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
     if (!hwImport) return err(res, 404, 'HW import not found');
 
     const limit = parseInt(req.query.limit, 10) || 200;
-    const stored = db.prepare(
+    const stored = await db.prepare(
       'SELECT row_json FROM hw_excel_raw WHERE hw_import_id=? ORDER BY row_index LIMIT ?'
     ).all(importId, limit);
 
@@ -770,7 +871,7 @@ router.post('/imports/:id/upload-iolist', upload.single('iolist'), async (req, r
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id, 10);
-    const hwImport = db.prepare('SELECT id, project_id FROM hw_imports WHERE id=?').get(importId);
+    const hwImport = await db.prepare('SELECT id, project_id FROM hw_imports WHERE id=?').get(importId);
     if (!hwImport) return err(res, 404, 'HW import not found');
     if (!req.file)  return err(res, 400, 'No file uploaded');
 
@@ -788,7 +889,24 @@ router.post('/imports/:id/upload-iolist', upload.single('iolist'), async (req, r
 
     const { rows, stations, colMap, resolutionStats } = await parseHwExcel(req.file.buffer, sheetName, overrideColumnMap, db);
 
-    db.prepare('DELETE FROM hw_signals WHERE hw_import_id=?').run(importId);
+    // Additive import: build the incoming station set (one entry per address) and validate
+    // it — together with the stations already stored for this import — for uniqueness of
+    // address / name / IP. Reject the whole import on any collision; add nothing.
+    const incomingStations = new Map();
+    for (const r of rows) {
+      if (r.stationAddr == null) continue;
+      if (!incomingStations.has(r.stationAddr)) {
+        incomingStations.set(r.stationAddr, { address: r.stationAddr, name: r.stationName, ip: r.ip });
+      }
+    }
+    const existingStations = await loadExistingStations(db, importId);
+    const conflictStations = [...existingStations, ...incomingStations.values()];
+    const conflicts = findStationConflicts(conflictStations);
+    if (conflicts.length) {
+      return err(res, 400, 'Duplicate stations: ' + conflicts.join('; '), {
+        conflictRows: buildConflictTable(conflictStations),
+      });
+    }
 
     const ins = db.prepare(`
       INSERT INTO hw_signals
@@ -797,45 +915,45 @@ router.post('/imports/:id/upload-iolist', upload.single('iolist'), async (req, r
          station_mlfb, resolved_by_tier2, unresolved)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     `);
-    const insertBatch = db.transaction((batch) => {
+    const insertBatch = db.transaction(async (batch) => {
       for (const r of batch) {
-        ins.run(importId, r.rowNum, r.stationAddr, r.stationName, r.ip,
+        await ins.run(importId, r.rowNum, r.stationAddr, r.stationName, r.ip,
           r.slot, r.channel, r.orderNo, r.moduleName, r.tag, r.desc, r.signalType,
           r.subsystemNo ?? null, r.routerAddress || null,
           r.stationMlfb || null,
-          r.resolvedByTier2 ?? 0, r.unresolved ?? 0);
+          !!r.resolvedByTier2, !!r.unresolved);
       }
     });
-    for (let i = 0; i < rows.length; i += 500) insertBatch(rows.slice(i, i + 500));
+    for (let i = 0; i < rows.length; i += 500) await insertBatch(rows.slice(i, i + 500));
 
     // Tier 2: Create slot 0 rows for stations with station_mlfb
     // This enables the grid to auto-generate ports (0.2, 0.3) based on the station module's port_config
-    const tier2Stations = db.prepare(`
+    const tier2Stations = await db.prepare(`
       SELECT DISTINCT station_address, station_name, ip_address, router_address, subsystem_no, station_mlfb
       FROM hw_signals
-      WHERE hw_import_id=? AND resolved_by_tier2=1 AND station_mlfb IS NOT NULL
+      WHERE hw_import_id=? AND resolved_by_tier2=true AND station_mlfb IS NOT NULL
         AND NOT EXISTS (SELECT 1 FROM hw_signals s2 WHERE s2.hw_import_id=? AND s2.station_address=hw_signals.station_address AND s2.slot=0)
     `).all(importId, importId);
 
     if (tier2Stations.length > 0) {
       const insSlot0 = db.prepare(`
-        INSERT OR IGNORE INTO hw_signals
+        INSERT INTO hw_signals
           (hw_import_id, row_number, station_address, station_name, ip_address,
            slot, channel, module_order_no, module_name, tag, description, signal_type, subsystem_no, router_address,
            station_mlfb, resolved_by_tier2, unresolved)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       `);
       for (const s of tier2Stations) {
-        insSlot0.run(
+        await insSlot0.run(
           importId, null, s.station_address, s.station_name, s.ip_address,
           0, null, s.station_mlfb, s.station_name,
           null, null, null, s.subsystem_no, s.router_address,
-          s.station_mlfb, 1, 0
+          s.station_mlfb, true, false
         );
       }
     }
 
-    db.prepare('UPDATE hw_imports SET excel_name=?, status=? WHERE id=?')
+    await db.prepare('UPDATE hw_imports SET excel_name=?, status=? WHERE id=?')
       .run(req.file.originalname, 'ready', importId);
 
     res.json({ importId, stationCount: stations.size, signalCount: rows.length, colMap, resolutionStats });
@@ -852,7 +970,7 @@ router.post('/imports/:id/preview-iolist', upload.single('iolist'), async (req, 
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id, 10);
-    const hwImport = db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
+    const hwImport = await db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
     if (!hwImport) return err(res, 404, 'HW import not found');
 
     // Parse columnMap from query string
@@ -869,7 +987,7 @@ router.post('/imports/:id/preview-iolist', upload.single('iolist'), async (req, 
 
     // If no file but columnMap is provided, use stored raw rows from DB
     if (!req.file && overrideColumnMap) {
-      const stored = db.prepare(
+      const stored = await db.prepare(
         'SELECT row_json FROM hw_excel_raw WHERE hw_import_id=? ORDER BY row_index'
       ).all(importId);
 
@@ -879,7 +997,7 @@ router.post('/imports/:id/preview-iolist', upload.single('iolist'), async (req, 
 
       // Parse using the stored raw rows (simulate as if we just read them from Excel)
       const rawExcelRows = stored.map(r => JSON.parse(r.row_json));
-      const parseResult = parseRawExcelRows(rawExcelRows, overrideColumnMap, db);
+      const parseResult = await parseRawExcelRows(rawExcelRows, overrideColumnMap, db);
       rows = parseResult.rows;
       stations = parseResult.stations;
       resolutionStats = parseResult.resolutionStats;
@@ -911,7 +1029,7 @@ router.post('/imports/:id/preview-iolist', upload.single('iolist'), async (req, 
     }
 
     // Load current DB signals
-    const dbRows = db.prepare(
+    const dbRows = await db.prepare(
       `SELECT station_address, station_name, ip_address, subsystem_no, router_address,
               slot, channel, module_order_no, module_name, tag, description, signal_type
        FROM hw_signals WHERE hw_import_id=? AND module_order_no != 'PLACEHOLDER'`
@@ -1014,6 +1132,57 @@ router.post('/imports/:id/preview-iolist', upload.single('iolist'), async (req, 
 
     summary.total = items.length;
 
+    // Add station-level conflict warnings to each row. Conflicts are computed once at the
+    // station level, then each row belonging to a conflicted station gets annotated so
+    // the UI can highlight it in red.
+    {
+      const incomingStations = new Map();
+      for (const r of rows) {
+        if (r.stationAddr == null) continue;
+        if (!incomingStations.has(r.stationAddr)) {
+          incomingStations.set(r.stationAddr, { address: r.stationAddr, name: r.stationName, ip: r.ip });
+        }
+      }
+      const existingStations = await loadExistingStations(db, importId);
+      const allConflicts = findStationConflicts([...existingStations, ...incomingStations.values()]);
+
+      // Build a map of station address → conflicts affecting it
+      const stationConflictMap = new Map();
+      for (const conflictMsg of allConflicts) {
+        // Match format 1: "Device Name/IP ... is used by stations 1, 2, 3"
+        let addrMatches = conflictMsg.match(/stations (.+)$/);
+        if (addrMatches) {
+          const addrs = addrMatches[1].split(', ').map(a => parseInt(a, 10));
+          for (const addr of addrs) {
+            if (!stationConflictMap.has(addr)) stationConflictMap.set(addr, []);
+            stationConflictMap.get(addr).push(conflictMsg);
+          }
+          continue;
+        }
+        // Match format 2: "Device Number X is used by N stations" — lookup all incoming stations
+        // to find which ones have that device number
+        addrMatches = conflictMsg.match(/^Device Number (\d+)/);
+        if (addrMatches) {
+          const deviceNum = parseInt(addrMatches[1], 10);
+          for (const r of rows) {
+            if (r.stationAddr === deviceNum) {
+              if (!stationConflictMap.has(deviceNum)) stationConflictMap.set(deviceNum, []);
+              stationConflictMap.get(deviceNum).push(conflictMsg);
+              break;
+            }
+          }
+        }
+      }
+
+      // Annotate each row-item with its station's conflicts
+      for (const item of items) {
+        const stationAddr = item.incoming?.station_address ?? item.current?.station_address;
+        if (stationAddr != null && stationConflictMap.has(stationAddr)) {
+          item.stationConflicts = stationConflictMap.get(stationAddr);
+        }
+      }
+    }
+
     res.json({
       summary,
       items,
@@ -1033,7 +1202,7 @@ router.get('/imports/:id/preview-mapped', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id, 10);
-    const hwImport = db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
+    const hwImport = await db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
     if (!hwImport) return err(res, 404, 'HW import not found');
 
     // Parse columnMap from query
@@ -1049,7 +1218,7 @@ router.get('/imports/:id/preview-mapped', async (req, res) => {
     }
 
     // Load stored raw rows from DB
-    const stored = db.prepare(
+    const stored = await db.prepare(
       'SELECT row_json FROM hw_excel_raw WHERE hw_import_id=? ORDER BY row_index'
     ).all(importId);
 
@@ -1058,7 +1227,7 @@ router.get('/imports/:id/preview-mapped', async (req, res) => {
     }
 
     const rawExcelRows = stored.map(r => JSON.parse(r.row_json));
-    const { rows, stations, resolutionStats } = parseRawExcelRows(rawExcelRows, columnMap, db);
+    const { rows, stations, resolutionStats } = await parseRawExcelRows(rawExcelRows, columnMap, db);
 
     // Build diff against current DB (same logic as preview-iolist)
     const CMP_FIELDS = ['station_address','station_name','ip_address','subsystem_no',
@@ -1075,7 +1244,7 @@ router.get('/imports/:id/preview-mapped', async (req, res) => {
       incoming.set(key, r);
     }
 
-    const dbRows = db.prepare(
+    const dbRows = await db.prepare(
       `SELECT station_address, station_name, ip_address, subsystem_no, router_address,
               slot, channel, module_order_no, module_name, tag, description, signal_type
        FROM hw_signals WHERE hw_import_id=? AND module_order_no != 'PLACEHOLDER'`
@@ -1173,6 +1342,53 @@ router.get('/imports/:id/preview-mapped', async (req, res) => {
 
     summary.total = items.length;
 
+    // Add station-level conflict warnings to each row (same logic as preview-iolist)
+    {
+      const incomingStations = new Map();
+      for (const r of rows) {
+        if (r.stationAddr == null) continue;
+        if (!incomingStations.has(r.stationAddr)) {
+          incomingStations.set(r.stationAddr, { address: r.stationAddr, name: r.stationName, ip: r.ip });
+        }
+      }
+      const existingStations = await loadExistingStations(db, importId);
+      const allConflicts = findStationConflicts([...existingStations, ...incomingStations.values()]);
+
+      const stationConflictMap = new Map();
+      for (const conflictMsg of allConflicts) {
+        // Match format 1: "Device Name/IP ... is used by stations 1, 2, 3"
+        let addrMatches = conflictMsg.match(/stations (.+)$/);
+        if (addrMatches) {
+          const addrs = addrMatches[1].split(', ').map(a => parseInt(a, 10));
+          for (const addr of addrs) {
+            if (!stationConflictMap.has(addr)) stationConflictMap.set(addr, []);
+            stationConflictMap.get(addr).push(conflictMsg);
+          }
+          continue;
+        }
+        // Match format 2: "Device Number X is used by N stations" — lookup all incoming stations
+        // to find which ones have that device number
+        addrMatches = conflictMsg.match(/^Device Number (\d+)/);
+        if (addrMatches) {
+          const deviceNum = parseInt(addrMatches[1], 10);
+          for (const r of rows) {
+            if (r.stationAddr === deviceNum) {
+              if (!stationConflictMap.has(deviceNum)) stationConflictMap.set(deviceNum, []);
+              stationConflictMap.get(deviceNum).push(conflictMsg);
+              break;
+            }
+          }
+        }
+      }
+
+      for (const item of items) {
+        const stationAddr = item.incoming?.station_address ?? item.current?.station_address;
+        if (stationAddr != null && stationConflictMap.has(stationAddr)) {
+          item.stationConflicts = stationConflictMap.get(stationAddr);
+        }
+      }
+    }
+
     res.json({
       summary,
       items,
@@ -1184,12 +1400,55 @@ router.get('/imports/:id/preview-mapped', async (req, res) => {
   } catch (e) { err(res, 500, e.message); }
 });
 
+// ── Hardware Column Mapping Persistence ──────────────────────────────────────
+
+// GET /api/hw-config/imports/:id/column-mapping
+// Load the saved column mapping for this import
+router.get('/imports/:id/column-mapping', async (req, res) => {
+  try {
+    const db       = getDb();
+    const importId = parseInt(req.params.id, 10);
+    const hwImport = await db.prepare('SELECT column_map FROM hw_imports WHERE id=?').get(importId);
+    if (!hwImport) return err(res, 404, 'HW import not found');
+
+    let mapping = {};
+    if (hwImport.column_map) {
+      try {
+        mapping = JSON.parse(hwImport.column_map);
+      } catch (e) {
+        console.error(`Failed to parse column_map for import ${importId}:`, e);
+      }
+    }
+    res.json({ mapping });
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// POST /api/hw-config/imports/:id/column-mapping
+// Save the column mapping for this import
+router.post('/imports/:id/column-mapping', async (req, res) => {
+  try {
+    const db       = getDb();
+    const importId = parseInt(req.params.id, 10);
+    const { mapping } = req.body;
+    if (!mapping) return err(res, 400, 'mapping object required');
+
+    const hwImport = await db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
+    if (!hwImport) return err(res, 404, 'HW import not found');
+
+    const mappingJson = JSON.stringify(mapping);
+    await db.prepare('UPDATE hw_imports SET column_map=? WHERE id=?')
+      .run(mappingJson, importId);
+
+    res.json({ ok: true, mapping });
+  } catch (e) { err(res, 500, e.message); }
+});
+
 // POST /api/hw-config/imports/:id/apply-iolist  (commit approved changes)
 router.post('/imports/:id/apply-iolist', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id, 10);
-    const hwImport = db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
+    const hwImport = await db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
     if (!hwImport) return err(res, 404, 'HW import not found');
 
     const { approvedKeys, parsedRows, fileName, missingKeys } = req.body;
@@ -1206,18 +1465,42 @@ router.post('/imports/:id/apply-iolist', async (req, res) => {
     }
 
     // Load current DB signals (need tag + signal_type to normalize key)
-    const dbRows = db.prepare(
+    const dbRows = await db.prepare(
       `SELECT station_address, slot, channel, tag, signal_type FROM hw_signals
        WHERE hw_import_id=? AND module_order_no != 'PLACEHOLDER'`
     ).all(importId);
 
-    const apply = db.transaction(() => {
+    // Validate the post-apply station set for uniqueness of address / name / IP.
+    // Final stations = existing DB stations (identity from their slot-0 rows) overridden
+    // by any approved incoming station of the same address, plus new approved stations.
+    // Reject the whole apply on any collision.
+    {
+      const finalStations = new Map();
+      for (const s of await loadExistingStations(db, importId)) {
+        finalStations.set(String(s.address), s);
+      }
+      for (const r of parsedRows) {
+        if (r.stationAddr == null) continue;
+        const key = `${r.stationAddr}:${r.slot}:${chKey(r.channel, r.tag, r.signalType)}`;
+        if (!approvedSet.has(key)) continue;
+        // Approved incoming row defines/overrides this station's identity.
+        finalStations.set(String(r.stationAddr), { address: r.stationAddr, name: r.stationName, ip: r.ip });
+      }
+      const conflicts = findStationConflicts([...finalStations.values()]);
+      if (conflicts.length) {
+        return err(res, 400, 'Duplicate stations: ' + conflicts.join('; '), {
+          conflictRows: buildConflictTable([...finalStations.values()]),
+        });
+      }
+    }
+
+    const apply = db.transaction(async () => {
       // Delete approved missing rows
       for (const r of dbRows) {
         const key = `${r.station_address}:${r.slot}:${chKey(r.channel, r.tag, r.signal_type)}`;
         if (missingSet.has(key) && approvedSet.has(key)) {
-          db.prepare(
-            `DELETE FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=? AND channel IS ?`
+          await db.prepare(
+            `DELETE FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=? AND channel IS NOT DISTINCT FROM ?`
           ).run(importId, r.station_address, r.slot, r.channel ?? null);
         }
       }
@@ -1237,59 +1520,59 @@ router.post('/imports/:id/apply-iolist', async (req, res) => {
         if (!approvedSet.has(key)) { rowIdx++; continue; }
 
         // Delete existing row for this key before inserting (upsert)
-        db.prepare(
-          `DELETE FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=? AND channel IS ?`
+        await db.prepare(
+          `DELETE FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=? AND channel IS NOT DISTINCT FROM ?`
         ).run(importId, r.stationAddr, r.slot, r.channel ?? null);
 
-        ins.run(importId, r.rowNum ?? rowIdx, r.stationAddr, r.stationName, r.ip,
+        await ins.run(importId, r.rowNum ?? rowIdx, r.stationAddr, r.stationName, r.ip,
           r.slot, r.channel ?? null, r.orderNo, r.moduleName, r.tag, r.desc,
           r.signalType, r.subsystemNo ?? null, r.routerAddress || null,
           r.stationMlfb || null,
-          r.resolvedByTier2 ?? 0, r.unresolved ?? 0);
+          !!r.resolvedByTier2, !!r.unresolved);
         rowIdx++;
       }
 
       if (fileName) {
-        db.prepare('UPDATE hw_imports SET excel_name=?, status=? WHERE id=?')
+        await db.prepare('UPDATE hw_imports SET excel_name=?, status=? WHERE id=?')
           .run(fileName, 'ready', importId);
       }
     });
 
-    apply();
+    await apply();
 
     // Tier 2: Create slot 0 rows for stations with station_mlfb
     // This enables the grid to auto-generate ports (0.2, 0.3) based on the station module's port_config
-    const tier2Stations = db.prepare(`
+    const tier2Stations = await db.prepare(`
       SELECT DISTINCT station_address, station_name, ip_address, router_address, subsystem_no, station_mlfb
       FROM hw_signals
-      WHERE hw_import_id=? AND resolved_by_tier2=1 AND station_mlfb IS NOT NULL
+      WHERE hw_import_id=? AND resolved_by_tier2=true AND station_mlfb IS NOT NULL
         AND NOT EXISTS (SELECT 1 FROM hw_signals s2 WHERE s2.hw_import_id=? AND s2.station_address=hw_signals.station_address AND s2.slot=0)
     `).all(importId, importId);
 
     if (tier2Stations.length > 0) {
       const insSlot0 = db.prepare(`
-        INSERT OR IGNORE INTO hw_signals
+        INSERT INTO hw_signals
           (hw_import_id, row_number, station_address, station_name, ip_address,
            slot, channel, module_order_no, module_name, tag, description, signal_type, subsystem_no, router_address,
            station_mlfb, resolved_by_tier2, unresolved)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       `);
       for (const s of tier2Stations) {
-        insSlot0.run(
+        await insSlot0.run(
           importId, null, s.station_address, s.station_name, s.ip_address,
           0, null, s.station_mlfb, s.station_name,
           null, null, null, s.subsystem_no, s.router_address,
-          s.station_mlfb, 1, 0
+          s.station_mlfb, true, false
         );
       }
     }
 
-    const signalCount = db.prepare(
+    const signalCount = Number((await db.prepare(
       'SELECT COUNT(*) AS cnt FROM hw_signals WHERE hw_import_id=?'
-    ).get(importId).cnt;
-    const stationCount = db.prepare(
+    ).get(importId)).cnt);
+    const stationCount = Number((await db.prepare(
       'SELECT COUNT(DISTINCT station_address) AS cnt FROM hw_signals WHERE hw_import_id=?'
-    ).get(importId).cnt;
+    ).get(importId)).cnt);
 
     res.json({ importId, stationCount, signalCount, appliedKeys: approvedKeys.length });
   } catch (e) { err(res, 500, e.message); }
@@ -1297,28 +1580,32 @@ router.post('/imports/:id/apply-iolist', async (req, res) => {
 
 // ── Station view ──────────────────────────────────────────────────────────────
 
-router.get('/imports/:id/stations', (req, res) => {
+router.get('/imports/:id/stations', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id, 10);
 
-    const signals = db.prepare(
-      `SELECT station_address, station_name, ip_address, router_address, slot, module_order_no, module_name,
-              subsystem_no, pip_no, potential_group, pa_profile, COUNT(*) AS signal_count
+    const signals = await db.prepare(
+      `SELECT station_address, MIN(station_name) AS station_name, MIN(ip_address) AS ip_address,
+              MIN(router_address) AS router_address, slot, module_order_no,
+              MIN(module_name) AS module_name, MIN(subsystem_no) AS subsystem_no,
+              MIN(pip_no) AS pip_no, MIN(potential_group) AS potential_group,
+              MIN(pa_profile) AS pa_profile, COUNT(*) AS signal_count
        FROM hw_signals
        WHERE hw_import_id=? AND module_order_no != 'PLACEHOLDER'
        GROUP BY station_address, slot, module_order_no
        ORDER BY station_address, slot`
     ).all(importId);
 
-    const allAddrs = db.prepare(
-      `SELECT DISTINCT station_address, station_name, ip_address, router_address, subsystem_no,
-              MAX(COALESCE(approved,0)) AS approved
+    const allAddrs = await db.prepare(
+      `SELECT station_address, MIN(station_name) AS station_name, MIN(ip_address) AS ip_address,
+              MIN(router_address) AS router_address, MIN(subsystem_no) AS subsystem_no,
+              BOOL_OR(COALESCE(approved,false)) AS approved
        FROM hw_signals WHERE hw_import_id=? GROUP BY station_address ORDER BY station_address`
     ).all(importId);
 
     // Load per-subslot profiles
-    const subslotRows = db.prepare(
+    const subslotRows = await db.prepare(
       `SELECT station_address, slot, subslot_no, pa_profile
        FROM hw_slot_subslots WHERE hw_import_id=? ORDER BY station_address, slot, subslot_no`
     ).all(importId);
@@ -1332,11 +1619,11 @@ router.get('/imports/:id/stations', (req, res) => {
     }
 
     // Resolve orderNo + family per station from slot 0 row
-    const tplRows = db.prepare('SELECT order_no, family, display_name FROM hw_module_templates').all();
+    const tplRows = await db.prepare('SELECT order_no, family, display_name FROM hw_module_templates').all();
     const tplMap  = new Map(tplRows.map(t => [t.order_no, t]));
 
-    const slot0Rows = db.prepare(
-      `SELECT station_address, module_order_no FROM hw_signals
+    const slot0Rows = await db.prepare(
+      `SELECT station_address, MIN(module_order_no) AS module_order_no FROM hw_signals
        WHERE hw_import_id=? AND slot=0 GROUP BY station_address`
     ).all(importId);
     const slot0Map = new Map();
@@ -1382,14 +1669,14 @@ router.get('/imports/:id/stations', (req, res) => {
 });
 
 // GET /imports/:id/preview-addresses — compute process-image addresses for all slots without generating a full CFG
-router.get('/imports/:id/preview-addresses', (req, res) => {
+router.get('/imports/:id/preview-addresses', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id, 10);
-    const hwImport = db.prepare('SELECT id, baseline_cfg FROM hw_imports WHERE id=?').get(importId);
+    const hwImport = await db.prepare('SELECT id, baseline_cfg FROM hw_imports WHERE id=?').get(importId);
     if (!hwImport) return err(res, 404, 'HW import not found');
 
-    const signals = db.prepare(
+    const signals = await db.prepare(
       `SELECT station_address, station_name, ip_address, router_address, subsystem_no,
               slot, module_order_no, pip_no, pa_profile
        FROM hw_signals
@@ -1397,11 +1684,11 @@ router.get('/imports/:id/preview-addresses', (req, res) => {
        ORDER BY station_address, slot`
     ).all(importId);
 
-    const tplRows    = db.prepare('SELECT * FROM hw_module_templates').all();
+    const tplRows    = await db.prepare('SELECT * FROM hw_module_templates').all();
     const templateMap = new Map(tplRows.map(t => [t.order_no, t]));
 
     // Load per-subslot PA profile assignments
-    const subslotRows = db.prepare(
+    const subslotRows = await db.prepare(
       'SELECT station_address, slot, subslot_no, pa_profile FROM hw_slot_subslots WHERE hw_import_id=? ORDER BY station_address, slot, subslot_no'
     ).all(importId);
     const subslotMap = new Map();
@@ -1455,7 +1742,7 @@ router.get('/imports/:id/preview-addresses', (req, res) => {
 });
 
 // POST /imports/:id/stations/bulk-delete — delete multiple stations at once
-router.post('/imports/:id/stations/bulk-delete', (req, res) => {
+router.post('/imports/:id/stations/bulk-delete', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id, 10);
@@ -1463,19 +1750,28 @@ router.post('/imports/:id/stations/bulk-delete', (req, res) => {
     if (!Array.isArray(addresses) || addresses.length === 0)
       return err(res, 400, 'addresses array required');
 
-    const del = db.transaction(() => {
+    const del = db.transaction(async () => {
       for (const addr of addresses) {
-        db.prepare('DELETE FROM hw_signals WHERE hw_import_id=? AND station_address=?')
-          .run(importId, parseInt(addr, 10));
+        const addrInt = parseInt(addr, 10);
+        // First delete dependent instance_ios rows that reference these hw_signals
+        const hwIds = await db.prepare(
+          'SELECT id FROM hw_signals WHERE hw_import_id=? AND station_address=?'
+        ).all(importId, addrInt);
+        for (const row of hwIds) {
+          await db.prepare('DELETE FROM instance_ios WHERE hw_signal_id=?').run(row.id);
+        }
+        // Then delete the hw_signals
+        await db.prepare('DELETE FROM hw_signals WHERE hw_import_id=? AND station_address=?')
+          .run(importId, addrInt);
       }
     });
-    del();
+    await del();
     res.json({ ok: true, deleted: addresses.length });
   } catch (e) { err(res, 500, e.message); }
 });
 
 // POST /imports/:id/stations/bulk-approve — set approved flag on multiple stations
-router.post('/imports/:id/stations/bulk-approve', (req, res) => {
+router.post('/imports/:id/stations/bulk-approve', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id, 10);
@@ -1483,27 +1779,27 @@ router.post('/imports/:id/stations/bulk-approve', (req, res) => {
     if (!Array.isArray(addresses) || addresses.length === 0)
       return err(res, 400, 'addresses array required');
 
-    const upd = db.transaction(() => {
+    const upd = db.transaction(async () => {
       for (const addr of addresses) {
-        db.prepare('UPDATE hw_signals SET approved=? WHERE hw_import_id=? AND station_address=?')
-          .run(approved ? 1 : 0, importId, parseInt(addr, 10));
+        await db.prepare('UPDATE hw_signals SET approved=? WHERE hw_import_id=? AND station_address=?')
+          .run(!!approved, importId, parseInt(addr, 10));
       }
     });
-    upd();
+    await upd();
     res.json({ ok: true, updated: addresses.length });
   } catch (e) { err(res, 500, e.message); }
 });
 
 // GET /api/hw-config/imports/:id/signals?page=0&limit=100
-router.get('/imports/:id/signals', (req, res) => {
+router.get('/imports/:id/signals', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id, 10);
     const limit    = Math.min(parseInt(req.query.limit || '100', 10), 500);
     const offset   = parseInt(req.query.page   || '0',   10) * limit;
 
-    const total   = db.prepare('SELECT COUNT(*) AS n FROM hw_signals WHERE hw_import_id=?').get(importId).n;
-    const signals = db.prepare(
+    const total   = Number((await db.prepare('SELECT COUNT(*) AS n FROM hw_signals WHERE hw_import_id=?').get(importId)).n);
+    const signals = await db.prepare(
       `SELECT * FROM hw_signals WHERE hw_import_id=? ORDER BY station_address, slot, channel, row_number
        LIMIT ? OFFSET ?`
     ).all(importId, limit, offset);
@@ -1513,7 +1809,7 @@ router.get('/imports/:id/signals', (req, res) => {
 });
 
 // PATCH /api/hw-config/imports/:id/stations/:addr — edit station name / ip / subsystemNo
-router.patch('/imports/:id/stations/:addr', (req, res) => {
+router.patch('/imports/:id/stations/:addr', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id,   10);
@@ -1528,16 +1824,36 @@ router.patch('/imports/:id/stations/:addr', (req, res) => {
     if (router_address  !== undefined) { sets.push('router_address=?');  vals.push(router_address); }
     if (!sets.length) return err(res, 400, 'Nothing to update');
 
+    // Validate device name uniqueness if station_name is being updated
+    if (station_name !== undefined && station_name.trim()) {
+      const duplicate = await db.prepare(
+        'SELECT COUNT(*) AS cnt FROM hw_signals WHERE hw_import_id=? AND station_address != ? AND station_name=?'
+      ).get(importId, addr, station_name);
+      if (Number(duplicate.cnt) > 0) {
+        return err(res, 400, `Device name "${station_name}" already exists. Device names must be unique.`);
+      }
+    }
+
+    // Validate IP uniqueness if ip_address is being updated
+    if (ip_address !== undefined && String(ip_address).trim()) {
+      const duplicate = await db.prepare(
+        'SELECT COUNT(*) AS cnt FROM hw_signals WHERE hw_import_id=? AND station_address != ? AND ip_address=?'
+      ).get(importId, addr, ip_address);
+      if (Number(duplicate.cnt) > 0) {
+        return err(res, 400, `IP "${ip_address}" already exists. Station IPs must be unique.`);
+      }
+    }
+
     vals.push(importId, addr);
-    db.prepare(`UPDATE hw_signals SET ${sets.join(', ')} WHERE hw_import_id=? AND station_address=?`).run(...vals);
+    await db.prepare(`UPDATE hw_signals SET ${sets.join(', ')} WHERE hw_import_id=? AND station_address=?`).run(...vals);
     // Invalidate cached generated CFG so next download reflects the updated values
-    db.prepare('DELETE FROM hw_generated_cfgs WHERE hw_import_id=?').run(importId);
+    await db.prepare('DELETE FROM hw_generated_cfgs WHERE hw_import_id=?').run(importId);
     res.json({ ok: true });
   } catch (e) { err(res, 500, e.message); }
 });
 
 // PATCH /api/hw-config/imports/:id/stations/:addr/slots/:slot — edit module name / order_no
-router.patch('/imports/:id/stations/:addr/slots/:slot', (req, res) => {
+router.patch('/imports/:id/stations/:addr/slots/:slot', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id,   10);
@@ -1551,17 +1867,27 @@ router.patch('/imports/:id/stations/:addr/slots/:slot', (req, res) => {
     if (module_order_no !== undefined) { sets.push('module_order_no=?'); vals.push(module_order_no); }
     if (!sets.length) return err(res, 400, 'Nothing to update');
 
+    // Validate device name uniqueness if module_name is being updated
+    if (module_name !== undefined && module_name.trim()) {
+      const duplicate = await db.prepare(
+        'SELECT COUNT(*) AS cnt FROM hw_signals WHERE hw_import_id=? AND (station_address != ? OR slot != ?) AND module_name=?'
+      ).get(importId, addr, slot, module_name);
+      if (Number(duplicate.cnt) > 0) {
+        return err(res, 400, `Device name "${module_name}" already exists. Device names must be unique.`);
+      }
+    }
+
     vals.push(importId, addr, slot);
-    db.prepare(
+    await db.prepare(
       `UPDATE hw_signals SET ${sets.join(', ')} WHERE hw_import_id=? AND station_address=? AND slot=?`
     ).run(...vals);
-    db.prepare('DELETE FROM hw_generated_cfgs WHERE hw_import_id=?').run(importId);
+    await db.prepare('DELETE FROM hw_generated_cfgs WHERE hw_import_id=?').run(importId);
     res.json({ ok: true });
   } catch (e) { err(res, 500, e.message); }
 });
 
 // PATCH /imports/:id/stations/:addr/slots/:slot/potential-group
-router.patch('/imports/:id/stations/:addr/slots/:slot/potential-group', (req, res) => {
+router.patch('/imports/:id/stations/:addr/slots/:slot/potential-group', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id,   10);
@@ -1570,7 +1896,7 @@ router.patch('/imports/:id/stations/:addr/slots/:slot/potential-group', (req, re
     const { potentialGroup } = req.body; // "NEW_GROUP" | "LEFT_MODULE" | null
     const val = potentialGroup === 'NEW_GROUP' || potentialGroup === 'LEFT_MODULE'
       ? potentialGroup : null;
-    db.prepare(
+    await db.prepare(
       'UPDATE hw_signals SET potential_group=? WHERE hw_import_id=? AND station_address=? AND slot=?'
     ).run(val, importId, addr, slot);
     res.json({ ok: true });
@@ -1578,7 +1904,7 @@ router.patch('/imports/:id/stations/:addr/slots/:slot/potential-group', (req, re
 });
 
 // PATCH /imports/:id/stations/:addr/slots/:slot/pip — assign PIP to a slot
-router.patch('/imports/:id/stations/:addr/slots/:slot/pip', (req, res) => {
+router.patch('/imports/:id/stations/:addr/slots/:slot/pip', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id,   10);
@@ -1587,7 +1913,7 @@ router.patch('/imports/:id/stations/:addr/slots/:slot/pip', (req, res) => {
     const { pipNo } = req.body; // null = "None / Default OB1", integer = PIP number
 
     const val = pipNo == null ? null : parseInt(pipNo, 10);
-    db.prepare(
+    await db.prepare(
       'UPDATE hw_signals SET pip_no=? WHERE hw_import_id=? AND station_address=? AND slot=?'
     ).run(val, importId, addr, slot);
     res.json({ ok: true });
@@ -1595,7 +1921,7 @@ router.patch('/imports/:id/stations/:addr/slots/:slot/pip', (req, res) => {
 });
 
 // PATCH /imports/:id/stations/:addr/slots/:slot/pa-profile — set PA subslot-1 profile for a CFU_PA device slot
-router.patch('/imports/:id/stations/:addr/slots/:slot/pa-profile', (req, res) => {
+router.patch('/imports/:id/stations/:addr/slots/:slot/pa-profile', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id,   10);
@@ -1604,11 +1930,11 @@ router.patch('/imports/:id/stations/:addr/slots/:slot/pa-profile', (req, res) =>
     const { paProfile } = req.body;
 
     // Validate against catalogue: must be a known subslot template in the same CFU_PA family
-    const known = db.prepare(
+    const known = await db.prepare(
       "SELECT order_no FROM hw_module_templates WHERE order_no=? AND hw_category='subslot' AND family='CFU_PA'"
     ).get(paProfile);
     const val = (paProfile && known) ? paProfile : null;
-    db.prepare(
+    await db.prepare(
       'UPDATE hw_signals SET pa_profile=? WHERE hw_import_id=? AND station_address=? AND slot=?'
     ).run(val, importId, addr, slot);
     res.json({ ok: true });
@@ -1616,7 +1942,7 @@ router.patch('/imports/:id/stations/:addr/slots/:slot/pa-profile', (req, res) =>
 });
 
 // PATCH /imports/:id/stations/:addr/slots/:slot/subslots/:ssNo/pa-profile — set per-subslot PA profile
-router.patch('/imports/:id/stations/:addr/slots/:slot/subslots/:ssNo/pa-profile', (req, res) => {
+router.patch('/imports/:id/stations/:addr/slots/:slot/subslots/:ssNo/pa-profile', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id,   10);
@@ -1626,11 +1952,11 @@ router.patch('/imports/:id/stations/:addr/slots/:slot/subslots/:ssNo/pa-profile'
     const { paProfile } = req.body;
 
     const known = paProfile
-      ? db.prepare("SELECT order_no FROM hw_module_templates WHERE order_no=? AND hw_category='subslot' AND family='CFU_PA'").get(paProfile)
+      ? await db.prepare("SELECT order_no FROM hw_module_templates WHERE order_no=? AND hw_category='subslot' AND family='CFU_PA'").get(paProfile)
       : null;
     const val = (paProfile && known) ? paProfile : null;
 
-    db.prepare(
+    await db.prepare(
       `INSERT INTO hw_slot_subslots (hw_import_id, station_address, slot, subslot_no, pa_profile)
        VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(hw_import_id, station_address, slot, subslot_no) DO UPDATE SET pa_profile=excluded.pa_profile`
@@ -1643,11 +1969,11 @@ router.patch('/imports/:id/stations/:addr/slots/:slot/subslots/:ssNo/pa-profile'
 // ── Manual station / slot management ─────────────────────────────────────────
 
 // POST /imports/:id/stations — add a station manually
-router.post('/imports/:id/stations', (req, res) => {
+router.post('/imports/:id/stations', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id, 10);
-    const hwImport = db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
+    const hwImport = await db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
     if (!hwImport) return err(res, 404, 'HW import not found');
 
     const { address, name, ip, subsystemNo, imOrderNo, imName } = req.body;
@@ -1655,7 +1981,7 @@ router.post('/imports/:id/stations', (req, res) => {
     if (!imOrderNo) return err(res, 400, 'imOrderNo (Slot 0 IM type) required');
 
     const addr = parseInt(address, 10);
-    const exists = db.prepare(
+    const exists = await db.prepare(
       'SELECT id FROM hw_signals WHERE hw_import_id=? AND station_address=? LIMIT 1'
     ).get(importId, addr);
     if (exists) return err(res, 409, `Station ${addr} already exists`);
@@ -1663,18 +1989,33 @@ router.post('/imports/:id/stations', (req, res) => {
     const stationName = name || `Station_${addr}`;
     const subsysNo    = subsystemNo ?? 100;
 
+    // Reject if the new station's address / name / IP collides with an existing station.
+    {
+      const existingStations = await loadExistingStations(db, importId);
+      const conflictStations = [
+        ...existingStations,
+        { address: addr, name: stationName, ip: ip || null },
+      ];
+      const conflicts = findStationConflicts(conflictStations);
+      if (conflicts.length) {
+        return err(res, 400, 'Duplicate stations: ' + conflicts.join('; '), {
+          conflictRows: buildConflictTable(conflictStations),
+        });
+      }
+    }
+
     // Load the auto-slot configuration for this station (keyed by IM order_no).
     // This is completely generic — whatever slots are defined in the config get created,
     // regardless of hardware family (ET200, CFU, Scalance, Festo, etc.)
-    const autoSlotConfig = loadStationAutoSlotConfig(db, imOrderNo);
+    const autoSlotConfig = await loadStationAutoSlotConfig(db, imOrderNo);
 
     const insSignal = db.prepare(`INSERT INTO hw_signals
       (hw_import_id, station_address, station_name, ip_address, slot, module_order_no, module_name, subsystem_no)
       VALUES (?,?,?,?,?,?,?,?)`);
 
-    const insertStation = db.transaction(() => {
+    const insertStation = db.transaction(async () => {
       // Slot 0 = station head — always inserted (holds IP, name, subsystem)
-      insSignal.run(importId, addr, stationName, ip || null, 0, imOrderNo, imName || imOrderNo, subsysNo);
+      await insSignal.run(importId, addr, stationName, ip || null, 0, imOrderNo, imName || imOrderNo, subsysNo);
 
       // Create all additional slots (slot ≥ 1) from the auto-slot config.
       // Slot 0's subslots (ports/interface) are AUTOCREATED at generation time from
@@ -1683,7 +2024,7 @@ router.post('/imports/:id/stations', (req, res) => {
         for (const slotCfg of autoSlotConfig.slots) {
           if (slotCfg.slot == null || slotCfg.slot === 0) continue; // skip head; already inserted
           if (!slotCfg.order_no) continue; // no module defined for this slot
-          insSignal.run(
+          await insSignal.run(
             importId, addr, stationName, ip || null,
             slotCfg.slot, slotCfg.order_no,
             slotCfg.label || slotCfg.order_no, subsysNo
@@ -1691,26 +2032,26 @@ router.post('/imports/:id/stations', (req, res) => {
         }
       }
     });
-    insertStation();
+    await insertStation();
 
     res.status(201).json({ ok: true });
   } catch (e) { err(res, 500, e.message); }
 });
 
 // POST /imports/:id/stations/:addr/copy — duplicate a station with next address + incremented IP
-router.post('/imports/:id/stations/:addr/copy', (req, res) => {
+router.post('/imports/:id/stations/:addr/copy', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id,   10);
     const srcAddr  = parseInt(req.params.addr, 10);
 
-    const srcRows = db.prepare(
+    const srcRows = await db.prepare(
       'SELECT * FROM hw_signals WHERE hw_import_id=? AND station_address=? ORDER BY slot, channel, row_number'
     ).all(importId, srcAddr);
     if (srcRows.length === 0) return err(res, 404, `Station ${srcAddr} not found`);
 
     // Next address = max used address + 1
-    const maxRow = db.prepare('SELECT MAX(station_address) AS m FROM hw_signals WHERE hw_import_id=?').get(importId);
+    const maxRow = await db.prepare('SELECT MAX(station_address) AS m FROM hw_signals WHERE hw_import_id=?').get(importId);
     const newAddr = (maxRow.m || 0) + 1;
 
     // Increment last IP octet
@@ -1724,8 +2065,23 @@ router.post('/imports/:id/stations/:addr/copy', (req, res) => {
       }
     }
 
-    if (db.prepare('SELECT id FROM hw_signals WHERE hw_import_id=? AND station_address=? LIMIT 1').get(importId, newAddr)) {
+    if (await db.prepare('SELECT id FROM hw_signals WHERE hw_import_id=? AND station_address=? LIMIT 1').get(importId, newAddr)) {
       return err(res, 409, `Station ${newAddr} already exists`);
+    }
+
+    // The copy reuses the source Device Name verbatim, which violates the per-import
+    // uniqueness rule (name must be unique). Reject with a clear message so the user
+    // renames the copy instead of silently creating a duplicate.
+    {
+      const existingStations = await loadExistingStations(db, importId);
+      const conflicts = findStationConflicts([
+        ...existingStations,
+        { address: newAddr, name: srcRows[0].station_name, ip: newIp || null },
+      ]);
+      if (conflicts.length) {
+        return err(res, 400, 'Cannot copy — duplicate stations: ' + conflicts.join('; ')
+          + '. Rename the source or edit the copy afterwards.');
+      }
     }
 
     const ins = db.prepare(`INSERT INTO hw_signals
@@ -1733,52 +2089,65 @@ router.post('/imports/:id/stations/:addr/copy', (req, res) => {
        slot, channel, module_order_no, module_name, tag, description, signal_type, subsystem_no, router_address, potential_group)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
 
-    const srcSubslots = db.prepare(
+    const srcSubslots = await db.prepare(
       'SELECT slot, subslot_no, pa_profile FROM hw_slot_subslots WHERE hw_import_id=? AND station_address=?'
     ).all(importId, srcAddr);
 
     const insSubslot = db.prepare(
-      `INSERT OR IGNORE INTO hw_slot_subslots (hw_import_id, station_address, slot, subslot_no, pa_profile)
-       VALUES (?, ?, ?, ?, ?)`
+      `INSERT INTO hw_slot_subslots (hw_import_id, station_address, slot, subslot_no, pa_profile)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (hw_import_id, station_address, slot, subslot_no) DO NOTHING`
     );
 
-    const copy = db.transaction(() => {
+    const copy = db.transaction(async () => {
       for (const r of srcRows) {
-        ins.run(
+        await ins.run(
           importId, r.row_number, newAddr, r.station_name, newIp,
           r.slot, r.channel, r.module_order_no, r.module_name,
           r.tag, r.description, r.signal_type, r.subsystem_no, r.router_address, r.potential_group ?? null
         );
       }
       for (const r of srcSubslots) {
-        insSubslot.run(importId, newAddr, r.slot, r.subslot_no, r.pa_profile);
+        await insSubslot.run(importId, newAddr, r.slot, r.subslot_no, r.pa_profile);
       }
     });
-    copy();
+    await copy();
 
     res.status(201).json({ ok: true, newAddress: newAddr, newIp });
   } catch (e) { err(res, 500, e.message); }
 });
 
 // DELETE /imports/:id/stations/:addr — remove a station and all its signals
-router.delete('/imports/:id/stations/:addr', (req, res) => {
+router.delete('/imports/:id/stations/:addr', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id,   10);
     const addr     = parseInt(req.params.addr, 10);
-    db.prepare('DELETE FROM hw_signals WHERE hw_import_id=? AND station_address=?').run(importId, addr);
-    db.prepare('DELETE FROM hw_slot_subslots WHERE hw_import_id=? AND station_address=?').run(importId, addr);
+
+    const del = db.transaction(async () => {
+      // First delete dependent instance_ios rows that reference these hw_signals
+      const hwIds = await db.prepare(
+        'SELECT id FROM hw_signals WHERE hw_import_id=? AND station_address=?'
+      ).all(importId, addr);
+      for (const row of hwIds) {
+        await db.prepare('DELETE FROM instance_ios WHERE hw_signal_id=?').run(row.id);
+      }
+      // Then delete the hw_signals and subslots
+      await db.prepare('DELETE FROM hw_signals WHERE hw_import_id=? AND station_address=?').run(importId, addr);
+      await db.prepare('DELETE FROM hw_slot_subslots WHERE hw_import_id=? AND station_address=?').run(importId, addr);
+    });
+    await del();
     res.json({ ok: true });
   } catch (e) { err(res, 500, e.message); }
 });
 
 // POST /imports/:id/stations/:addr/slots — add a slot manually
-router.post('/imports/:id/stations/:addr/slots', (req, res) => {
+router.post('/imports/:id/stations/:addr/slots', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id,   10);
     const addr     = parseInt(req.params.addr, 10);
-    const hwImport = db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
+    const hwImport = await db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
     if (!hwImport) return err(res, 404, 'HW import not found');
 
     const { slot, moduleOrderNo, moduleName } = req.body;
@@ -1787,34 +2156,35 @@ router.post('/imports/:id/stations/:addr/slots', (req, res) => {
     const slotNo = parseInt(slot, 10);
 
     // CFU_PA: slots 0-2 are reserved system slots — only allow user slots ≥3
-    const imRow = db.prepare('SELECT module_order_no FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=0 LIMIT 1').get(importId, addr);
+    const imRow = await db.prepare('SELECT module_order_no FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=0 LIMIT 1').get(importId, addr);
     if (imRow) {
-      const imTpl = db.prepare('SELECT family FROM hw_module_templates WHERE order_no=?').get(imRow.module_order_no);
+      const imTpl = await db.prepare('SELECT family FROM hw_module_templates WHERE order_no=?').get(imRow.module_order_no);
       if (imTpl && imTpl.family === 'CFU_PA' && slotNo < 3) {
         return err(res, 400, 'CFU_PA: Slots 0, 1, and 2 are reserved system slots. Add from Slot 3 onwards.');
       }
     }
 
     // Carry station-level info from existing rows for this station
-    const head = db.prepare(
+    const head = await db.prepare(
       'SELECT station_name, ip_address, subsystem_no, router_address FROM hw_signals WHERE hw_import_id=? AND station_address=? LIMIT 1'
     ).get(importId, addr);
 
     // Auto-default POTENTIAL_GROUP for ET200SP I/O slots (slot > 0).
     // Rule: if the slot immediately to the left (slotNo-1) has the same order_no,
     // default to LEFT_MODULE; otherwise NEW_GROUP.
-    const headTpl = db.prepare('SELECT family FROM hw_module_templates WHERE order_no=?')
-      .get(db.prepare('SELECT module_order_no FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=0 LIMIT 1')
-          .get(importId, addr)?.module_order_no || '');
+    const slot0 = await db.prepare('SELECT module_order_no FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=0 LIMIT 1')
+          .get(importId, addr);
+    const headTpl = await db.prepare('SELECT family FROM hw_module_templates WHERE order_no=?')
+      .get(slot0?.module_order_no || '');
     const stationFamily = headTpl ? headTpl.family : null;
     let defaultPotentialGroup = null;
     if (stationFamily && stationFamily.startsWith('ET200') && slotNo > 0) {
-      const tplForNew = db.prepare('SELECT param_template FROM hw_module_templates WHERE order_no=?').get(moduleOrderNo);
+      const tplForNew = await db.prepare('SELECT param_template FROM hw_module_templates WHERE order_no=?').get(moduleOrderNo);
       const hasPotentialGroup = tplForNew
         ? (tplForNew.param_template || '').includes('POTENTIAL_GROUP')
         : true; // unknown modules get the default applied
       if (hasPotentialGroup) {
-        const leftSlot = db.prepare(
+        const leftSlot = await db.prepare(
           'SELECT module_order_no FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=? LIMIT 1'
         ).get(importId, addr, slotNo - 1);
         defaultPotentialGroup = (leftSlot && leftSlot.module_order_no === moduleOrderNo)
@@ -1823,7 +2193,7 @@ router.post('/imports/:id/stations/:addr/slots', (req, res) => {
       }
     }
 
-    db.prepare(`INSERT INTO hw_signals
+    await db.prepare(`INSERT INTO hw_signals
       (hw_import_id, station_address, station_name, ip_address, slot, module_order_no, module_name, subsystem_no, router_address, potential_group)
       VALUES (?,?,?,?,?,?,?,?,?,?)`
     ).run(
@@ -1841,31 +2211,40 @@ router.post('/imports/:id/stations/:addr/slots', (req, res) => {
 });
 
 // DELETE /imports/:id/stations/:addr/slots/:slot — remove one slot and renumber remaining
-router.delete('/imports/:id/stations/:addr/slots/:slot', (req, res) => {
+router.delete('/imports/:id/stations/:addr/slots/:slot', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id,   10);
     const addr     = parseInt(req.params.addr, 10);
     const slot     = parseInt(req.params.slot, 10);
 
-    db.transaction(() => {
-      db.prepare('DELETE FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=?').run(importId, addr, slot);
-      db.prepare('DELETE FROM hw_slot_subslots WHERE hw_import_id=? AND station_address=? AND slot=?').run(importId, addr, slot);
+    await db.transaction(async () => {
+      // First delete dependent instance_ios rows that reference these hw_signals
+      const hwIds = await db.prepare(
+        'SELECT id FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=?'
+      ).all(importId, addr, slot);
+      for (const row of hwIds) {
+        await db.prepare('DELETE FROM instance_ios WHERE hw_signal_id=?').run(row.id);
+      }
+      // Then delete the hw_signals and subslots
+      await db.prepare('DELETE FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=?').run(importId, addr, slot);
+      await db.prepare('DELETE FROM hw_slot_subslots WHERE hw_import_id=? AND station_address=? AND slot=?').run(importId, addr, slot);
 
       // Renumber remaining user slots to be contiguous.
       // CFU_PA reserves slots 0-2 (head + DIQ8 + PA Master); all others start user slots at 1.
-      const imRow = db.prepare(
+      const imRow = await db.prepare(
         'SELECT module_order_no FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=0 LIMIT 1'
       ).get(importId, addr);
       const imTpl = imRow
-        ? db.prepare('SELECT family FROM hw_module_templates WHERE order_no=?').get(imRow.module_order_no)
+        ? await db.prepare('SELECT family FROM hw_module_templates WHERE order_no=?').get(imRow.module_order_no)
         : null;
       const firstUser = (imTpl && imTpl.family === 'CFU_PA') ? 3 : 1;
 
       // Distinct user slot numbers still present, sorted ascending
-      const userSlots = db.prepare(
+      const userSlotRows = await db.prepare(
         'SELECT DISTINCT slot FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot>=? ORDER BY slot'
-      ).all(importId, addr, firstUser).map(r => r.slot);
+      ).all(importId, addr, firstUser);
+      const userSlots = userSlotRows.map(r => r.slot);
 
       if (userSlots.length === 0) return;
       const isContiguous = userSlots.every((s, i) => s === firstUser + i);
@@ -1874,14 +2253,14 @@ router.delete('/imports/:id/stations/:addr/slots/:slot', (req, res) => {
       // Two-pass renumber through temporary negative slots to avoid unique-key conflicts.
       for (let i = userSlots.length - 1; i >= 0; i--) {
         const tmp = -(i + 1);
-        db.prepare('UPDATE hw_signals SET slot=? WHERE hw_import_id=? AND station_address=? AND slot=?').run(tmp, importId, addr, userSlots[i]);
-        db.prepare('UPDATE hw_slot_subslots SET slot=? WHERE hw_import_id=? AND station_address=? AND slot=?').run(tmp, importId, addr, userSlots[i]);
+        await db.prepare('UPDATE hw_signals SET slot=? WHERE hw_import_id=? AND station_address=? AND slot=?').run(tmp, importId, addr, userSlots[i]);
+        await db.prepare('UPDATE hw_slot_subslots SET slot=? WHERE hw_import_id=? AND station_address=? AND slot=?').run(tmp, importId, addr, userSlots[i]);
       }
       for (let i = 0; i < userSlots.length; i++) {
         const tmp    = -(i + 1);
         const newSlot = firstUser + i;
-        db.prepare('UPDATE hw_signals SET slot=? WHERE hw_import_id=? AND station_address=? AND slot=?').run(newSlot, importId, addr, tmp);
-        db.prepare('UPDATE hw_slot_subslots SET slot=? WHERE hw_import_id=? AND station_address=? AND slot=?').run(newSlot, importId, addr, tmp);
+        await db.prepare('UPDATE hw_signals SET slot=? WHERE hw_import_id=? AND station_address=? AND slot=?').run(newSlot, importId, addr, tmp);
+        await db.prepare('UPDATE hw_slot_subslots SET slot=? WHERE hw_import_id=? AND station_address=? AND slot=?').run(newSlot, importId, addr, tmp);
       }
     })();
 
@@ -1893,14 +2272,14 @@ router.delete('/imports/:id/stations/:addr/slots/:slot', (req, res) => {
 
 // GET /imports/:id/stations/:addr/slots/:slot/channels
 // Returns one row per channel (0-indexed), creating missing rows up to channel_count from template.
-router.get('/imports/:id/stations/:addr/slots/:slot/channels', (req, res) => {
+router.get('/imports/:id/stations/:addr/slots/:slot/channels', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id,   10);
     const addr     = parseInt(req.params.addr, 10);
     const slot     = parseInt(req.params.slot, 10);
 
-    const existing = db.prepare(
+    const existing = await db.prepare(
       `SELECT id, channel, tag, description, signal_type
        FROM hw_signals
        WHERE hw_import_id=? AND station_address=? AND slot=?
@@ -1908,16 +2287,19 @@ router.get('/imports/:id/stations/:addr/slots/:slot/channels', (req, res) => {
     ).all(importId, addr, slot);
 
     // Get channel_count from template for this slot
-    const slotMeta = db.prepare(
+    const slotMeta = await db.prepare(
       `SELECT module_order_no FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=? LIMIT 1`
     ).get(importId, addr, slot);
 
     let channelCount = existing.length;
     let slotSignalType = null;
-    if (slotMeta) {
-      const tpl = db.prepare('SELECT channel_count, signal_type FROM hw_module_templates WHERE order_no=?').get(slotMeta.module_order_no);
+    if (slotMeta && slotMeta.module_order_no) {
+      const tpl = await db.prepare('SELECT channel_count, signal_type FROM hw_module_templates WHERE order_no=?').get(slotMeta.module_order_no);
+      console.log(`[Channels] slot=${slot} order_no="${slotMeta.module_order_no}" found_template=${!!tpl} channel_count=${tpl?.channel_count || 'N/A'}`);
       if (tpl && tpl.channel_count > 0) channelCount = tpl.channel_count;
       if (tpl) slotSignalType = tpl.signal_type;
+    } else {
+      console.log(`[Channels] slot=${slot} no slotMeta or module_order_no is null`);
     }
 
     // Build a full channel list: existing rows + empty placeholders for gaps.
@@ -1955,7 +2337,7 @@ router.get('/imports/:id/stations/:addr/slots/:slot/channels', (req, res) => {
 });
 
 // PATCH /imports/:id/stations/:addr/slots/:slot/channels/:ch
-router.patch('/imports/:id/stations/:addr/slots/:slot/channels/:ch', (req, res) => {
+router.patch('/imports/:id/stations/:addr/slots/:slot/channels/:ch', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id,   10);
@@ -1964,7 +2346,7 @@ router.patch('/imports/:id/stations/:addr/slots/:slot/channels/:ch', (req, res) 
     const ch       = parseInt(req.params.ch,   10);
     const { tag, description, signal_type } = req.body;
 
-    const existing = db.prepare(
+    const existing = await db.prepare(
       'SELECT id FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=? AND channel=?'
     ).get(importId, addr, slot, ch);
 
@@ -1975,15 +2357,15 @@ router.patch('/imports/:id/stations/:addr/slots/:slot/channels/:ch', (req, res) 
       if (signal_type !== undefined) { sets.push('signal_type=?'); vals.push(signal_type); }
       if (sets.length) {
         vals.push(existing.id);
-        db.prepare(`UPDATE hw_signals SET ${sets.join(', ')} WHERE id=?`).run(...vals);
+        await db.prepare(`UPDATE hw_signals SET ${sets.join(', ')} WHERE id=?`).run(...vals);
       }
     } else {
       // Row doesn't exist yet — pull station/slot metadata for required FK fields
-      const head = db.prepare(
+      const head = await db.prepare(
         `SELECT station_name, ip_address, module_order_no, module_name, subsystem_no, router_address
          FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=? LIMIT 1`
       ).get(importId, addr, slot);
-      db.prepare(`INSERT INTO hw_signals
+      await db.prepare(`INSERT INTO hw_signals
         (hw_import_id, station_address, station_name, ip_address, slot, channel,
          module_order_no, module_name, subsystem_no, router_address, tag, description, signal_type)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
@@ -2006,11 +2388,11 @@ router.post('/imports/:id/generate', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id, 10);
-    const hwImport = db.prepare('SELECT * FROM hw_imports WHERE id=?').get(importId);
+    const hwImport = await db.prepare('SELECT * FROM hw_imports WHERE id=?').get(importId);
     if (!hwImport)           return err(res, 404, 'HW import not found');
     if (!hwImport.baseline_cfg) return err(res, 400, 'No baseline CFG uploaded');
 
-    const tplRows    = db.prepare('SELECT * FROM hw_module_templates').all();
+    const tplRows    = await db.prepare('SELECT * FROM hw_module_templates').all();
     const templateMap = new Map(tplRows.map(t => [t.order_no, t]));
 
     // Optional filter: generate only specific station addresses or only approved ones
@@ -2024,15 +2406,15 @@ router.post('/imports/:id/generate', async (req, res) => {
       signalQuery += ` AND station_address IN (${filterAddrs.map(() => '?').join(',')})`;
       queryParams.push(...filterAddrs);
     } else if (filterMode === 'approved') {
-      signalQuery += ' AND COALESCE(approved,0)=1';
+      signalQuery += ' AND COALESCE(approved,false)=true';
     }
     signalQuery += ' ORDER BY station_address, slot, channel, row_number';
 
-    const signals = db.prepare(signalQuery).all(...queryParams);
+    const signals = await db.prepare(signalQuery).all(...queryParams);
     if (signals.length === 0) return err(res, 400, 'No signals or modules configured — add modules in Configuration');
 
     // Load per-subslot profiles for all stations in this import
-    const subslotRows = db.prepare(
+    const subslotRows = await db.prepare(
       'SELECT station_address, slot, subslot_no, pa_profile FROM hw_slot_subslots WHERE hw_import_id=? ORDER BY station_address, slot, subslot_no'
     ).all(importId);
     const subslotMap = new Map();
@@ -2067,6 +2449,7 @@ router.post('/imports/:id/generate', async (req, res) => {
           pipNo:          sig.pip_no != null ? sig.pip_no : null,
           potentialGroup: sig.potential_group != null ? sig.potential_group : null,
           paProfile:      sig.pa_profile || null,
+          mlfb:           sig.station_mlfb || null,
           subslots:       subslotMap.get(`${addr}:${sig.slot}`) || [],
           channels:       [],
         });
@@ -2084,39 +2467,39 @@ router.post('/imports/:id/generate', async (req, res) => {
       parsedBaseline.existingAddresses.maxOutput
     );
 
-    const { cfg: cfgText, warnings } = generateCfg(parsedBaseline, stations, templateMap, db);
+    const { cfg: cfgText, warnings } = await generateCfg(parsedBaseline, stations, templateMap, db);
 
     let moduleCount = 0;
     for (const st of stations.values()) moduleCount += st.slots.size;
     // Persist warnings in stats so they survive a reload of the generated CFG list.
     const stats = JSON.stringify({ stations: stations.size, modules: moduleCount, signals: signals.length, warnings });
 
-    db.prepare('DELETE FROM hw_generated_cfgs WHERE hw_import_id=?').run(importId);
-    const r = db.prepare(
+    await db.prepare('DELETE FROM hw_generated_cfgs WHERE hw_import_id=?').run(importId);
+    const r = await db.prepare(
       'INSERT INTO hw_generated_cfgs (hw_import_id, cfg_text, stats) VALUES (?,?,?)'
     ).run(importId, cfgText, stats);
-    db.prepare('UPDATE hw_imports SET status=? WHERE id=?').run('generated', importId);
+    await db.prepare('UPDATE hw_imports SET status=? WHERE id=?').run('generated', importId);
 
     res.json({ cfgId: r.lastInsertRowid, stats: JSON.parse(stats), warnings, previewLines: cfgText.split('\n').slice(0, 30) });
   } catch (e) { err(res, 500, e.message); }
 });
 
-router.get('/imports/:id/cfgs', (req, res) => {
+router.get('/imports/:id/cfgs', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id, 10);
-    const rows = db.prepare(
+    const rows = await db.prepare(
       'SELECT id, stats, generated_at FROM hw_generated_cfgs WHERE hw_import_id=? ORDER BY id DESC'
     ).all(importId);
     res.json(rows.map(r => ({ ...r, stats: r.stats ? JSON.parse(r.stats) : null })));
   } catch (e) { err(res, 500, e.message); }
 });
 
-router.get('/imports/:id/cfgs/:cfgId/download', (req, res) => {
+router.get('/imports/:id/cfgs/:cfgId/download', async (req, res) => {
   try {
     const db    = getDb();
     const cfgId = parseInt(req.params.cfgId, 10);
-    const row   = db.prepare('SELECT cfg_text FROM hw_generated_cfgs WHERE id=?').get(cfgId);
+    const row   = await db.prepare('SELECT cfg_text FROM hw_generated_cfgs WHERE id=?').get(cfgId);
     if (!row) return err(res, 404, 'CFG not found');
 
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
@@ -2129,36 +2512,36 @@ router.get('/imports/:id/cfgs/:cfgId/download', (req, res) => {
 
 // GET /slot-compat
 // Returns all rows: [{ id, slot_order_no, subslot_order_no, is_default }]
-router.get('/slot-compat', (req, res) => {
+router.get('/slot-compat', async (req, res) => {
   try {
     const db = getDb();
-    const rows = db.prepare('SELECT id, slot_order_no, subslot_order_no, is_default FROM hw_slot_subslot_compat ORDER BY slot_order_no, subslot_order_no').all();
+    const rows = await db.prepare('SELECT id, slot_order_no, subslot_order_no, is_default FROM hw_slot_subslot_compat ORDER BY slot_order_no, subslot_order_no').all();
     res.json(rows);
   } catch (e) { err(res, 500, e.message); }
 });
 
 // POST /slot-compat
 // Body: { slot_order_no, subslot_order_no, is_default? }
-router.post('/slot-compat', (req, res) => {
+router.post('/slot-compat', async (req, res) => {
   try {
     const db = getDb();
     const { slot_order_no, subslot_order_no, is_default = 0 } = req.body;
     if (!slot_order_no || !subslot_order_no) return err(res, 400, 'slot_order_no and subslot_order_no required');
-    const r = db.prepare(
-      'INSERT OR IGNORE INTO hw_slot_subslot_compat (slot_order_no, subslot_order_no, is_default) VALUES (?,?,?)'
-    ).run(slot_order_no, subslot_order_no, is_default ? 1 : 0);
-    res.status(201).json({ id: r.lastInsertRowid, inserted: r.changes > 0 });
+    const r = await db.prepare(
+      'INSERT INTO hw_slot_subslot_compat (slot_order_no, subslot_order_no, is_default) VALUES (?,?,?) ON CONFLICT (slot_order_no, subslot_order_no) DO NOTHING'
+    ).run(slot_order_no, subslot_order_no, !!is_default);
+    res.status(201).json({ id: r.lastInsertRowid, inserted: r.rowCount > 0 });
   } catch (e) { err(res, 500, e.message); }
 });
 
 // DELETE /slot-compat
 // Body: { slot_order_no, subslot_order_no }
-router.delete('/slot-compat', (req, res) => {
+router.delete('/slot-compat', async (req, res) => {
   try {
     const db = getDb();
     const { slot_order_no, subslot_order_no } = req.body;
     if (!slot_order_no || !subslot_order_no) return err(res, 400, 'slot_order_no and subslot_order_no required');
-    db.prepare('DELETE FROM hw_slot_subslot_compat WHERE slot_order_no=? AND subslot_order_no=?')
+    await db.prepare('DELETE FROM hw_slot_subslot_compat WHERE slot_order_no=? AND subslot_order_no=?')
       .run(slot_order_no, subslot_order_no);
     res.json({ ok: true });
   } catch (e) { err(res, 500, e.message); }
@@ -2169,10 +2552,10 @@ router.delete('/slot-compat', (req, res) => {
 // Infer each slot/subslot's `type` from the catalogue + structural position, so the
 // UI never has to expose a "type" field. The generator relies on subslot.type==='port'
 // to emit PORT blocks; everything else is descriptive.
-function inferAutoSlotTypes(db, config) {
+async function inferAutoSlotTypes(db, config) {
   if (!config || !Array.isArray(config.slots)) return config;
 
-  const tplRows = db.prepare('SELECT order_no, hw_category, signal_type, display_name FROM hw_module_templates').all();
+  const tplRows = await db.prepare('SELECT order_no, hw_category, signal_type, display_name FROM hw_module_templates').all();
   const tplMap  = new Map(tplRows.map(t => [t.order_no, t]));
 
   // A subslot is a network port if the catalogue marks it INFRA/port-ish, its order_no
@@ -2199,10 +2582,10 @@ function inferAutoSlotTypes(db, config) {
 }
 
 // GET /station-auto-slots — List all stations + their auto-slot configs (by order_no)
-router.get('/station-auto-slots', (req, res) => {
+router.get('/station-auto-slots', async (req, res) => {
   try {
     const db = getDb();
-    const rows = db.prepare(
+    const rows = await db.prepare(
       'SELECT order_no, auto_slots_config, created_at, updated_at FROM hw_station_auto_slots ORDER BY order_no'
     ).all();
 
@@ -2220,13 +2603,13 @@ router.get('/station-auto-slots', (req, res) => {
 // GET /station-auto-slots/:orderNo — Get config for a specific station (by order_no)
 // If config doesn't exist, return an empty template with default rules instead of 404.
 // This allows users to create configurations for new station order numbers.
-router.get('/station-auto-slots/:orderNo', (req, res) => {
+router.get('/station-auto-slots/:orderNo', async (req, res) => {
   try {
     const db = getDb();
     const orderNo = (req.params.orderNo || '').trim();
     if (!orderNo) return err(res, 400, 'orderNo parameter required');
 
-    const row = db.prepare(
+    const row = await db.prepare(
       'SELECT order_no, auto_slots_config, created_at, updated_at FROM hw_station_auto_slots WHERE order_no=?'
     ).get(orderNo);
 
@@ -2262,7 +2645,7 @@ router.get('/station-auto-slots/:orderNo', (req, res) => {
 
 // POST /station-auto-slots — Create or update auto-slot config for a station
 // Body: { order_no, config: {...} }
-router.post('/station-auto-slots', (req, res) => {
+router.post('/station-auto-slots', async (req, res) => {
   try {
     const db = getDb();
     const { order_no, config } = req.body;
@@ -2276,7 +2659,7 @@ router.post('/station-auto-slots', (req, res) => {
     }
 
     // Infer slot/subslot types from the catalogue so the UI never needs a type field
-    inferAutoSlotTypes(db, config);
+    await inferAutoSlotTypes(db, config);
 
     // Validate JSON-serializability
     let configJson;
@@ -2286,15 +2669,15 @@ router.post('/station-auto-slots', (req, res) => {
       return err(res, 400, `Invalid config JSON: ${e.message}`);
     }
 
-    const existing = db.prepare('SELECT id FROM hw_station_auto_slots WHERE order_no=?').get(order_no.trim());
+    const existing = await db.prepare('SELECT id FROM hw_station_auto_slots WHERE order_no=?').get(order_no.trim());
 
     if (existing) {
-      db.prepare(
-        'UPDATE hw_station_auto_slots SET auto_slots_config=?, updated_at=datetime("now") WHERE order_no=?'
+      await db.prepare(
+        'UPDATE hw_station_auto_slots SET auto_slots_config=?, updated_at=NOW() WHERE order_no=?'
       ).run(configJson, order_no.trim());
       return res.json({ ok: true, action: 'updated', order_no: order_no.trim() });
     } else {
-      const r = db.prepare(
+      const r = await db.prepare(
         'INSERT INTO hw_station_auto_slots (order_no, auto_slots_config) VALUES (?, ?)'
       ).run(order_no.trim(), configJson);
       return res.status(201).json({ ok: true, action: 'created', order_no: order_no.trim(), id: r.lastInsertRowid });
@@ -2306,7 +2689,7 @@ router.post('/station-auto-slots', (req, res) => {
 // If config doesn't exist, creates a new one. This allows users to save
 // configurations for any station order_no, not just pre-seeded ones.
 // Body: config JSON object
-router.put('/station-auto-slots/:orderNo', (req, res) => {
+router.put('/station-auto-slots/:orderNo', async (req, res) => {
   try {
     const db = getDb();
     const orderNo = (req.params.orderNo || '').trim();
@@ -2318,7 +2701,7 @@ router.put('/station-auto-slots/:orderNo', (req, res) => {
     }
 
     // Infer slot/subslot types from the catalogue so the UI never needs a type field
-    inferAutoSlotTypes(db, config);
+    await inferAutoSlotTypes(db, config);
 
     // Validate JSON-serializability
     let configJson;
@@ -2328,17 +2711,17 @@ router.put('/station-auto-slots/:orderNo', (req, res) => {
       return err(res, 400, `Invalid JSON: ${e.message}`);
     }
 
-    const existing = db.prepare('SELECT id FROM hw_station_auto_slots WHERE order_no=?').get(orderNo);
+    const existing = await db.prepare('SELECT id FROM hw_station_auto_slots WHERE order_no=?').get(orderNo);
 
     if (existing) {
       // Update existing config
-      db.prepare(
-        'UPDATE hw_station_auto_slots SET auto_slots_config=?, updated_at=datetime("now") WHERE order_no=?'
+      await db.prepare(
+        'UPDATE hw_station_auto_slots SET auto_slots_config=?, updated_at=NOW() WHERE order_no=?'
       ).run(configJson, orderNo);
       res.json({ ok: true, action: 'updated', order_no: orderNo });
     } else {
       // Create new config if it doesn't exist
-      const r = db.prepare(
+      const r = await db.prepare(
         'INSERT INTO hw_station_auto_slots (order_no, auto_slots_config) VALUES (?, ?)'
       ).run(orderNo, configJson);
       res.status(201).json({ ok: true, action: 'created', order_no: orderNo, id: r.lastInsertRowid });
@@ -2347,20 +2730,20 @@ router.put('/station-auto-slots/:orderNo', (req, res) => {
 });
 
 // DELETE /station-auto-slots/:orderNo — Delete auto-slot config for a station
-router.delete('/station-auto-slots/:orderNo', (req, res) => {
+router.delete('/station-auto-slots/:orderNo', async (req, res) => {
   try {
     const db = getDb();
     const orderNo = (req.params.orderNo || '').trim();
 
     if (!orderNo) return err(res, 400, 'orderNo parameter required');
 
-    const existing = db.prepare('SELECT id FROM hw_station_auto_slots WHERE order_no=?').get(orderNo);
+    const existing = await db.prepare('SELECT id FROM hw_station_auto_slots WHERE order_no=?').get(orderNo);
 
     if (!existing) {
       return err(res, 404, `No auto-slot config found for station order_no "${orderNo}"`);
     }
 
-    db.prepare('DELETE FROM hw_station_auto_slots WHERE order_no=?').run(orderNo);
+    await db.prepare('DELETE FROM hw_station_auto_slots WHERE order_no=?').run(orderNo);
 
     res.json({ ok: true, deleted: orderNo });
   } catch (e) { err(res, 500, e.message); }

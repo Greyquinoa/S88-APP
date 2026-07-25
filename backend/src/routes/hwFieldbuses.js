@@ -11,61 +11,72 @@ const WRITABLE = [
   'T50_Fieldbus_Name', 'LINT_T_Driver', 'T15_IP_Address',
 ];
 
+// Postgres folds unquoted identifiers to lowercase, so hw_fieldbuses columns
+// come back as e.g. int_dp_subsystem. Restore the canonical mixed-case keys
+// the frontend expects before sending rows out.
+const LOWER_TO_CANONICAL = new Map(WRITABLE.map(f => [f.toLowerCase(), f]));
+function toCanonical(row) {
+  if (!row) return row;
+  const out = {};
+  for (const [k, v] of Object.entries(row)) out[LOWER_TO_CANONICAL.get(k) || k] = v;
+  return out;
+}
+
 // GET /api/hw-fieldbuses?controllerId=N
-router.get('/', (req, res) => {
+router.get('/', async (req, res) => {
   const { controllerId } = req.query;
   if (!controllerId) return res.status(400).json({ error: 'controllerId required' });
   const db = getDb();
-  const rows = db.prepare(
+  const rows = await db.prepare(
     'SELECT * FROM hw_fieldbuses WHERE hw_controller_id = ? ORDER BY INT_DP_Subsystem, id'
   ).all(Number(controllerId));
-  res.json(rows);
+  res.json(rows.map(toCanonical));
 });
 
 // POST /api/hw-fieldbuses
-router.post('/', (req, res) => {
+router.post('/', async (req, res) => {
   const db = getDb();
   const data = pick(req.body);
   if (!data.hw_controller_id) return res.status(400).json({ error: 'hw_controller_id required' });
   const cols = Object.keys(data);
   const vals = Object.values(data);
   const placeholders = cols.map(() => '?').join(', ');
-  const result = db.prepare(
+  const result = await db.prepare(
     `INSERT INTO hw_fieldbuses (${cols.join(', ')}) VALUES (${placeholders})`
   ).run(vals);
-  const created = db.prepare('SELECT * FROM hw_fieldbuses WHERE id = ?').get(result.lastInsertRowid);
-  res.status(201).json(created);
+  const created = await db.prepare('SELECT * FROM hw_fieldbuses WHERE id = ?').get(result.lastInsertRowid);
+  res.status(201).json(toCanonical(created));
 });
 
 // GET /api/hw-fieldbuses/:id
-router.get('/:id', (req, res) => {
+router.get('/:id', async (req, res) => {
   const db = getDb();
-  const row = db.prepare('SELECT * FROM hw_fieldbuses WHERE id = ?').get(Number(req.params.id));
+  const row = await db.prepare('SELECT * FROM hw_fieldbuses WHERE id = ?').get(Number(req.params.id));
   if (!row) return res.status(404).json({ error: 'Not found' });
-  res.json(row);
+  res.json(toCanonical(row));
 });
 
 // PUT /api/hw-fieldbuses/:id
-router.put('/:id', (req, res) => {
+router.put('/:id', async (req, res) => {
   const db = getDb();
-  const existing = db.prepare('SELECT * FROM hw_fieldbuses WHERE id = ?').get(Number(req.params.id));
+  const existing = await db.prepare('SELECT * FROM hw_fieldbuses WHERE id = ?').get(Number(req.params.id));
   if (!existing) return res.status(404).json({ error: 'Not found' });
   const data = pick(req.body);
   if (Object.keys(data).length === 0) return res.status(400).json({ error: 'No writable fields' });
   const setClause = Object.keys(data).map(c => `${c} = ?`).join(', ');
-  db.prepare(
-    `UPDATE hw_fieldbuses SET ${setClause}, updated_at = datetime('now') WHERE id = ?`
+  await db.prepare(
+    `UPDATE hw_fieldbuses SET ${setClause}, updated_at = NOW() WHERE id = ?`
   ).run([...Object.values(data), Number(req.params.id)]);
-  const updated = db.prepare('SELECT * FROM hw_fieldbuses WHERE id = ?').get(Number(req.params.id));
-  res.json(updated);
+  const updated = await db.prepare('SELECT * FROM hw_fieldbuses WHERE id = ?').get(Number(req.params.id));
+  res.json(toCanonical(updated));
 });
 
 // DELETE /api/hw-fieldbuses/:id
-router.delete('/:id', (req, res) => {
+router.delete('/:id', async (req, res) => {
   const db = getDb();
-  const existing = db.prepare('SELECT * FROM hw_fieldbuses WHERE id = ?').get(Number(req.params.id));
+  const existing = await db.prepare('SELECT * FROM hw_fieldbuses WHERE id = ?').get(Number(req.params.id));
   if (!existing) return res.status(404).json({ error: 'Not found' });
-  db.prepare('DELETE FROM hw_fieldbuses WHERE id = ?').run(Number(req.params.id));
+  await db.prepare('DELETE FROM hw_fieldbuses WHERE id = ?').run(Number(req.params.id));
   res.status(204).send();
 });
 

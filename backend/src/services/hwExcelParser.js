@@ -36,10 +36,10 @@ function detectColumnMap(headers) {
  * @param {string} signalType - Signal type value from Excel
  * @returns {Object|null} - { card_mlfb, station_mlfb } if found, null otherwise
  */
-function resolveTier2(db, protocol, signalType) {
+async function resolveTier2(db, protocol, signalType) {
   if (!db || !protocol || !signalType) return null;
   try {
-    const result = db.prepare(
+    const result = await db.prepare(
       'SELECT card_mlfb, station_mlfb FROM hw_hardware_resolution WHERE protocol=? AND signal_type=?'
     ).get(protocol.trim(), signalType.trim());
     return result || null;
@@ -108,7 +108,7 @@ async function parseHwExcel(buffer, sheetName, overrideColumnMap, db) {
       const protocol = get('protocol');
       const signalType = get('signal_type');
       if (protocol && signalType) {
-        const resolved = resolveTier2(db, protocol, signalType);
+        const resolved = await resolveTier2(db, protocol, signalType);
         if (resolved) {
           orderNo = resolved.card_mlfb;
           stationMlfb = resolved.station_mlfb;
@@ -171,8 +171,8 @@ async function parseHwExcel(buffer, sheetName, overrideColumnMap, db) {
     rawRows.push({
       rowNum, stationAddr, slot, orderNo, moduleName, tag, desc, signalType, channel, ip, stationName, subsystemNo, routerAddress,
       stationMlfb,
-      resolvedByTier2: tier2Used ? 1 : 0,
-      unresolved: unresolved ? 1 : 0,
+      resolvedByTier2: !!tier2Used,
+      unresolved: !!unresolved,
     });
   }
 
@@ -186,7 +186,7 @@ async function parseHwExcel(buffer, sheetName, overrideColumnMap, db) {
  * @param {Object} colMap - Column mapping {appField: "excelColumnName", ...}
  * @param {Object} db - Database instance (optional). If provided, enables Tier 2 resolution via Protocol+SignalType.
  */
-function parseRawExcelRows(rawExcelRows, colMap, db) {
+async function parseRawExcelRows(rawExcelRows, colMap, db) {
   const stations = new Map();
   const rows = [];
   const resolutionStats = {
@@ -220,7 +220,7 @@ function parseRawExcelRows(rawExcelRows, colMap, db) {
       const protocol = get('protocol');
       const signalType = get('signal_type');
       if (protocol && signalType) {
-        const resolved = resolveTier2(db, protocol, signalType);
+        const resolved = await resolveTier2(db, protocol, signalType);
         if (resolved) {
           orderNo = resolved.card_mlfb;
           stationMlfb = resolved.station_mlfb;
@@ -241,7 +241,8 @@ function parseRawExcelRows(rawExcelRows, colMap, db) {
     if (!tier2Used) resolutionStats.tier1++;
 
     const stationAddr = parseInt(stationAddrRaw, 10);
-    const slot = slotRaw != null ? parseInt(slotRaw, 10) : 0;
+    const slotParsed = slotRaw != null ? parseInt(slotRaw, 10) : 0;
+    const slot = isNaN(slotParsed) ? 0 : slotParsed;
 
     if (isNaN(stationAddr)) continue;
 
@@ -252,9 +253,11 @@ function parseRawExcelRows(rawExcelRows, colMap, db) {
     const desc = get('description') || '';
     const signalType = get('signal_type') || '';
     const channelRaw = get('channel');
-    const channel = channelRaw != null ? parseInt(channelRaw, 10) : null;
+    const channelParsed = channelRaw != null ? parseInt(channelRaw, 10) : null;
+    const channel = isNaN(channelParsed) ? null : channelParsed; // non-numeric cell (e.g. "n/a") → treat as no channel, not NaN
     const subsystemRaw = get('subsystem_no');
-    const subsystemNo = subsystemRaw != null ? parseInt(subsystemRaw, 10) : null;
+    const subsystemParsed = subsystemRaw != null ? parseInt(subsystemRaw, 10) : null;
+    const subsystemNo = isNaN(subsystemParsed) ? null : subsystemParsed;
     const routerAddress = get('router_address') || '';
 
     // Build station
@@ -281,8 +284,8 @@ function parseRawExcelRows(rawExcelRows, colMap, db) {
     rows.push({
       rowNum, stationAddr, slot, orderNo, moduleName, tag, desc, signalType, channel, ip, stationName, subsystemNo, routerAddress,
       stationMlfb,
-      resolvedByTier2: tier2Used ? 1 : 0,
-      unresolved: unresolved ? 1 : 0,
+      resolvedByTier2: !!tier2Used,
+      unresolved: !!unresolved,
     });
   }
 

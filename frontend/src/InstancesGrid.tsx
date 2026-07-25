@@ -36,6 +36,7 @@ export interface InstanceRow {
   samplingTime: string;
   userProject: string;
   folderId: string;
+  source?: "manual" | "imported";
 }
 
 export interface FolderOption {
@@ -56,6 +57,15 @@ interface InstancesGridProps {
   onRowSelect?: (id: string) => void;
   /** Currently selected row id — highlighted for EM/EPH role assignment */
   selectedId?: string | null;
+  /** Called when the map-signals action is clicked — opens the signal mapping modal */
+  onMapSignals?: (id: string) => void;
+  /** Called when "Generate Connections" is clicked — reconciles dummy IOs to hardware.
+   *  May return a Promise; the button shows a busy state until it resolves. */
+  onGenerateConnections?: () => void | Promise<void>;
+  /** Per-instance reconciliation summary keyed by instanceName. When provided, a
+   *  "Connections" column shows how many dummy IOs are bound to hardware (real)
+   *  out of the total. Omit to hide the column. */
+  connStatusByInstance?: Record<string, { real: number; dummy: number; total: number }>;
 }
 
 // ── Delete button cell renderer ───────────────────────────────────────────────
@@ -74,6 +84,81 @@ function DeleteCellRenderer(props: { data: InstanceRow; context: { onDelete: (id
       <i className="ti ti-trash" aria-hidden="true" />
       <span className="ig-delete-sr">Delete</span>
     </button>
+  );
+}
+
+// ── Map-signals button cell renderer ──────────────────────────────────────────
+
+function MapSignalsCellRenderer(props: { data: InstanceRow; context: { onMapSignals?: (id: string) => void } }) {
+  if (!props.context.onMapSignals) return null;
+  return (
+    <button
+      className="ig-delete-btn"
+      title="Map signals to variables"
+      onClick={(e) => {
+        e.stopPropagation();
+        props.context.onMapSignals!(props.data.id);
+      }}
+    >
+      <i className="ti ti-plug-connected" aria-hidden="true" />
+      <span className="ig-delete-sr">Map signals</span>
+    </button>
+  );
+}
+
+// ── Connection-status cell renderer ──────────────────────────────────────────
+// Shows how many of an instance's dummy IO signals were matched to hardware by
+// "Generate Connections": green = all bound, amber = some, orange = none, "—" =
+// the instance has no IO rules (nothing to reconcile).
+function ConnStatusCellRenderer(props: {
+  data: InstanceRow;
+  context: { connStatusByInstance?: Record<string, { real: number; dummy: number; total: number }> };
+}) {
+  const st = props.context.connStatusByInstance?.[props.data.instanceName];
+  if (!st || st.total === 0) {
+    return <span style={{ color: "#9CA3AF", fontSize: 12 }}>—</span>;
+  }
+  const allReal = st.real === st.total;
+  const noneReal = st.real === 0;
+  const bg = allReal ? "#DCFCE7" : noneReal ? "#FFEDD5" : "#FEF9C3";
+  const fg = allReal ? "#166534" : noneReal ? "#9A3412" : "#854D0E";
+  return (
+    <span
+      title={`${st.real} of ${st.total} dummy IO signal(s) bound to hardware · ${st.dummy} unmatched`}
+      style={{
+        display: "inline-flex", alignItems: "center", gap: 4,
+        background: bg, color: fg, fontSize: 11, fontWeight: 600,
+        padding: "2px 8px", borderRadius: 10, whiteSpace: "nowrap",
+      }}
+    >
+      <i className={`ti ${allReal ? "ti-plug-connected" : "ti-plug-connected-x"}`} aria-hidden="true" />
+      {st.real}/{st.total}
+    </span>
+  );
+}
+
+// ── Imported checkbox cell renderer ──────────────────────────────────────────
+
+function ImportedCheckboxRenderer(props: { data: InstanceRow }) {
+  const isImported = props.data.source === "imported";
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        height: "100%",
+      }}
+    >
+      <i
+        className={isImported ? "ti ti-checkbox" : "ti ti-checkbox-off"}
+        style={{
+          fontSize: 18,
+          color: isImported ? "#16A34A" : "#D1D5DB",
+        }}
+        aria-hidden="true"
+      />
+    </div>
   );
 }
 
@@ -117,9 +202,36 @@ export default function InstancesGrid({
   onRowAdd,
   onRowSelect,
   selectedId,
+  onMapSignals,
+  onGenerateConnections,
+  connStatusByInstance,
 }: InstancesGridProps) {
   const gridRef = useRef<AgGridReact<InstanceRow>>(null);
   const [quickFilter, setQuickFilter] = useState("");
+  const [genConn, setGenConn] = useState(false);
+  const [selectedRows, setSelectedRows] = useState<InstanceRow[]>([]);
+
+  const handleGenerateConnections = async () => {
+    if (!onGenerateConnections || genConn) return;
+    setGenConn(true);
+    try { await onGenerateConnections(); }
+    finally { setGenConn(false); }
+  };
+
+  const handleSelectionChanged = useCallback(() => {
+    const selected = gridRef.current?.api?.getSelectedRows() || [];
+    setSelectedRows(selected);
+  }, []);
+
+  const handleDeleteSelected = useCallback(() => {
+    if (selectedRows.length === 0) return;
+    const confirmed = window.confirm(
+      `Delete ${selectedRows.length} instance${selectedRows.length !== 1 ? 's' : ''}?`
+    );
+    if (!confirmed) return;
+    selectedRows.forEach(row => onRowDelete(row.id));
+    setSelectedRows([]);
+  }, [selectedRows, onRowDelete]);
 
   // Profiles filtered to matching libType
   const filteredProfiles = useMemo(
@@ -280,6 +392,50 @@ export default function InstancesGrid({
             : null,
       },
       {
+        headerName: "Imported",
+        field: "source",
+        editable: false,
+        sortable: true,
+        filter: "agSetColumnFilter",
+        floatingFilter: false,
+        resizable: true,
+        minWidth: 100,
+        flex: 0.6,
+        cellRenderer: ImportedCheckboxRenderer,
+        cellStyle: { display: "flex", alignItems: "center", justifyContent: "center" },
+        suppressHeaderMenuButton: true,
+      },
+      {
+        headerName: "Connections",
+        colId: "connStatus",
+        editable: false,
+        sortable: false,
+        filter: false,
+        floatingFilter: false,
+        resizable: true,
+        minWidth: 110,
+        flex: 0.8,
+        hide: !connStatusByInstance,
+        cellRenderer: ConnStatusCellRenderer,
+        cellStyle: { display: "flex", alignItems: "center", justifyContent: "center" },
+        suppressHeaderMenuButton: true,
+      },
+      {
+        headerName: "",
+        colId: "mapSignals",
+        sortable: false,
+        filter: false,
+        resizable: false,
+        editable: false,
+        width: 48,
+        maxWidth: 48,
+        pinned: "right" as const,
+        hide: !onMapSignals,
+        cellRenderer: MapSignalsCellRenderer,
+        cellStyle: { display: "flex", alignItems: "center", justifyContent: "center", padding: 0 },
+        suppressHeaderMenuButton: true,
+      },
+      {
         headerName: "",
         field: "id",
         sortable: false,
@@ -294,7 +450,7 @@ export default function InstancesGrid({
         suppressHeaderMenuButton: true,
       },
     ],
-    [typeValues, userProjectValues, folderValues, folderLabels, cmtProfiles, folderOptions.length]
+    [typeValues, userProjectValues, folderValues, folderLabels, cmtProfiles, folderOptions.length, onMapSignals, folderLabels, connStatusByInstance]
   );
 
   // Detect duplicate instance names for cell styling
@@ -322,8 +478,8 @@ export default function InstancesGrid({
   );
 
   const context = useMemo(
-    () => ({ onDelete: onRowDelete, duplicateNames }),
-    [onRowDelete, duplicateNames]
+    () => ({ onDelete: onRowDelete, duplicateNames, onMapSignals, connStatusByInstance }),
+    [onRowDelete, duplicateNames, onMapSignals, connStatusByInstance]
   );
 
   const defaultColDef = useMemo<ColDef>(
@@ -390,12 +546,29 @@ export default function InstancesGrid({
 
         <div className="ig-toolbar-right">
           <span className="ig-count">
-            {rowData.length} {libLabel[libType] ?? libType} instance
-            {rowData.length !== 1 ? "s" : ""}
+            {selectedRows.length > 0
+              ? `${selectedRows.length} of ${rowData.length} selected`
+              : `${rowData.length} ${libLabel[libType] ?? libType} instance${rowData.length !== 1 ? "s" : ""}`}
           </span>
+          {selectedRows.length > 0 && (
+            <button className="ig-btn ig-btn-danger" onClick={handleDeleteSelected} title="Delete selected instances">
+              <i className="ti ti-trash" aria-hidden="true" /> Delete {selectedRows.length}
+            </button>
+          )}
           <button className="ig-btn ig-btn-ghost" onClick={handleExportCsv} title="Export CSV">
             <i className="ti ti-download" aria-hidden="true" /> Export CSV
           </button>
+          {onGenerateConnections && (
+            <button
+              className="ig-btn ig-btn-ghost"
+              onClick={handleGenerateConnections}
+              disabled={genConn}
+              title="Match each dummy IO signal to a hardware symbol by exact name. Matched → real connection; unmatched → stays dummy."
+            >
+              <i className={`ti ${genConn ? "ti-loader-2" : "ti-plug-connected"}`} aria-hidden="true" />{" "}
+              {genConn ? "Generating…" : "Generate Connections"}
+            </button>
+          )}
           <button className="ig-btn ig-btn-primary" onClick={onRowAdd}>
             <i className="ti ti-plus" aria-hidden="true" /> Add Instance
           </button>
@@ -423,11 +596,12 @@ export default function InstancesGrid({
           quickFilterText={quickFilter}
           onCellValueChanged={onCellValueChanged}
           onRowClicked={onRowClicked}
+          onSelectionChanged={handleSelectionChanged}
           getRowStyle={getRowStyle}
           stopEditingWhenCellsLoseFocus
           singleClickEdit={false}
-          rowSelection={{ mode: "singleRow", checkboxes: false }}
-          suppressRowClickSelection
+          rowSelection={{ mode: "multiRow", checkboxes: true }}
+          suppressRowClickSelection={false}
           suppressCellFocus={false}
           animateRows={false}
           rowBuffer={20}

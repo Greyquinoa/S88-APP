@@ -463,7 +463,12 @@ function parseCfgDevices(text) {
         });
       }
 
-      st.slots.push({ slot: slotN, orderNo, name, pipNo, potentialGroup, symbols, subslots: [] });
+      // MLFB: Module Type/ID (e.g., "8086607" for Festo Slot 1)
+      let mlfb = null;
+      const mlfbM = block.text.match(/\bMLFB\s+"([^"]*)"/);
+      if (mlfbM && mlfbM[1]) mlfb = mlfbM[1];
+
+      st.slots.push({ slot: slotN, orderNo, name, pipNo, potentialGroup, symbols, subslots: [], mlfb });
       continue;
     }
 
@@ -506,4 +511,66 @@ function hexToIp(hex) {
   return [0, 2, 4, 6].map(i => parseInt(hex.slice(i, i + 2), 16)).join('.');
 }
 
-module.exports = { parseCfg, parseCfgDevices };
+/**
+ * Extract AUTOCREATED metadata from a baseline .cfg file.
+ * Returns an array of {order_no, slot, subslot} for all AUTOCREATED slots/subslots.
+ * @param {string} text - Raw CFG file content
+ * @returns {Array<{order_no, slot, subslot}>} List of autocreated slots/subslots
+ */
+function extractAutoCreatedMetadata(text) {
+  const lines = text.split(/\r?\n/);
+  const autocreatedList = [];
+  const currentDevice = {};  // {order_no, slot, subslot}
+
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i].trim();
+
+    // Device header: IOSUBSYSTEM subsysNo, IOADDRESS ioAddr, SLOT slotNo, "orderNo" "version", "name"
+    // Example: IOSUBSYSTEM 101, IOADDRESS 2, SLOT 0, "V_2_0_PA_ETER:6ES7 655-5PX11-0XX0" "V2.0", "cfu-pa"
+    const deviceMatch = l.match(/^IOSUBSYSTEM\s+\d+,\s+IOADDRESS\s+\d+,\s+(?:SLOT\s+(\d+),\s+)?"([^"]+)"/);
+    if (deviceMatch) {
+      const slotNum = deviceMatch[1] ? parseInt(deviceMatch[1], 10) : null;
+      const orderNo = deviceMatch[2];
+      currentDevice.order_no = orderNo;
+      currentDevice.slot = slotNum;
+      currentDevice.subslot = null;
+
+      // Check if this line has AUTOCREATED keyword
+      if (l.includes('AUTOCREATED')) {
+        autocreatedList.push({
+          order_no: orderNo,
+          slot: slotNum,
+          subslot: null,
+        });
+      }
+      continue;
+    }
+
+    // Subslot header: IOSUBSYSTEM subsysNo, IOADDRESS ioAddr, SLOT slotNo, SUBSLOT subslotNo, "orderNo", "name"
+    // Example: IOSUBSYSTEM 101, IOADDRESS 2, SLOT 0, SUBSLOT 1, "_S7H_HSP_CFU_PA_V2_0_IFACE_CT", "cfu-pa"
+    const subslotMatch = l.match(/^IOSUBSYSTEM\s+\d+,\s+IOADDRESS\s+\d+,\s+SLOT\s+(\d+),\s+SUBSLOT\s+(\d+),\s+"([^"]+)"/);
+    if (subslotMatch) {
+      const slotNum = parseInt(subslotMatch[1], 10);
+      const subslotNum = parseInt(subslotMatch[2], 10);
+      const subslotOrderNo = subslotMatch[3];
+
+      // Check if this line has AUTOCREATED keyword
+      if (l.includes('AUTOCREATED')) {
+        // Try to get the parent station's order_no (slot 0 order_no)
+        // For now, we'll track it from the context if we have it
+        if (currentDevice.order_no) {
+          autocreatedList.push({
+            order_no: currentDevice.order_no,
+            slot: slotNum,
+            subslot: subslotNum,
+          });
+        }
+      }
+      continue;
+    }
+  }
+
+  return autocreatedList;
+}
+
+module.exports = { parseCfg, parseCfgDevices, extractAutoCreatedMetadata };

@@ -22,6 +22,31 @@ function isAnalog(tpl) {
 }
 
 /**
+ * Default SYMBOL-line address identifiers for a card, scoped by direction.
+ * Returns { in, out } where each is the PCS7 identifier string (or null when the
+ * direction is not used by that signal type). These are catalogue DEFAULTS — a card
+ * may override either via hw_module_templates.in_identifier / .out_identifier.
+ *
+ *   DI    → I  / —      AI  → IW / —
+ *   DO    → — / Q       AO  → — / QW
+ *   MIXED → I  / Q   (DIQ8: DI channels on input, DO channels on output)
+ *   PA    → I  / Q   (CFU_PA transmitter telegrams)
+ *   INFRA / unknown → — / —
+ */
+function defaultIdentifiers(signalType) {
+  const st = (signalType ? String(signalType) : '').toUpperCase();
+  switch (st) {
+    case 'DI': return { in: 'I',  out: null };
+    case 'DO': return { in: null, out: 'Q'  };
+    case 'AI': return { in: 'IW', out: null };
+    case 'AO': return { in: null, out: 'QW' };
+    case 'MIXED': return { in: 'I', out: 'Q' };
+    case 'PA':    return { in: 'I', out: 'Q' };
+    default:      return { in: null, out: null };
+  }
+}
+
+/**
  * Fallback template for GSD-referenced PA device profiles (META\...\... paths).
  * These are PROFIBUS PA transmitter slots. The byte length is fixed per GSD module
  * identifier (Kennung) — we default to 5 bytes for the "AI short" profile.
@@ -183,4 +208,4 @@ function findTemplate(templateMap, orderNo) {
   return null;
 }
 
-module.exports = { allocateAddresses, findTemplate, isAnalog, isGsdPaPath, ANALOG_BASE };
+module.exports = { allocateAddresses, findTemplate, isAnalog, isGsdPaPath, defaultIdentifiers, ANALOG_BASE };

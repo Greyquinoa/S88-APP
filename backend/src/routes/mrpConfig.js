@@ -16,14 +16,14 @@ function err(res, code, msg) { return res.status(code).json({ error: msg }); }
 // Return all PN-IO capable devices extracted from the baseline CFG of this import.
 // Each device includes its alias, ioAddress (or rackSlot for CPU), ifaceSubslot,
 // and the list of port subslots it exposes.
-router.get('/:importId/devices', (req, res) => {
+router.get('/:importId/devices', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.importId, 10);
-    const hwImport = db.prepare('SELECT baseline_cfg, baseline_info FROM hw_imports WHERE id=?').get(importId);
+    const hwImport = await db.prepare('SELECT baseline_cfg, baseline_info FROM hw_imports WHERE id=?').get(importId);
     if (!hwImport) return err(res, 404, 'HW import not found');
 
-    const generated = db.prepare(
+    const generated = await db.prepare(
       'SELECT cfg_text FROM hw_generated_cfgs WHERE hw_import_id=? ORDER BY id DESC LIMIT 1'
     ).get(importId);
     const sourceCfg = generated?.cfg_text || hwImport.baseline_cfg;
@@ -38,15 +38,15 @@ router.get('/:importId/devices', (req, res) => {
 
 // ── GET /api/mrp/:importId/config ────────────────────────────────────────────
 // Load saved MRP config (domain, fieldbus, device roles, port links).
-router.get('/:importId/config', (req, res) => {
+router.get('/:importId/config', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.importId, 10);
-    const config   = db.prepare('SELECT * FROM mrp_configs WHERE hw_import_id=? ORDER BY id DESC LIMIT 1').get(importId);
+    const config   = await db.prepare('SELECT * FROM mrp_configs WHERE hw_import_id=? ORDER BY id DESC LIMIT 1').get(importId);
     if (!config) return res.json(null);
 
-    const roles = db.prepare('SELECT * FROM mrp_device_roles WHERE mrp_config_id=?').all(config.id);
-    const links = db.prepare('SELECT * FROM mrp_port_links WHERE mrp_config_id=?').all(config.id);
+    const roles = await db.prepare('SELECT * FROM mrp_device_roles WHERE mrp_config_id=?').all(config.id);
+    const links = await db.prepare('SELECT * FROM mrp_port_links WHERE mrp_config_id=?').all(config.id);
     res.json({ ...config, roles, links });
   } catch (e) { err(res, 500, e.message); }
 });
@@ -54,42 +54,42 @@ router.get('/:importId/config', (req, res) => {
 // ── POST /api/mrp/:importId/config ───────────────────────────────────────────
 // Save (upsert) MRP config: domain name, fieldbus, device roles, port links.
 // Body: { domainName, fieldbusNo, stationName, roles: [{deviceAlias, mrpRole, mrpInstances}], links: [{...}] }
-router.post('/:importId/config', (req, res) => {
+router.post('/:importId/config', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.importId, 10);
-    const hwImport = db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
+    const hwImport = await db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
     if (!hwImport) return err(res, 404, 'HW import not found');
 
     const { domainName = 'mrpdomain-1', fieldbusNo, stationName, roles = [], links = [] } = req.body;
     if (fieldbusNo == null) return err(res, 400, 'fieldbusNo required');
 
-    const save = db.transaction(() => {
+    const save = db.transaction(async () => {
       // Upsert mrp_configs
-      const existing = db.prepare('SELECT id FROM mrp_configs WHERE hw_import_id=? ORDER BY id DESC LIMIT 1').get(importId);
+      const existing = await db.prepare('SELECT id FROM mrp_configs WHERE hw_import_id=? ORDER BY id DESC LIMIT 1').get(importId);
       let configId;
       if (existing) {
-        db.prepare(`UPDATE mrp_configs SET domain_name=?, fieldbus_no=?, station_name=?, updated_at=datetime('now') WHERE id=?`)
+        await db.prepare(`UPDATE mrp_configs SET domain_name=?, fieldbus_no=?, station_name=?, updated_at=NOW() WHERE id=?`)
           .run(domainName, fieldbusNo, stationName || '', existing.id);
         configId = existing.id;
       } else {
-        const r = db.prepare(
+        const r = await db.prepare(
           'INSERT INTO mrp_configs (hw_import_id, domain_name, fieldbus_no, station_name) VALUES (?,?,?,?)'
         ).run(importId, domainName, fieldbusNo, stationName || '');
         configId = r.lastInsertRowid;
       }
 
       // Replace roles
-      db.prepare('DELETE FROM mrp_device_roles WHERE mrp_config_id=?').run(configId);
+      await db.prepare('DELETE FROM mrp_device_roles WHERE mrp_config_id=?').run(configId);
       const insRole = db.prepare(
         'INSERT INTO mrp_device_roles (mrp_config_id, device_alias, io_address, subsystem_no, mrp_role, mrp_instances, ring_port_1, ring_port_2) VALUES (?,?,?,?,?,?,?,?)'
       );
       for (const r of roles) {
-        insRole.run(configId, r.deviceAlias, r.ioAddress ?? null, r.subsystemNo ?? null, r.mrpRole ?? 0, r.mrpInstances ?? 0, r.ringPort1 ?? null, r.ringPort2 ?? null);
+        await insRole.run(configId, r.deviceAlias, r.ioAddress ?? null, r.subsystemNo ?? null, r.mrpRole ?? 0, r.mrpInstances ?? 0, r.ringPort1 ?? null, r.ringPort2 ?? null);
       }
 
       // Replace links
-      db.prepare('DELETE FROM mrp_port_links WHERE mrp_config_id=?').run(configId);
+      await db.prepare('DELETE FROM mrp_port_links WHERE mrp_config_id=?').run(configId);
       const insLink = db.prepare(
         `INSERT INTO mrp_port_links
            (mrp_config_id, from_device, from_iface_subslot, from_port_subslot,
@@ -97,40 +97,40 @@ router.post('/:importId/config', (req, res) => {
          VALUES (?,?,?,?,?,?,?)`
       );
       for (const l of links) {
-        insLink.run(configId, l.fromDevice, l.fromIfaceSubslot, l.fromPortSubslot,
+        await insLink.run(configId, l.fromDevice, l.fromIfaceSubslot, l.fromPortSubslot,
           l.toDevice, l.toIfaceSubslot, l.toPortSubslot);
       }
 
       return configId;
     });
 
-    const configId = save();
+    const configId = await save();
     res.json({ ok: true, configId });
   } catch (e) { err(res, 500, e.message); }
 });
 
 // ── POST /api/mrp/:importId/apply ────────────────────────────────────────────
 // Apply saved MRP config to the baseline CFG and return the patched file for download.
-router.post('/:importId/apply', (req, res) => {
+router.post('/:importId/apply', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.importId, 10);
-    const hwImport = db.prepare('SELECT baseline_cfg FROM hw_imports WHERE id=?').get(importId);
+    const hwImport = await db.prepare('SELECT baseline_cfg FROM hw_imports WHERE id=?').get(importId);
     if (!hwImport) return err(res, 404, 'HW import not found');
 
     // Prefer the generated CFG (which includes all wizard-added IO devices)
     // over the raw baseline, which may only contain the CPU rack.
-    const generated = db.prepare(
+    const generated = await db.prepare(
       'SELECT cfg_text FROM hw_generated_cfgs WHERE hw_import_id=? ORDER BY id DESC LIMIT 1'
     ).get(importId);
     const sourceCfg = generated?.cfg_text || hwImport.baseline_cfg;
     if (!sourceCfg) return err(res, 400, 'No CFG available — upload a baseline or generate from HW Config first');
 
-    const config = db.prepare('SELECT * FROM mrp_configs WHERE hw_import_id=? ORDER BY id DESC LIMIT 1').get(importId);
+    const config = await db.prepare('SELECT * FROM mrp_configs WHERE hw_import_id=? ORDER BY id DESC LIMIT 1').get(importId);
     if (!config) return err(res, 400, 'No MRP config saved — configure MRP first');
 
-    const roles = db.prepare('SELECT * FROM mrp_device_roles WHERE mrp_config_id=?').all(config.id);
-    const links = db.prepare('SELECT * FROM mrp_port_links WHERE mrp_config_id=?').all(config.id);
+    const roles = await db.prepare('SELECT * FROM mrp_device_roles WHERE mrp_config_id=?').all(config.id);
+    const links = await db.prepare('SELECT * FROM mrp_port_links WHERE mrp_config_id=?').all(config.id);
 
     // Extract device structure from the source CFG (generated or baseline)
     const parsed    = parseCfg(sourceCfg);
@@ -217,12 +217,12 @@ router.post('/:importId/apply', (req, res) => {
 // ── POST /api/mrp/:importId/import-from-cfg ───────────────────────────────────
 // Accept a configured CFG file, parse MRP roles + port links from it,
 // and save them as the MRP config for this import (same as POST /config).
-router.post('/:importId/import-from-cfg', upload.single('cfg'), (req, res) => {
+router.post('/:importId/import-from-cfg', upload.single('cfg'), async (req, res) => {
   try {
     if (!req.file) return err(res, 400, 'No CFG file uploaded');
     const db       = getDb();
     const importId = parseInt(req.params.importId, 10);
-    const hwImport = db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
+    const hwImport = await db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
     if (!hwImport) return err(res, 404, 'HW import not found');
 
     const cfgText = req.file.buffer.toString('utf8');
@@ -243,34 +243,34 @@ router.post('/:importId/import-from-cfg', upload.single('cfg'), (req, res) => {
     // Infer fieldbusNo from the first active device that has a subsystemNo
     const fieldbusNo = activeRoles.find(r => r.subsystemNo != null)?.subsystemNo ?? null;
 
-    const save = db.transaction(() => {
-      const existing = db.prepare(
+    const save = db.transaction(async () => {
+      const existing = await db.prepare(
         'SELECT id FROM mrp_configs WHERE hw_import_id=? ORDER BY id DESC LIMIT 1'
       ).get(importId);
       let configId;
       if (existing) {
-        db.prepare(
-          `UPDATE mrp_configs SET domain_name=?, fieldbus_no=?, station_name=?, updated_at=datetime('now') WHERE id=?`
+        await db.prepare(
+          `UPDATE mrp_configs SET domain_name=?, fieldbus_no=?, station_name=?, updated_at=NOW() WHERE id=?`
         ).run(domainName, fieldbusNo, stationName || '', existing.id);
         configId = existing.id;
       } else {
-        const r = db.prepare(
+        const r = await db.prepare(
           'INSERT INTO mrp_configs (hw_import_id, domain_name, fieldbus_no, station_name) VALUES (?,?,?,?)'
         ).run(importId, domainName, fieldbusNo, stationName || '');
         configId = r.lastInsertRowid;
       }
 
-      db.prepare('DELETE FROM mrp_device_roles WHERE mrp_config_id=?').run(configId);
+      await db.prepare('DELETE FROM mrp_device_roles WHERE mrp_config_id=?').run(configId);
       const insRole = db.prepare(
         'INSERT INTO mrp_device_roles (mrp_config_id, device_alias, io_address, subsystem_no, mrp_role, mrp_instances, ring_port_1, ring_port_2) VALUES (?,?,?,?,?,?,?,?)'
       );
       for (const r of roles) {
-        insRole.run(configId, r.alias, r.ioAddress, r.subsystemNo,
+        await insRole.run(configId, r.alias, r.ioAddress, r.subsystemNo,
           r.mrpRole, r.mrpRole === 3 ? 1 : 0, r.ringPort1 ?? null, r.ringPort2 ?? null);
         console.log(`[MRP Import] Saved role: alias=${r.alias}, ring_port_1=${r.ringPort1}, ring_port_2=${r.ringPort2}`);
       }
 
-      db.prepare('DELETE FROM mrp_port_links WHERE mrp_config_id=?').run(configId);
+      await db.prepare('DELETE FROM mrp_port_links WHERE mrp_config_id=?').run(configId);
       const insLink = db.prepare(
         `INSERT INTO mrp_port_links
            (mrp_config_id, from_device, from_iface_subslot, from_port_subslot,
@@ -278,14 +278,14 @@ router.post('/:importId/import-from-cfg', upload.single('cfg'), (req, res) => {
          VALUES (?,?,?,?,?,?,?)`
       );
       for (const l of links) {
-        insLink.run(configId, l.fromDevice, l.fromIfaceSubslot, l.fromPortSubslot,
+        await insLink.run(configId, l.fromDevice, l.fromIfaceSubslot, l.fromPortSubslot,
           l.toDevice, l.toIfaceSubslot, l.toPortSubslot);
       }
 
       return configId;
     });
 
-    const configId = save();
+    const configId = await save();
     res.json({
       ok: true,
       configId,

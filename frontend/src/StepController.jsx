@@ -161,22 +161,6 @@ export default function StepController({ controller, onSaved, onDeleted, pipMapp
               {STATION_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
             </select>
           </Field>
-          <Field label="Program Container">
-            <input style={S.input} value={form.T24_Program_Container || ''}
-              onChange={e => set('T24_Program_Container', e.target.value)} />
-          </Field>
-          <Field label="Controller No.">
-            <input style={S.input} type="number" value={form.INT_Controller_No ?? ''}
-              onChange={e => set('INT_Controller_No', e.target.value === '' ? null : Number(e.target.value))} />
-          </Field>
-          <Field label="Version">
-            <input style={S.input} value={form.T8_Version || ''}
-              onChange={e => set('T8_Version', e.target.value)} />
-          </Field>
-          <Field label="IP Address">
-            <input style={S.input} placeholder="192.168.27.10" value={form.T15_IP_Address || ''}
-              onChange={e => set('T15_IP_Address', e.target.value)} />
-          </Field>
         </div>
       </div>
 
@@ -286,21 +270,27 @@ export default function StepController({ controller, onSaved, onDeleted, pipMapp
       <div style={S.card}>
         <div style={S.cardTitle}>Hardware</div>
         <div style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginBottom: '0.75rem', marginTop: -4 }}>
-          Populated automatically on CFG import. Search the catalogue or type manually.
+          Populated automatically on CFG import.
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          <HwPicker label="Rack"
-            orderNo={form.T50_Rack_Order_No || ''} name={form.T50_Rack_Name || ''}
-            library={hwLibrary}
-            onSelect={hw => setForm(f => ({ ...f, T50_Rack_Order_No: hw.order_no, T50_Rack_Name: hw.display_name }))}
-            onChangeOrderNo={v => set('T50_Rack_Order_No', v)}
-            onChangeName={v => set('T50_Rack_Name', v)} />
-          <HwPicker label="Power Supply"
-            orderNo={form.T50_PS_Order_No || ''} name={form.T50_PS_Name || ''}
-            library={hwLibrary}
-            onSelect={hw => setForm(f => ({ ...f, T50_PS_Order_No: hw.order_no, T50_PS_Name: hw.display_name }))}
-            onChangeOrderNo={v => set('T50_PS_Order_No', v)}
-            onChangeName={v => set('T50_PS_Name', v)} />
+          <div>
+            <span style={S.label}>Rack</span>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+              <input style={S.input} placeholder="Part Number" value={form.T50_Rack_Order_No || ''}
+                onChange={e => set('T50_Rack_Order_No', e.target.value)} />
+              <input style={S.input} placeholder="Type" value={form.T50_Rack_Name || ''}
+                onChange={e => set('T50_Rack_Name', e.target.value)} />
+            </div>
+          </div>
+          <div>
+            <span style={S.label}>Power Supply</span>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+              <input style={S.input} placeholder="Part Number" value={form.T50_PS_Order_No || ''}
+                onChange={e => set('T50_PS_Order_No', e.target.value)} />
+              <input style={S.input} placeholder="Type" value={form.T50_PS_Name || ''}
+                onChange={e => set('T50_PS_Name', e.target.value)} />
+            </div>
+          </div>
         </div>
       </div>
 

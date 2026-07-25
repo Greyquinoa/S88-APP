@@ -126,6 +126,16 @@
   opacity: 0.88;
 }
 
+.ig-btn-danger {
+  background: #DC2626;
+  color: #fff;
+  border-color: #DC2626;
+}
+
+.ig-btn-danger:hover:not(:disabled) {
+  opacity: 0.88;
+}
+
 /* ── Duplicate-name warning banner ───────────────────────────────────────────── */
 
 .ig-warning {

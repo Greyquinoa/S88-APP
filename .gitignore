@@ -25,3 +25,7 @@ backend/data/*.db
 
 # Nested repos / migration scratch
 migrationtostateofart/
+
+# Windows reserved filenames
+nul.css
+frontend/nul.css

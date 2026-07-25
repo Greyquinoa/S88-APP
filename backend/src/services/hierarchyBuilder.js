@@ -22,8 +22,8 @@ const VALID_LEVELS = ['ProcessCell', 'Unit', 'Standard', 'EquipmentModule'];
  *
  * Returns { nodeCount, levels: { ... } }
  */
-function buildHierarchy(db, importId, levelMap) {
-  const tags = db.prepare(`
+async function buildHierarchy(db, importId, levelMap) {
+  const tags = await db.prepare(`
     SELECT *
     FROM io_tags
     WHERE import_id = ?
@@ -51,8 +51,8 @@ function buildHierarchy(db, importId, levelMap) {
   }
 
   // Clear any previous hierarchy for this import
-  db.prepare('DELETE FROM io_hierarchy_nodes WHERE import_id = ?').run(importId);
-  db.prepare('UPDATE io_tags SET hierarchy_node_id = NULL WHERE import_id = ?').run(importId);
+  await db.prepare('DELETE FROM io_hierarchy_nodes WHERE import_id = ?').run(importId);
+  await db.prepare('UPDATE io_tags SET hierarchy_node_id = NULL WHERE import_id = ?').run(importId);
 
   // node registry: key → { key, level, name, parentKey, sortOrder, sourceTagIds[] }
   const registry = new Map();
@@ -97,13 +97,13 @@ function buildHierarchy(db, importId, levelMap) {
     VALUES (?, ?, ?, ?, ?, ?)
   `);
   const linkTag = db.prepare(
-    'UPDATE io_tags SET hierarchy_node_id=?, updated_at=datetime("now") WHERE id=?'
+    'UPDATE io_tags SET hierarchy_node_id=?, updated_at=NOW() WHERE id=?'
   );
 
-  db.transaction(() => {
+  await db.transaction(async () => {
     for (const node of sorted) {
       const parentDbId = node.parentKey ? (dbIds[node.parentKey] ?? null) : null;
-      const row = insertNode.run(
+      const row = await insertNode.run(
         importId, parentDbId, node.level, node.name,
         S88_TYPE[node.level] ?? null, node.sortOrder
       );
@@ -112,7 +112,7 @@ function buildHierarchy(db, importId, levelMap) {
       // Link source tags to their CM node
       if (node.level === 'ControlModule') {
         for (const tid of node.sourceTagIds) {
-          linkTag.run(row.lastInsertRowid, tid);
+          await linkTag.run(row.lastInsertRowid, tid);
         }
       }
     }
@@ -144,8 +144,8 @@ function topoSort(nodes) {
 /**
  * Load the full hierarchy tree for an import as a nested structure.
  */
-function loadHierarchyTree(db, importId) {
-  const nodes = db.prepare(`
+async function loadHierarchyTree(db, importId) {
+  const nodes = await db.prepare(`
     SELECT n.*, COUNT(t.id) AS tag_count
     FROM io_hierarchy_nodes n
     LEFT JOIN io_tags t ON t.hierarchy_node_id = n.id
@@ -169,15 +169,15 @@ function loadHierarchyTree(db, importId) {
  * approved tags to project_instances.
  * Returns { folders: N, instances: N }
  */
-function promoteToProject(db, importId, projectId) {
-  const nodes = db.prepare(`
+async function promoteToProject(db, importId, projectId) {
+  const nodes = await db.prepare(`
     SELECT * FROM io_hierarchy_nodes WHERE import_id = ? ORDER BY sort_order, id
   `).all(importId);
 
   // One instance per CM node — pick the best assigned_cm_type across all IO rows in that node.
   // Priority: manual_override > approved > auto. Dedup in JS (no window functions needed).
   const STATUS_RANK = { manual_override: 1, approved: 2, auto: 3 };
-  const allCmRows = db.prepare(`
+  const allCmRows = await db.prepare(`
     SELECT n.id AS node_id, n.name AS node_name, n.parent_id AS node_parent_id,
            t.assigned_cm_type, t.assignment_status, t.assignment, t.id AS tag_id
     FROM io_hierarchy_nodes n
@@ -201,19 +201,53 @@ function promoteToProject(db, importId, projectId) {
   // Map: io_hierarchy_node id → project_hierarchy_folder id
   const nodeToFolderId = {};
 
-  const maxSO = db.prepare(
+  const maxSO = (await db.prepare(
     'SELECT MAX(sort_order) AS m FROM project_hierarchy_folders WHERE project_id=?'
-  ).get(projectId)?.m || 0;
+  ).get(projectId))?.m || 0;
   let folSO = maxSO + 1;
 
-  const maxInstSO = db.prepare(
+  const maxInstSO = (await db.prepare(
     'SELECT MAX(sort_order) AS m FROM project_instances WHERE project_id=?'
-  ).get(projectId)?.m || 0;
+  ).get(projectId))?.m || 0;
   let instSO = maxInstSO + 1;
 
   let foldersCreated = 0, instancesCreated = 0, userProjectsCreated = 0;
 
-  db.transaction(() => {
+  await db.transaction(async () => {
+    // Helper: Find or create a folder by path
+    const folderPathCache = new Map();
+    const ensureFolderPath = async (parentId, folderPath) => {
+      if (!folderPath) return parentId;
+      const segs = (folderPath || '').split('/').map(s => s.trim()).filter(Boolean);
+      let cur = parentId;
+      for (const seg of segs) {
+        const key = `${cur ?? 'root'}::${seg}`;
+        if (folderPathCache.has(key)) {
+          cur = folderPathCache.get(key);
+        } else {
+          // Reuse existing folder or create new one
+          const existing = await db.prepare(`
+            SELECT id FROM project_hierarchy_folders
+            WHERE project_id=? AND parent_id IS NOT DISTINCT FROM ? AND name=?
+          `).get(projectId, cur, seg);
+
+          if (existing) {
+            cur = existing.id;
+          } else {
+            const row = await db.prepare(`
+              INSERT INTO project_hierarchy_folders
+                (project_id, parent_id, name, s88_type, sort_order)
+              VALUES (?,?,?,?,?)
+            `).run(projectId, cur, seg, null, folSO++);
+            cur = row.lastInsertRowid;
+            foldersCreated++;
+          }
+          folderPathCache.set(key, cur);
+        }
+      }
+      return cur;
+    };
+
     // Only promote non-CM nodes to hierarchy folders
     const folderNodes = nodes.filter(n => n.level !== 'ControlModule');
 
@@ -222,15 +256,15 @@ function promoteToProject(db, importId, projectId) {
       const parentFolderId = node.parent_id ? (nodeToFolderId[node.parent_id] ?? null) : null;
 
       // Reuse existing folder with same name + parent
-      const existing = db.prepare(`
+      const existing = await db.prepare(`
         SELECT id FROM project_hierarchy_folders
-        WHERE project_id=? AND name=? AND (parent_id IS ? OR parent_id = ?)
+        WHERE project_id=? AND name=? AND (parent_id IS NOT DISTINCT FROM ? OR parent_id = ?)
       `).get(projectId, node.name, parentFolderId, parentFolderId);
 
       if (existing) {
         nodeToFolderId[node.id] = existing.id;
       } else {
-        const row = db.prepare(`
+        const row = await db.prepare(`
           INSERT INTO project_hierarchy_folders
             (project_id, parent_id, name, s88_type, sort_order)
           VALUES (?,?,?,?,?)
@@ -240,8 +274,8 @@ function promoteToProject(db, importId, projectId) {
       }
 
       // Mark node as promoted
-      db.prepare(
-        'UPDATE io_hierarchy_nodes SET promoted=1, promoted_folder_id=? WHERE id=?'
+      await db.prepare(
+        'UPDATE io_hierarchy_nodes SET promoted=true, promoted_folder_id=? WHERE id=?'
       ).run(nodeToFolderId[node.id], node.id);
     }
 
@@ -251,32 +285,70 @@ function promoteToProject(db, importId, projectId) {
     )];
 
     // Upsert each AS assignment into project_user_projects so it appears in the dropdown
-    const maxUpSO = db.prepare(
+    const maxUpSO = (await db.prepare(
       'SELECT MAX(sort_order) AS m FROM project_user_projects WHERE project_id=?'
-    ).get(projectId)?.m || 0;
+    ).get(projectId))?.m || 0;
     let upSO = maxUpSO + 1;
 
     const upsertUp = db.prepare(`
-      INSERT OR IGNORE INTO project_user_projects (project_id, name, sort_order)
+      INSERT INTO project_user_projects (project_id, name, sort_order)
       VALUES (?,?,?)
+      ON CONFLICT (project_id, name) DO NOTHING
     `);
     for (const asgn of distinctAssignments) {
-      const r = upsertUp.run(projectId, asgn, upSO++);
-      if (r.changes > 0) userProjectsCreated++;
+      const r = await upsertUp.run(projectId, asgn, upSO++);
+      if (r.rowCount > 0) userProjectsCreated++;
     }
 
     // Cache composite CM type lookups by name (assigned_cm_type is now a composite name)
     const compositeCache = new Map();
-    function resolveComposite(name) {
+    async function resolveComposite(name) {
       if (compositeCache.has(name)) return compositeCache.get(name);
-      const comp = db.prepare('SELECT * FROM composite_cm_types WHERE name=?').get(name);
+      const comp = await db.prepare('SELECT * FROM composite_cm_types WHERE name=?').get(name);
       if (!comp) { compositeCache.set(name, null); return null; }
-      const members = db.prepare(
+      const members = await db.prepare(
         'SELECT * FROM composite_cm_members WHERE composite_id=? ORDER BY sort_order, id'
       ).all(comp.id);
-      const result = { comp, members };
+      // Load IO connection rules for this composite
+      let connRules = await db.prepare(
+        'SELECT * FROM composite_cm_connections WHERE composite_id=? AND conn_type=? ORDER BY sort_order, id'
+      ).all(comp.id, 'io_connection');
+      connRules = connRules.map(c => {
+        try {
+          const meta = c.static_value ? JSON.parse(c.static_value) : {};
+          return { ...c, ...meta };
+        } catch (e) {
+          return c;
+        }
+      });
+      const result = { comp, members, ioConnections: connRules };
       compositeCache.set(name, result);
       return result;
+    }
+
+    // Extract IO connection rules for a given CM type in a composite
+    function getIOConnectionsForMember(composite, memberIdx) {
+      if (!composite || !composite.ioConnections) return [];
+      // Filter rules that target this member's CM type
+      const member = composite.members[memberIdx];
+      if (!member) return [];
+      // Convert composite-level connection rules into instance-level format.
+      // Stored shape (composite_cm_connections + decoded static_value JSON):
+      //   to_member_idx → member this rule targets
+      //   to_var_name   → the block pin (parameter) that gets the dummy signal
+      //   block_name    → the sub-block within the member's CM type (from meta JSON)
+      //   prefix/suffix → wrap the instrument tag to build the dummy signal name
+      //   dtype         → IO direction/type (DI/DO/AI/AO)
+      return composite.ioConnections
+        .filter(c => Number(c.to_member_idx) === Number(memberIdx))  // Rules targeting this member
+        .map(c => ({
+          target_block: c.block_name || '',
+          target_pin: c.to_var_name || '',
+          prefix: c.prefix || '',
+          suffix: c.suffix || '',
+          signal_type: c.dtype || c.signal_type || 'DI',
+          required: c.required ? 1 : 0,
+        }));
     }
 
     // Create one or more project_instances per CM node.
@@ -284,56 +356,68 @@ function promoteToProject(db, importId, projectId) {
     let groupCounter = instSO * 1000; // unique composite group id base
 
     for (const tag of approvedTags) {
-      const folderId = tag.node_parent_id ? (nodeToFolderId[tag.node_parent_id] ?? null) : null;
+      const baseFolderId = tag.node_parent_id ? (nodeToFolderId[tag.node_parent_id] ?? null) : null;
 
       // Avoid duplicate base instance names
-      const existing = db.prepare(
+      const existing = await db.prepare(
         'SELECT id FROM project_instances WHERE project_id=? AND instance_name=?'
       ).get(projectId, tag.node_name);
       if (existing) continue;
 
-      const composite = resolveComposite(tag.assigned_cm_type);
+      const composite = await resolveComposite(tag.assigned_cm_type);
 
       if (composite) {
         const { comp, members } = composite;
         const groupId = ++groupCounter;
-        members.forEach((m, mi) => {
+        for (let mi = 0; mi < members.length; mi++) {
+          const m = members[mi];
           const isProject = m.scope === 'project';
           const instName = isProject
             ? (`${m.name_prefix || ''}${m.name_suffix || ''}`.trim() || m.cm_type_name || tag.node_name)
             : `${m.name_prefix || ''}${tag.node_name}${m.name_suffix || ''}`;
           // Skip project-scope members that already exist
           if (isProject) {
-            const ex = db.prepare(
+            const ex = await db.prepare(
               'SELECT id FROM project_instances WHERE project_id=? AND instance_name=?'
             ).get(projectId, instName);
-            if (ex) return;
+            if (ex) continue;
           }
-          db.prepare(`
+
+          // Apply hierarchy_folder rule from composite member definition
+          // Members with hierarchy_folder get a subfolder (e.g. NIF member → CM/NIF)
+          let memberFolderId = baseFolderId;
+          if (m.hierarchy_folder) {
+            memberFolderId = await ensureFolderPath(baseFolderId, m.hierarchy_folder);
+          }
+
+          const connections = getIOConnectionsForMember(composite, mi);
+          await db.prepare(`
             INSERT INTO project_instances
               (project_id, cm_type, instance_name, sampling_time, user_project, folder_id, sort_order,
-               composite_group_id, composite_id, member_idx)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
+               composite_group_id, composite_id, member_idx, source, connections)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
           `).run(
             projectId,
             m.cm_type_name,
             instName,
             '1000',
             tag.assignment || '',
-            folderId,
+            memberFolderId,
             instSO++,
             groupId,
             comp.id,
-            mi
+            mi,
+            'imported',
+            JSON.stringify(connections)
           );
           instancesCreated++;
-        });
+        }
       } else {
         // Raw CM type (legacy / non-composite)
-        db.prepare(`
+        await db.prepare(`
           INSERT INTO project_instances
-            (project_id, cm_type, instance_name, sampling_time, user_project, folder_id, sort_order)
-          VALUES (?,?,?,?,?,?,?)
+            (project_id, cm_type, instance_name, sampling_time, user_project, folder_id, sort_order, source, connections)
+          VALUES (?,?,?,?,?,?,?,?,?)
         `).run(
           projectId,
           tag.assigned_cm_type,
@@ -341,14 +425,16 @@ function promoteToProject(db, importId, projectId) {
           '1000',
           tag.assignment || '',
           folderId,
-          instSO++
+          instSO++,
+          'imported',
+          JSON.stringify([])
         );
         instancesCreated++;
       }
     }
 
     // Mark import as promoted
-    db.prepare(`UPDATE io_imports SET status='promoted' WHERE id=?`).run(importId);
+    await db.prepare(`UPDATE io_imports SET status='promoted' WHERE id=?`).run(importId);
   })();
 
   return { folders: foldersCreated, instances: instancesCreated, userProjects: userProjectsCreated };

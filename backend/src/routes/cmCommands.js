@@ -5,10 +5,10 @@ const { getDb } = require('../db');
 const router   = express.Router();
 
 // GET /api/cm-commands — returns all commands sorted by sort_order
-router.get('/', (_req, res) => {
+router.get('/', async (_req, res) => {
   try {
     const db   = getDb();
-    const rows = db.prepare('SELECT id, name, value, sort_order FROM lib_cm_commands ORDER BY sort_order, id').all();
+    const rows = await db.prepare('SELECT id, name, value, sort_order FROM lib_cm_commands ORDER BY sort_order, id').all();
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -17,7 +17,7 @@ router.get('/', (_req, res) => {
 
 // PUT /api/cm-commands — replace all commands
 // Body: [ { name, value }, ... ]  (sort_order derived from array position)
-router.put('/', (req, res) => {
+router.put('/', async (req, res) => {
   try {
     const db      = getDb();
     const entries = req.body;
@@ -28,15 +28,17 @@ router.put('/', (req, res) => {
         return res.status(400).json({ error: `value for "${e.name}" must be an integer` });
     }
 
-    db.transaction(() => {
-      db.prepare('DELETE FROM lib_cm_commands').run();
+    await db.transaction(async () => {
+      await db.prepare('DELETE FROM lib_cm_commands').run();
       const ins = db.prepare('INSERT INTO lib_cm_commands (name, value, sort_order) VALUES (?, ?, ?)');
-      entries.forEach((e, i) => ins.run(e.name.trim().toUpperCase(), e.value, i));
+      for (let i = 0; i < entries.length; i++) {
+        await ins.run(entries[i].name.trim().toUpperCase(), entries[i].value, i);
+      }
     })();
 
     res.json({ success: true, count: entries.length });
   } catch (err) {
-    if (err.message?.includes('UNIQUE')) return res.status(409).json({ error: 'Duplicate command name' });
+    if (err.message?.includes('unique') || err.code === '23505') return res.status(409).json({ error: 'Duplicate command name' });
     res.status(500).json({ error: err.message });
   }
 });

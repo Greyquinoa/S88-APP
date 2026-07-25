@@ -1,0 +1,47 @@
+/* Canvas-based jelly slider progress bar */
+
+.jelly-container {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  background: var(--color-background-primary, #ffffff);
+  border-bottom: 0.5px solid var(--color-border-tertiary, rgba(0, 0, 0, 0.1));
+  padding: 12px 16px;
+}
+
+.jelly-wrapper {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.jelly-slider-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.jelly-canvas {
+  flex: 1;
+  height: 50px;
+  border-radius: 8px;
+  background: transparent;
+}
+
+.jelly-percent {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text-primary, #1a1a1a);
+  font-variant-numeric: tabular-nums;
+  width: 38px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.jelly-label {
+  font-size: 12px;
+  color: var(--color-text-secondary, #6b7280);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

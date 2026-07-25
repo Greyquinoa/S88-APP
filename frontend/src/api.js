@@ -13,7 +13,11 @@ async function request(method, path, body, isFile = false) {
   }
   const res = await fetch(`${BASE}${path}`, opts);
   const data = await res.json();
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  if (!res.ok) {
+    const e = new Error(data.error || `HTTP ${res.status}`);
+    if (data.conflictRows) e.conflictRows = data.conflictRows;
+    throw e;
+  }
   return data;
 }
 
@@ -79,6 +83,60 @@ export async function patchVarValid(cmTypeName, varId, isValid) {
 // ── Generate ──────────────────────────────────────────────────────────────────
 export async function generateXML({ projectName, userProjects, instances, generatedBy }) {
   return request('POST', '/generate', { projectName, userProjects, instances, generatedBy });
+}
+
+// Streaming generation: POSTs the payload and reads Server-Sent-Events progress
+// frames from the response body. Calls onProgress({ pct, phase, msg }) for each
+// progress frame and resolves with { outputs, auditIds } on the final "done" frame.
+// Uses a relative /api URL so it rides the Vite dev proxy (avoids CORS on :5174).
+export async function generateXMLStream({ projectName, userProjects, instances, generatedBy }, onProgress) {
+  const res = await fetch(`${BASE}/generate/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ projectName, userProjects, instances, generatedBy }),
+  });
+  if (!res.ok || !res.body) {
+    // Server rejected before streaming (e.g. 4xx/5xx with JSON error).
+    let msg = `HTTP ${res.status}`;
+    try { const j = await res.json(); if (j?.error) msg = j.error; } catch (_) {}
+    throw new Error(msg);
+  }
+
+  const reader  = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let result = null;
+
+  const handleFrame = (raw) => {
+    // Each SSE frame is one or more `data: ...` lines.
+    const dataLines = raw.split('\n')
+      .filter(l => l.startsWith('data:'))
+      .map(l => l.slice(5).trim());
+    if (!dataLines.length) return;
+    let obj;
+    try { obj = JSON.parse(dataLines.join('\n')); } catch (_) { return; }
+    if (obj.error) throw new Error(obj.error);
+    if (obj.done)  { result = { outputs: obj.outputs, auditIds: obj.auditIds }; return; }
+    onProgress?.(obj);
+  };
+
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    // Frames are separated by a blank line (\n\n).
+    let sep;
+    while ((sep = buffer.indexOf('\n\n')) !== -1) {
+      const frame = buffer.slice(0, sep);
+      buffer = buffer.slice(sep + 2);
+      handleFrame(frame);
+    }
+  }
+  // Flush any trailing frame without a terminating blank line.
+  if (buffer.trim()) handleFrame(buffer);
+
+  if (!result) throw new Error('Generation stream ended without a result');
+  return result;
 }
 
 // ── Audit history ─────────────────────────────────────────────────────────────
@@ -151,6 +209,7 @@ export async function uploadIOList(projectId, file, sheetName, columnMapId) {
 }
 
 export async function listIOImports(projectId)  { return request('GET', `/io/project/${projectId}/imports`); }
+export async function getLatestIoImport()       { return request('GET', `/io/imports/latest`); }
 export async function getIOImport(id)           { return request('GET', `/io/imports/${id}`); }
 export async function deleteIOImport(id)        { return request('DELETE', `/io/imports/${id}`); }
 export async function reimportIOList(importId, file) {
@@ -161,6 +220,9 @@ export async function reimportIOList(importId, file) {
 
 export async function getIOHeaders(importId) {
   return request('GET', `/io/imports/${importId}/headers`);
+}
+export async function getIOPreview(importId) {
+  return request('GET', `/io/imports/${importId}/preview`);
 }
 export async function getIOTags(importId, params = {}) {
   const qs = new URLSearchParams(params).toString();
@@ -189,6 +251,11 @@ export async function updateIOColumnMap(id, data)  { return request('PUT',    `/
 export async function deleteIOColumnMap(id)        { return request('DELETE', `/io/column-maps/${id}`); }
 export async function applyIOColumnMap(importId, column_map_id) {
   return request('POST', `/io/imports/${importId}/apply-column-map`, { column_map_id });
+}
+// Records the "real" column-map config for this import (the one with the hardware
+// mapping), independent of column_map_id which "Import Instances" later overwrites.
+export async function setIOSourceColumnMap(importId, column_map_id) {
+  return request('POST', `/io/imports/${importId}/set-source-column-map`, { column_map_id });
 }
 
 export async function getIOFunctionMaps()              { return request('GET',    '/io/function-maps'); }
@@ -220,6 +287,61 @@ export async function promoteIOImport(importId, projectId) {
 }
 
 export function ioExportUrl(importId) { return `/api/io/imports/${importId}/export`; }
+
+// ── Automated Workflow ───────────────────────────────────────────────────────────
+// Streaming execution: POSTs the payload and reads Server-Sent-Events progress frames.
+// Calls onProgress({ pct, phase, msg }) for each frame and resolves with { success, xml, stats, auditId }.
+export async function executeWorkflowStream({ importId, projectId, functionMapId }, onProgress) {
+  const res = await fetch(`${BASE}/workflow/execute`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ importId, projectId, functionMapId }),
+  });
+  if (!res.ok || !res.body) {
+    let msg = `HTTP ${res.status}`;
+    try { const j = await res.json(); if (j?.error) msg = j.error; } catch (_) {}
+    throw new Error(msg);
+  }
+
+  const reader  = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let result = null;
+
+  const handleFrame = (raw) => {
+    const dataLines = raw.split('\n')
+      .filter(l => l.startsWith('data:'))
+      .map(l => l.slice(5).trim());
+    if (!dataLines.length) return;
+    let obj;
+    try { obj = JSON.parse(dataLines.join('\n')); } catch (_) { return; }
+    if (obj.error) {
+      const e = new Error(obj.error);
+      if (obj.conflictRows) e.conflictRows = obj.conflictRows;
+      throw e;
+    }
+    if (obj.done) { result = obj; return; }
+    if (onProgress && (obj.pct !== undefined || obj.phase)) onProgress(obj);
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const frames = buffer.split('\n\n');
+      buffer = frames.pop(); // Incomplete frame
+      for (const frame of frames) if (frame.trim()) handleFrame(frame);
+    }
+    buffer += decoder.decode(); // Flush
+    if (buffer.trim()) handleFrame(buffer);
+    return result || { success: false, error: 'No response from server' };
+  } catch (err) {
+    throw err;
+  } finally {
+    reader.releaseLock();
+  }
+}
 
 // ── PCS7 Project Config ───────────────────────────────────────────────────────
 export async function getProjectConfig(projectId) {
@@ -287,6 +409,34 @@ export async function parseCfgForCatalogue(file) {
 export async function bulkUpsertCatalogueTemplates(devices) {
   return request('POST', '/hw-config/module-templates/bulk-upsert', { devices });
 }
+
+// ── Module Parameters (extracted from CFG PARAMETER blocks) ────────────────────
+export async function getModuleParameters(templateId) {
+  return request('GET', `/module-parameters/templates/${templateId}`);
+}
+export async function getModuleParametersGrouped(templateId) {
+  return request('GET', `/module-parameters/templates/${templateId}/grouped`);
+}
+export async function updateModuleChannelParameter(templateId, parameterName, channelType, parameterValue, spareValue = null, isDynamic = false) {
+  return request('PATCH', `/module-parameters/templates/${templateId}/channel-param`, {
+    parameter_name: parameterName,
+    channel_type: channelType,
+    parameter_value: parameterValue,
+    spare_value: spareValue,
+    is_dynamic: isDynamic
+  });
+}
+export async function updateModuleLevelParameter(templateId, parameterName, parameterValue) {
+  return request('PATCH', `/module-parameters/templates/${templateId}/module-param`, {
+    parameter_name: parameterName,
+    parameter_value: parameterValue
+  });
+}
+export async function updateModuleParameterVisibility(templateId, updates) {
+  return request('PATCH', `/module-parameters/templates/${templateId}/visibility`, {
+    updates
+  });
+}
 export async function listHwImports(projectId) {
   return request('GET', `/hw-config/project/${projectId}/imports`);
 }
@@ -319,9 +469,29 @@ export async function applyHwIoList(importId, approvedKeys, parsedRows, fileName
     { approvedKeys, parsedRows, fileName, missingKeys });
 }
 
+// Unified import: copy an IO import's raw rows into a HW import's hw_excel_raw,
+// so the Hardware preview/mapping can consume the same sheet (no re-upload).
+export async function ingestIoRowsIntoHw(hwImportId, ioImportId) {
+  return request('POST', `/hw-config/imports/${hwImportId}/ingest-io-rows`, { ioImportId });
+}
+
+// Preview HW import using stored rows + a column mapping (no file upload).
+export async function previewHwMapped(hwImportId, columnMap) {
+  const qs = `?columnMap=${encodeURIComponent(JSON.stringify(columnMap))}`;
+  return request('GET', `/hw-config/imports/${hwImportId}/preview-mapped${qs}`);
+}
+
 export async function getColumnMappingSuggestions(importId, selectedColumns) {
   return request('POST', `/hw-config/imports/${importId}/suggest-column-mappings`,
     { selectedColumns });
+}
+
+export async function loadHwColumnMapping(importId) {
+  return request('GET', `/hw-config/imports/${importId}/column-mapping`);
+}
+
+export async function saveHwColumnMapping(importId, mapping) {
+  return request('POST', `/hw-config/imports/${importId}/column-mapping`, { mapping });
 }
 
 export async function getHwStations(importId) {
@@ -516,4 +686,23 @@ export async function generateConnections(projectId) {
 export async function getConnectionIOs(projectId, status) {
   const qs = status ? `?status=${encodeURIComponent(status)}` : '';
   return request('GET', `/connections/project/${projectId}${qs}`);
+}
+export async function getDerivedValues(projectId) {
+  return request('GET', `/connections/derived-values/${projectId}`);
+}
+// Set (value != null) or clear (value === null) a manual override for one derived
+// Value pin. Overrides take priority over the auto-resolved IO-list value in the
+// modal, in getDerivedValues, and in XML export.
+export async function setDerivedValueOverride(projectId, instanceName, varName, value) {
+  return request('PUT', `/connections/derived-values/${projectId}/instance/${encodeURIComponent(instanceName)}/override`, { varName, value });
+}
+
+// Per-instance matrix override — one `enabled` flag + edited cells for a matrix CM
+// instance. When enabled, cells win over the composite type's matrix defaults in the
+// Parameters modal and in XML export. `cells` is keyed by mode_nr → { colName: value }.
+export async function getMatrixOverrides(projectId) {
+  return request('GET', `/connections/matrix-override/${projectId}`);
+}
+export async function setMatrixOverride(projectId, instanceName, enabled, cells) {
+  return request('PUT', `/connections/matrix-override/${projectId}/instance/${encodeURIComponent(instanceName)}`, { enabled, cells });
 }

@@ -14,9 +14,9 @@ const INTERNAL_FIELDS = [
  * { "CUST_COL": "internal_field", ... }, update the resolved columns on each tag.
  * Mapping values not in INTERNAL_FIELDS are ignored (raw_data always preserved).
  */
-function applyMapping(db, importId, mappings) {
+async function applyMapping(db, importId, mappings) {
   // mappings: { customerCol → internalField }
-  const tags = db.prepare(
+  const tags = await db.prepare(
     'SELECT id, raw_data FROM io_tags WHERE import_id = ?'
   ).all(importId);
 
@@ -29,11 +29,11 @@ function applyMapping(db, importId, mappings) {
   const update = db.prepare(`
     UPDATE io_tags SET
       instrument_tag=?, function_val=?, hierarchy=?, assignment=?,
-      updated_at=datetime('now')
+      updated_at=NOW()
     WHERE id=?
   `);
 
-  db.transaction(() => {
+  await db.transaction(async () => {
     for (const tag of tags) {
       const raw = JSON.parse(tag.raw_data || '{}');
       const get = field => {
@@ -42,12 +42,12 @@ function applyMapping(db, importId, mappings) {
         const v = raw[col];
         return v != null ? String(v).trim() || null : null;
       };
-      update.run(
+      await update.run(
         get('instrument_tag'), get('function_val'), get('hierarchy'), get('assignment'),
         tag.id
       );
     }
-    db.prepare(
+    await db.prepare(
       `UPDATE io_imports SET status='mapped' WHERE id=?`
     ).run(importId);
   })();

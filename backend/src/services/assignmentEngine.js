@@ -50,15 +50,15 @@ function levenshtein(a, b) {
  * Updates io_tags.assigned_cm_type and assignment_status.
  * Returns report { auto, unresolved, skipped }.
  */
-function runAssignment(db, importId, functionMapConfigId) {
-  const mappings = db.prepare(`
+async function runAssignment(db, importId, functionMapConfigId) {
+  const mappings = await db.prepare(`
     SELECT * FROM io_function_mappings
     WHERE config_id = ?
     ORDER BY priority DESC, id ASC
   `).all(functionMapConfigId);
 
-  const tags = db.prepare(`
-    SELECT id, tag_name, function_val, assignment_status
+  const tags = await db.prepare(`
+    SELECT id, tag_name, function_val, assignment_status, validation_flags
     FROM io_tags
     WHERE import_id = ? AND validation_status != 'error'
   `).all(importId);
@@ -67,17 +67,17 @@ function runAssignment(db, importId, functionMapConfigId) {
 
   const updateAuto = db.prepare(`
     UPDATE io_tags SET assigned_cm_type=?, assignment_status='auto',
-      assigned_at=datetime('now'), assigned_by='engine', updated_at=datetime('now')
+      assigned_at=NOW(), assigned_by='engine', updated_at=NOW()
     WHERE id=?
   `);
   const updateUnresolved = db.prepare(`
     UPDATE io_tags SET assigned_cm_type=NULL, assignment_status='unresolved',
-      validation_flags=json_set(COALESCE(validation_flags,'{}'),'$.suggestion',?),
-      updated_at=datetime('now')
+      validation_flags=?,
+      updated_at=NOW()
     WHERE id=?
   `);
 
-  db.transaction(() => {
+  await db.transaction(async () => {
     for (const tag of tags) {
       // Skip manual overrides — respect human decisions
       if (tag.assignment_status === 'manual_override' || tag.assignment_status === 'approved') {
@@ -86,19 +86,24 @@ function runAssignment(db, importId, functionMapConfigId) {
       }
       const result = resolveMapping(tag.function_val, mappings);
       if (result) {
-        updateAuto.run(result.cm_type_name, tag.id);
+        await updateAuto.run(result.cm_type_name, tag.id);
         report.auto++;
       } else {
         const hint = suggestMatch(tag.function_val, mappings);
-        updateUnresolved.run(hint ? JSON.stringify(hint) : null, tag.id);
+        // Merge {suggestion: hint} into the existing validation_flags JSON in JS
+        // (Postgres jsonb_set() would need a jsonb column; validation_flags stays TEXT).
+        let flags = {};
+        try { flags = JSON.parse(tag.validation_flags || '{}'); } catch (_) { flags = {}; }
+        flags.suggestion = hint || null;
+        await updateUnresolved.run(JSON.stringify(flags), tag.id);
         report.unresolved++;
       }
     }
 
-    db.prepare(`UPDATE io_imports SET function_map_id=?, status='assigned' WHERE id=?`)
+    await db.prepare(`UPDATE io_imports SET function_map_id=?, status='assigned' WHERE id=?`)
       .run(functionMapConfigId, importId);
 
-    db.prepare(`
+    await db.prepare(`
       INSERT INTO io_audit_trail (import_id, action, actor, after_val)
       VALUES (?, 'assign', 'engine', ?)
     `).run(importId, JSON.stringify(report));
@@ -111,7 +116,7 @@ function runAssignment(db, importId, functionMapConfigId) {
  * Collect all distinct unresolved function values for an import.
  * Used to pre-populate the function mapping screen.
  */
-function getUnresolvedFunctions(db, importId) {
+async function getUnresolvedFunctions(db, importId) {
   return db.prepare(`
     SELECT function_val, COUNT(*) AS tag_count
     FROM io_tags

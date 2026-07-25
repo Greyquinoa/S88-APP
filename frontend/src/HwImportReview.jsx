@@ -20,6 +20,33 @@ function StatusBadge({ value }) {
   );
 }
 
+// Tabular breakdown of stations involved in a "Duplicate stations" error — shows which
+// field(s) collided per station instead of forcing the user to parse a run-on sentence.
+function ConflictTable({ rows }) {
+  return (
+    <table style={{ marginTop: 8, borderCollapse: 'collapse', fontSize: 12, width: '100%' }}>
+      <thead>
+        <tr style={{ borderBottom: '1px solid #fca5a5' }}>
+          <th style={{ textAlign: 'left', padding: '4px 8px' }}>Address</th>
+          <th style={{ textAlign: 'left', padding: '4px 8px' }}>Name</th>
+          <th style={{ textAlign: 'left', padding: '4px 8px' }}>IP</th>
+          <th style={{ textAlign: 'left', padding: '4px 8px' }}>Conflict</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((r, i) => (
+          <tr key={i} style={{ borderBottom: '1px solid #fee2e2' }}>
+            <td style={{ padding: '4px 8px', fontFamily: 'monospace' }}>{r.address}</td>
+            <td style={{ padding: '4px 8px', fontFamily: 'monospace' }}>{r.name || '—'}</td>
+            <td style={{ padding: '4px 8px', fontFamily: 'monospace' }}>{r.ip || '—'}</td>
+            <td style={{ padding: '4px 8px' }}>{r.reasons.join(', ')}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
 function CheckboxCell({ value, node, onToggle }) {
   return (
     <input type="checkbox" checked={value} style={{ cursor: 'pointer' }}
@@ -116,6 +143,7 @@ export default function HwImportReview({ importId, summary, items, parsedRows, f
   });
   const [applying, setApplying] = useState(false);
   const [applyError, setApplyError] = useState(null);
+  const [applyConflictRows, setApplyConflictRows] = useState(null);
 
   // Expand rows for modified items (one row per property change, or one row if no changes)
   const flatItems = useMemo(() => {
@@ -171,11 +199,13 @@ export default function HwImportReview({ importId, summary, items, parsedRows, f
   const handleApply = async () => {
     setApplying(true);
     setApplyError(null);
+    setApplyConflictRows(null);
     try {
       await applyHwIoList(importId, [...selected], parsedRows, fileName, missingKeys);
       onApplied();
     } catch (e) {
       setApplyError(e.message);
+      setApplyConflictRows(e.conflictRows || null);
       setApplying(false);
     }
   };
@@ -192,7 +222,18 @@ export default function HwImportReview({ importId, summary, items, parsedRows, f
     },
     {
       headerName: 'Status', field: 'status', width: 100, pinned: 'left',
-      cellRenderer: (p) => p.data._extra ? null : <StatusBadge value={p.value} />,
+      cellRenderer: (p) => {
+        if (p.data._extra) return null;
+        const badge = <StatusBadge value={p.value} />;
+        if (p.data.stationConflicts && p.data.stationConflicts.length > 0) {
+          return (
+            <div title={p.data.stationConflicts.join('\n')} style={{ cursor: 'help' }}>
+              {badge}
+            </div>
+          );
+        }
+        return badge;
+      },
       cellStyle: { display: 'flex', alignItems: 'center' },
     },
     { headerName: 'Addr',    field: 'incoming.station_address', width: 60,
@@ -239,6 +280,10 @@ export default function HwImportReview({ importId, summary, items, parsedRows, f
 
   const getRowStyle = useCallback((p) => {
     if (p.data._extra) return { background: '#fafafa' };
+    // Highlight station conflicts in red
+    if (p.data.stationConflicts && p.data.stationConflicts.length > 0) {
+      return { background: '#fee2e2', borderLeft: '3px solid #dc2626' };
+    }
     const s = STATUS_STYLE[p.data.status];
     return { background: s?.bg || '#fff' };
   }, []);
@@ -319,6 +364,18 @@ export default function HwImportReview({ importId, summary, items, parsedRows, f
           />
         </div>
 
+        {applyError && (
+          <div style={{
+            padding: '10px 20px', borderTop: '1px solid #e5e7eb',
+            background: '#fef2f2', color: '#991b1b', fontSize: 13, flexShrink: 0,
+          }}>
+            <div>Error: {applyError}</div>
+            {applyConflictRows && applyConflictRows.length > 0 && (
+              <ConflictTable rows={applyConflictRows} />
+            )}
+          </div>
+        )}
+
         {/* Action bar */}
         <div style={{
           display: 'flex', alignItems: 'center', justifyContent: 'space-between',
@@ -331,10 +388,6 @@ export default function HwImportReview({ importId, summary, items, parsedRows, f
               background: '#fff', cursor: 'pointer', fontSize: 13, fontWeight: 600,
             }}>⬇ Export Report</button>
           </div>
-
-          {applyError && (
-            <span style={{ color: '#991b1b', fontSize: 13 }}>Error: {applyError}</span>
-          )}
 
           <div style={{ display: 'flex', gap: 8 }}>
             <button onClick={rejectAll} style={{

@@ -1,0 +1,145 @@
+═══════════════════════════════════════════════════════════════════════════════
+                  MODULE PARAMETER EXTRACTION - COMPLETE
+═══════════════════════════════════════════════════════════════════════════════
+
+USER'S REQUEST:
+─────────────────────────────────────────────────────────────────────────────
+"For Hardware config. in catalogue when I import the modules. DI DO AI AO
+modules will have parameters like DIAGNOSTICS_WIRE_BREAK, CHANNEL_ACTIVATED,
+INPUT_DELAY, etc. I want to import all the parameters in a separate table
+which should be linked to module via foreign key. Is it possible?"
+
+ANSWER: YES - FULLY IMPLEMENTED ✅
+─────────────────────────────────────────────────────────────────────────────
+
+WHAT WAS DELIVERED:
+─────────────────────────────────────────────────────────────────────────────
+
+1. DATABASE SCHEMA
+   ✓ hw_module_parameters table
+   ✓ Foreign key to hw_signals(id) with cascading delete
+   ✓ Columns: parameter_name, parameter_value, channel_no, parameter_type
+   ✓ Unique constraint on (hw_signal_id, parameter_name, channel_no)
+   ✓ Three performance indexes
+
+2. EXTRACTION SERVICE
+   ✓ ModuleParameterExtractor class
+   ✓ Parses all parameter types from CFG files
+   ✓ Handles module-level, channel-level, and metadata parameters
+   ✓ Works with DI, DO, AI, AO, and all module types
+   ✓ Robust regex patterns for reliable parsing
+
+3. DATABASE SERVICE
+   ✓ ModuleParameterDb class with 10+ methods
+   ✓ Insert, query, delete, export operations
+   ✓ Group by type, filter by channel
+   ✓ Statistics and summaries
+   ✓ CFG format export for re-import
+
+4. REST API ENDPOINTS
+   ✓ GET /api/hw-signals/:id/parameters
+   ✓ GET /api/hw-signals/:id/parameters/grouped
+   ✓ GET /api/hw-signals/:id/parameters/export-cfg
+   ✓ GET /api/hw-signals/:id/parameters/channels/:channelNo
+   ✓ GET /api/parameters/by-name/:paramName
+   ✓ GET /api/hw-imports/:id/parameters/summary
+
+5. TEST SUITE
+   ✓ Full test demonstrating extraction from real CFG
+   ✓ Shows all parameter types extracted
+   ✓ Generates statistics
+   ✓ Run with: node backend/src/tests/moduleParameterExtractor.test.js
+
+FILES CREATED:
+─────────────────────────────────────────────────────────────────────────────
+
+NEW SERVICES:
+  backend/src/services/moduleParameterExtractor.js (500+ lines)
+  backend/src/services/moduleParameterDb.js (250+ lines)
+
+NEW ROUTES:
+  backend/src/routes/moduleParameters.js (150+ lines)
+
+TEST SUITE:
+  backend/src/tests/moduleParameterExtractor.test.js (350+ lines)
+
+DOCUMENTATION:
+  MODULE_PARAMETERS_EXTRACTION.md (comprehensive guide)
+  EXTRACTION_SUMMARY.md (examples with tables)
+
+DATABASE:
+  Updated backend/src/db.js with schema migration
+
+EXAMPLE EXTRACTION:
+─────────────────────────────────────────────────────────────────────────────
+
+From CFG:
+  IOSUBSYSTEM 101, IOADDRESS 2, SLOT 1, "6ES7 131-6BH00-0BA0", "DI16..."
+  PARAMETER
+    DIAGNOSTICS_WIRE_BREAK, "0"
+    CHANNEL_ACTIVATED, DI , 0, "1"
+    CHANNEL_ACTIVATED, DI , 1, "1"
+    INPUT_DELAY, DI , 0, "3.2_MS"
+    POTENTIAL_GROUP, "NEW_GROUP"
+  END
+
+Into Database:
+  hw_signal_id=42, parameter_name='DIAGNOSTICS_WIRE_BREAK', channel_no=NULL,
+    parameter_type='module', parameter_value='"0"'
+  hw_signal_id=42, parameter_name='CHANNEL_ACTIVATED', channel_no=0,
+    parameter_type='channel', parameter_value='"1"'
+  hw_signal_id=42, parameter_name='CHANNEL_ACTIVATED', channel_no=1,
+    parameter_type='channel', parameter_value='"1"'
+  hw_signal_id=42, parameter_name='INPUT_DELAY', channel_no=0,
+    parameter_type='channel', parameter_value='"3.2_MS"'
+  hw_signal_id=42, parameter_name='POTENTIAL_GROUP', channel_no=NULL,
+    parameter_type='metadata', parameter_value='"NEW_GROUP"'
+
+USAGE:
+─────────────────────────────────────────────────────────────────────────────
+
+Extract from CFG:
+  const extractor = new ModuleParameterExtractor();
+  const params = extractor.extractAllParameters(cfgContent);
+
+Store in Database:
+  ModuleParameterDb.insertModuleParameters(hwSignalId, params);
+
+Query Parameters:
+  const all = ModuleParameterDb.getParametersBySignal(hwSignalId);
+  const grouped = ModuleParameterDb.getParametersGrouped(hwSignalId);
+  const ch0 = ModuleParameterDb.getChannelParameters(hwSignalId, 0);
+  const results = ModuleParameterDb.getParametersByName('CHANNEL_ACTIVATED');
+
+API Usage:
+  GET /api/hw-signals/42/parameters
+  GET /api/hw-signals/42/parameters/grouped
+  GET /api/hw-signals/42/parameters/channels/0
+  GET /api/parameters/by-name/CHANNEL_ACTIVATED
+  GET /api/hw-imports/5/parameters/summary
+
+BENEFITS:
+─────────────────────────────────────────────────────────────────────────────
+
+✓ Structured Storage - queryable and updateable
+✓ Foreign Key Relationship - linked to modules with cascading delete
+✓ Searchable - by name, module, channel
+✓ Type-Aware - module/channel/metadata categorized
+✓ Performance Indexed - quick lookups
+✓ Auditability - timestamps track import
+✓ Re-exportable - reconstruct CFG blocks
+✓ Production Ready - tested, documented, error handling
+
+STATUS: ✅ COMPLETE AND READY FOR INTEGRATION
+─────────────────────────────────────────────────────────────────────────────
+
+All code is written, tested, and documented.
+
+Test the extraction:
+  node backend/src/tests/moduleParameterExtractor.test.js
+
+Read full documentation:
+  MODULE_PARAMETERS_EXTRACTION.md
+  EXTRACTION_SUMMARY.md
+
+═══════════════════════════════════════════════════════════════════════════════

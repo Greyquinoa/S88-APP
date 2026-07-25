@@ -18,6 +18,11 @@ const hwConfigRoutes       = require('./routes/hwConfig');
 const hwControllersRoutes  = require('./routes/hwControllers');
 const hwFieldbusesRoutes   = require('./routes/hwFieldbuses');
 const mrpConfigRoutes      = require('./routes/mrpConfig');
+const signalMappingRoutes  = require('./routes/signalMappings');
+const ioConnectionRoutes   = require('./routes/ioConnections');
+const connectionRoutes     = require('./routes/connections');
+const moduleParametersRoutes = require('./routes/moduleParameters');
+const workflowRoutes       = require('./routes/workflow');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -37,6 +42,11 @@ app.use('/api/hw-config',        hwConfigRoutes);
 app.use('/api/hw-controllers',   hwControllersRoutes);
 app.use('/api/hw-fieldbuses',    hwFieldbusesRoutes);
 app.use('/api/mrp',              mrpConfigRoutes);
+app.use('/api/signal-mappings',  signalMappingRoutes);
+app.use('/api/io-connections',   ioConnectionRoutes);
+app.use('/api/connections',      connectionRoutes);
+app.use('/api/module-parameters', moduleParametersRoutes);
+app.use('/api/workflow',         workflowRoutes);
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
@@ -44,10 +54,37 @@ async function start() {
   try {
     // sql.js needs async init (loads WebAssembly)
     await initDb();
-    ensureSchema();
-    app.listen(PORT, () => {
+    await ensureSchema();
+
+    const server = app.listen(PORT, () => {
       console.log(`[Server] PCS7 Generator backend → http://localhost:${PORT}`);
     });
+
+    server.on('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        console.error(`[Server] Port ${PORT} is already in use — is another instance still running?`);
+      } else {
+        console.error('[Server] Server error:', err.message);
+      }
+      process.exit(1);
+    });
+
+    // Release the port cleanly on Ctrl+C / nodemon restart / kill
+    const shutdown = (signal) => {
+      console.log(`\n[Server] ${signal} received — shutting down…`);
+      server.close(() => {
+        console.log('[Server] Closed. Port released.');
+        process.exit(0);
+      });
+      // Force-exit if close() hangs on lingering connections
+      setTimeout(() => {
+        console.error('[Server] Forced shutdown after timeout.');
+        process.exit(1);
+      }, 5000).unref();
+    };
+
+    process.on('SIGINT',  () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
   } catch (err) {
     console.error('[Server] Failed to start:', err.message);
     process.exit(1);

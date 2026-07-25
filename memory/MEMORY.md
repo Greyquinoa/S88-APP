@@ -1,0 +1,6 @@
+- [Editable Catalogue Details](editable_catalogue_module_details.md) — Inline edit channel_count, input_bytes, output_bytes, identifiers with auto database persistence
+- [GSDML vs Scalance Separation](gsdml_vs_scalance_separation.md) — Complete isolation: Scalance for network switches only, GSDML for I/O devices (transmitters, valves, analyzers)
+- [Channel Count & Digital vs Analog](channel_count_and_diginal_vs_analog.md) — channel_count=0 behavior, DigIn/AnaIn differentiation by signal_type
+- [Addr IN/OUT Calculation](addr_in_addr_out_calculation.md) — Step-by-step address allocation, sequential packing, cursor advancement
+- [Address Calculation Derivation](address_calculation_derivation.md) — How channel_count, input_bytes, output_bytes are derived from CFG
+- [IO Address Calculation](io_address_calculation.md) — Sequential packing strategy, cursor-based allocation, identifier resolution

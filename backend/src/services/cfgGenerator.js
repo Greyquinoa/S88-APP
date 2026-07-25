@@ -1,7 +1,7 @@
 // services/cfgGenerator.js — Generate a PCS7 STEP7 .cfg file from baseline + station data
 'use strict';
 const { findTemplate, isGsdPaPath, defaultIdentifiers } = require('./hwAddressEngine');
-const { loadFamilyAutoSlotConfig, buildSlotMap, buildSubslotMap, isSlotAutocreated, isSubslotAutocreated, resolveSlotOrderNo, resolveSubslotOrderNo } = require('./autoSlotResolver');
+const { loadStationAutoSlotConfig, buildSlotMap, buildSubslotMap, isSlotAutocreated, isSubslotAutocreated, resolveSlotOrderNo, resolveSubslotOrderNo } = require('./autoSlotResolver');
 const blocks = require('./cfgBlocks');
 
 // I/O modules that PCS7 does NOT wrap in a REDUNDANCY block even on an H-station.
@@ -154,16 +154,64 @@ function buildAddressLines(tpl, slot, warnings, ctx) {
 }
 
 /**
- * Build PARAMETER block lines from a template (param_template already indented).
- * If potentialGroup is provided ("NEW_GROUP" | "LEFT_MODULE"), the POTENTIAL_GROUP
- * line is injected/replaced inside the block (ET200SP-only).
+ * Build PARAMETER block lines from a template.
+ * Looks up normalized parameters from hw_module_parameters using order_no (version-independent),
+ * falls back to param_template. If potentialGroup is provided, it's injected/replaced.
+ *
+ * @param tpl - Template object { order_no, param_template, ... }
+ * @param potentialGroup - "NEW_GROUP" | "LEFT_MODULE" or null
+ * @param db - Database handle (optional, for normalized params lookup)
  */
-function buildParamLines(tpl, potentialGroup) {
-  const hasTpl = tpl && tpl.param_template;
-  if (!potentialGroup && !hasTpl) return null;
+async function buildParamLines(tpl, potentialGroup, db, assignedChannels = null) {
+  let lines = [];
 
-  let lines = hasTpl ? tpl.param_template.split('\n') : [];
+  // Try to fetch normalized parameters from DB by exact order_no match
+  if (db && tpl && tpl.order_no && tpl.signal_type && ['DI', 'DO', 'AI', 'AO'].includes(tpl.signal_type)) {
+    try {
+      const params = await db.prepare(`
+        SELECT p.id, p.parameter_name, p.channel_type, p.channel_no, p.parameter_type,
+               p.parameter_value, p.spare_value, p.is_dynamic
+        FROM hw_module_parameters p
+        JOIN hw_module_templates t ON p.template_id = t.id
+        WHERE t.signal_type = ? AND t.order_no = ? AND p.is_visible = true
+        ORDER BY p.sort_order
+      `).all(tpl.signal_type, tpl.order_no);
 
+      if (params.length > 0) {
+        // Build lines from normalized parameters
+        params.forEach(p => {
+          if (p.channel_no !== null) {
+            // Channel-level parameter: choose between default and spare based on assignment
+            let value = p.parameter_value;
+            if (p.is_dynamic && assignedChannels) {
+              // For dynamic parameters, use spare_value if channel is NOT assigned
+              const isChannelAssigned = assignedChannels.has(p.channel_no);
+              if (!isChannelAssigned && p.spare_value !== null) {
+                value = p.spare_value;
+              }
+            }
+            // PARAM_NAME, CHANNEL_TYPE , CH_NO, "VALUE"
+            lines.push(`  ${p.parameter_name}, ${p.channel_type} , ${p.channel_no}, "${value}"`);
+          } else {
+            // Module-level: PARAM_NAME, "VALUE"
+            lines.push(`  ${p.parameter_name}, "${p.parameter_value}"`);
+          }
+        });
+      }
+    } catch (e) {
+      // Fall through to param_template if DB lookup fails
+      console.warn(`[CFG] Parameter lookup failed for ${tpl.order_no}:`, e.message);
+    }
+  }
+
+  // Fall back to param_template if no normalized params found
+  if (lines.length === 0 && tpl && tpl.param_template) {
+    lines = tpl.param_template.split('\n');
+  }
+
+  if (!potentialGroup && lines.length === 0) return null;
+
+  // Inject/replace POTENTIAL_GROUP if provided (ET200SP-only)
   if (potentialGroup) {
     const pgLine = `  POTENTIAL_GROUP, "${potentialGroup}"`;
     const idx = lines.findIndex(l => l.trimStart().startsWith('POTENTIAL_GROUP'));
@@ -174,7 +222,7 @@ function buildParamLines(tpl, potentialGroup) {
     }
   }
 
-  return ['PARAMETER', ...lines];
+  return lines.length > 0 ? ['PARAMETER', ...lines] : null;
 }
 
 /**
@@ -184,8 +232,9 @@ function buildParamLines(tpl, potentialGroup) {
  * @param diag - { ptr } mutable diagnostic-address counter (counts down)
  * @param warnings - mutable array collecting missing-identifier diagnostics
  * @param autoSlotConfig - Auto-slot configuration from database (optional)
+ * @param db - Database instance (for loading module parameters)
  */
-function renderEt200sp(station, templateMap, ioNo, diag, warnings, autoSlotConfig) {
+async function renderEt200sp(station, templateMap, ioNo, diag, warnings, autoSlotConfig, db) {
   const out = [];
   const addr      = station.address;
   const name      = deviceName(station);
@@ -208,10 +257,10 @@ function renderEt200sp(station, templateMap, ioNo, diag, warnings, autoSlotConfi
     const slot0Config = autoSlotConfig.slots.find(s => s.slot === 0);
     if (slot0Config && slot0Config.subslots) {
       for (const subslot of slot0Config.subslots) {
-        if (subslot.type === 'port' && subslot.order_no) {
+        if (subslot.order_no) {
           out.push(blocks.portBlock({
             ioNo, addr, subslot: subslot.subslot,
-            portLabel: subslot.port_label,
+            portLabel: subslot.port_label || subslot.label,
             portOrder: subslot.order_no,
             diag: diag.ptr--
           }));
@@ -236,6 +285,13 @@ function renderEt200sp(station, templateMap, ioNo, diag, warnings, autoSlotConfi
       continue;
     }
     const tpl = findTemplate(templateMap, slot.orderNo);
+    // Collect assigned channel numbers for dynamic parameter resolution
+    const assignedChannels = new Set();
+    if (slot.channels) {
+      slot.channels.forEach(ch => {
+        if (ch.tag) assignedChannels.add(Number(ch.channel));
+      });
+    }
     out.push(blocks.ioModuleBlock({
       ioNo, addr, slot: slotNo,
       order: slot.orderNo,
@@ -243,7 +299,8 @@ function renderEt200sp(station, templateMap, ioNo, diag, warnings, autoSlotConfi
       name: slot.name,
       redundant: !NON_REDUNDANT_ORDERS.has(slot.orderNo),
       addressLines: buildAddressLines(tpl, slot, warnings, { addr, slot: slotNo, order: slot.orderNo }),
-      paramLines: buildParamLines(tpl, slot.potentialGroup || null),
+      paramLines: await buildParamLines(tpl, slot.potentialGroup || null, db, assignedChannels),
+      mlfb: tpl ? tpl.mlfb : null,
     }));
   }
 
@@ -271,8 +328,9 @@ function renderEt200sp(station, templateMap, ioNo, diag, warnings, autoSlotConfi
  *   Slot 3+ — PA transmitter slots added by the user (one META\PA... block each)
  *
  * @param autoSlotConfig - Auto-slot configuration from database (optional)
+ * @param db - Database instance (for loading module parameters)
  */
-function renderCfuPa(station, templateMap, ioNo, diag, warnings, autoSlotConfig) {
+async function renderCfuPa(station, templateMap, ioNo, diag, warnings, autoSlotConfig, db) {
   const out = [];
   const addr      = station.address;
   const name      = deviceName(station);
@@ -303,10 +361,10 @@ function renderCfuPa(station, templateMap, ioNo, diag, warnings, autoSlotConfig)
     const slot0Config = autoSlotConfig.slots.find(s => s.slot === 0);
     if (slot0Config && slot0Config.subslots) {
       for (const subslot of slot0Config.subslots) {
-        if (subslot.type === 'port' && subslot.order_no) {
+        if (subslot.order_no) {
           out.push(blocks.portBlock({
             ioNo, addr, subslot: subslot.subslot,
-            portLabel: subslot.port_label,
+            portLabel: subslot.port_label || subslot.label,
             portOrder: subslot.order_no,
             diag: diag.ptr--
           }));
@@ -319,6 +377,13 @@ function renderCfuPa(station, templateMap, ioNo, diag, warnings, autoSlotConfig)
   const slot1 = station.slots.get(1);
   const slot1Tpl = slot1 ? findTemplate(templateMap, slot1.orderNo) : null;
   if (slot1) {
+    // Collect assigned channel numbers for dynamic parameter resolution
+    const slot1AssignedChannels = new Set();
+    if (slot1.channels) {
+      slot1.channels.forEach(ch => {
+        if (ch.tag) slot1AssignedChannels.add(Number(ch.channel));
+      });
+    }
     out.push(blocks.ioModuleBlock({
       ioNo, addr, slot: 1,
       order: slot1 ? slot1.orderNo : '_S7H_HSP_CFU_PA_V2_0_DI8_DQ8_CT',
@@ -326,7 +391,8 @@ function renderCfuPa(station, templateMap, ioNo, diag, warnings, autoSlotConfig)
       name: slot1 ? slot1.name : 'DIQ8 DC24V/0.5A',
       redundant: false,
       addressLines: buildAddressLines(slot1Tpl, slot1, warnings, { addr, slot: 1, order: slot1.orderNo }),
-      paramLines: slot1Tpl ? buildParamLines(slot1Tpl, null) : null,
+      paramLines: slot1Tpl ? await buildParamLines(slot1Tpl, null, db, slot1AssignedChannels) : null,
+      mlfb: slot1Tpl ? slot1Tpl.mlfb : null,
     }));
   }
 
@@ -474,7 +540,7 @@ function renderCfuPa(station, templateMap, ioNo, diag, warnings, autoSlotConfig)
  * Structure: device header → SLOT 0 (DAP) → SUBSLOT 1 (PN-IO) → SUBSLOT N (ports).
  * Port definitions come from tpl.port_config JSON; device identity from tpl.gsdml_file + tpl.dap_id.
  */
-function renderScalance(station, templateMap, ioNo, diag) {
+function renderScalance(station, templateMap, ioNo, diag, db) {
   const addr   = station.address;
   const hexIp  = ipToHex(station.ip);
   const name   = deviceName(station);
@@ -486,7 +552,8 @@ function renderScalance(station, templateMap, ioNo, diag) {
   const dapId     = headTpl && headTpl.dap_id     ? headTpl.dap_id     : '';
   const gsdmlPath = dapId ? `${gsdmlFile}<DAP ${dapId}>` : gsdmlFile;
   const version   = headTpl && headTpl.version    ? headTpl.version    : '';
-  const mlfb      = headSlot ? headSlot.orderNo : (headTpl ? headTpl.order_no : '');
+  // Prefer MLFB from slot (extracted from baseline CFG) over template; fallback to template's mlfb
+  const mlfb      = (headSlot && headSlot.mlfb) ? headSlot.mlfb : (headTpl && headTpl.mlfb ? headTpl.mlfb : '');
 
   let meta = {};
   if (headTpl && headTpl.param_template) {
@@ -522,41 +589,71 @@ function renderScalance(station, templateMap, ioNo, diag) {
  *
  * @param db - Database instance (for loading auto-slot configs)
  */
-function renderStation(station, templateMap, ioNo, diag, warnings, db) {
+async function renderStation(station, templateMap, ioNo, diag, warnings, db) {
   const headSlot = station.slots.get(0) ||
     station.slots.get([...station.slots.keys()].sort((a, b) => a - b)[0]);
   const headTpl  = headSlot ? findTemplate(templateMap, headSlot.orderNo) : null;
   const family   = headTpl ? headTpl.family : 'ET200SP';
 
-  // Load auto-slot config from database
-  const autoSlotConfig = db ? loadFamilyAutoSlotConfig(db, family) : null;
+  // Load auto-slot config from database using station (slot 0) order_no
+  // This is keyed by the interface module order number, not the family name
+  const autoSlotConfig = headSlot && db ? await loadStationAutoSlotConfig(db, headSlot.orderNo) : null;
 
   if (family === 'CFU_PA') {
-    return renderCfuPa(station, templateMap, ioNo, diag, warnings, autoSlotConfig);
+    return renderCfuPa(station, templateMap, ioNo, diag, warnings, autoSlotConfig, db);
   }
 
   if (family === 'Scalance') {
-    return renderScalance(station, templateMap, ioNo, diag);
+    return renderScalance(station, templateMap, ioNo, diag, db);
   }
 
   if (family === 'ET200SP') {
-    return renderEt200sp(station, templateMap, ioNo, diag, warnings, autoSlotConfig);
+    return renderEt200sp(station, templateMap, ioNo, diag, warnings, autoSlotConfig, db);
   }
 
-  // Generic fallback (non-ET200SP). Minimal but structurally valid.
+  // Generic fallback (Festo, GSDML, and other non-ET200SP families).
+  // Still use auto-slot config for subslot generation (slots 1+, Slot 0 subslots, etc.)
   const addr      = station.address;
   const name      = deviceName(station);
   const hexIp     = ipToHex(station.ip);
   const hexRouter = station.routerAddress ? ipToHex(station.routerAddress) : null;
   const imOrder = headSlot ? headSlot.orderNo : 'UNKNOWN';
   const imVer = headTpl && headTpl.version ? headTpl.version : '';
+  // Prefer MLFB from slot (extracted from baseline CFG) over template; fallback to template's mlfb
+  const mlfb = (headSlot && headSlot.mlfb) ? headSlot.mlfb : (headTpl && headTpl.mlfb ? headTpl.mlfb : null);
   const out = [];
   out.push(blocks.deviceHeaderBlock({ ioNo, addr, imOrder, imVersion: imVer, name, posX: station.posX, posY: station.posY }));
-  out.push(blocks.slot0Block({ ioNo, addr, imOrder, name, hexIp, hexRouter, diag: diag.ptr-- }));
+  out.push(blocks.slot0Block({ ioNo, addr, imOrder, name, hexIp, hexRouter, diag: diag.ptr--, mlfb }));
+
+  // Auto-create Slot 0 subslots (e.g. PN-IO interface, ports) from config
+  if (autoSlotConfig && autoSlotConfig.slots) {
+    const slot0Config = autoSlotConfig.slots.find(s => s.slot === 0);
+    if (slot0Config && slot0Config.subslots) {
+      for (const subslot of slot0Config.subslots) {
+        if (subslot.order_no) {
+          out.push(blocks.portBlock({
+            ioNo, addr, subslot: subslot.subslot,
+            portLabel: subslot.port_label || subslot.label,
+            portOrder: subslot.order_no,
+            diag: diag.ptr--
+          }));
+        }
+      }
+    }
+  }
+
+  // Render slots 1+ (each may have its own subslots from config)
   const ioSlots = [...station.slots.keys()].filter(s => s !== 0).sort((a, b) => a - b);
   for (const slotNo of ioSlots) {
     const slot = station.slots.get(slotNo);
     const tpl  = findTemplate(templateMap, slot.orderNo);
+    // Collect assigned channel numbers for dynamic parameter resolution
+    const slotAssignedChannels = new Set();
+    if (slot.channels) {
+      slot.channels.forEach(ch => {
+        if (ch.tag) slotAssignedChannels.add(Number(ch.channel));
+      });
+    }
     out.push(blocks.ioModuleBlock({
       ioNo, addr, slot: slotNo,
       order: slot.orderNo,
@@ -564,8 +661,26 @@ function renderStation(station, templateMap, ioNo, diag, warnings, db) {
       name: slot.name,
       redundant: false,
       addressLines: buildAddressLines(tpl, slot, warnings, { addr, slot: slotNo, order: slot.orderNo }),
-      paramLines: buildParamLines(tpl),
+      paramLines: await buildParamLines(tpl, null, db, slotAssignedChannels),
+      mlfb: tpl ? tpl.mlfb : null,
     }));
+
+    // Auto-create subslots for this slot from config (if defined)
+    if (autoSlotConfig && autoSlotConfig.slots) {
+      const slotConfig = autoSlotConfig.slots.find(s => s.slot === slotNo);
+      if (slotConfig && slotConfig.subslots) {
+        for (const subslot of slotConfig.subslots) {
+          if (subslot.order_no) {
+            out.push(blocks.portBlock({
+              ioNo, addr, subslot: subslot.subslot,
+              portLabel: subslot.port_label || subslot.label,
+              portOrder: subslot.order_no,
+              diag: diag.ptr--
+            }));
+          }
+        }
+      }
+    }
   }
   return out.join('\n\n');
 }
@@ -578,7 +693,7 @@ function renderStation(station, templateMap, ioNo, diag, warnings, db) {
  * @param {Map}    templateMap    - Map<orderNo, templateRow>
  * @param {object} db             - Database instance (for loading auto-slot configs)
  */
-function generateCfg(parsedBaseline, stations, templateMap, db) {
+async function generateCfg(parsedBaseline, stations, templateMap, db) {
   const parts = [];
   const defaultIoNo = parsedBaseline.ioSubsystemNo;
 
@@ -659,7 +774,7 @@ function generateCfg(parsedBaseline, stations, templateMap, db) {
   for (const addr of sortedAddrs) {
     const station = stations.get(addr);
     const ioNo = station.subsystemNo != null ? station.subsystemNo : defaultIoNo;
-    parts.push(renderStation(station, templateMap, ioNo, diag, warnings, db));
+    parts.push(await renderStation(station, templateMap, ioNo, diag, warnings, db));
     parts.push('');
   }
 

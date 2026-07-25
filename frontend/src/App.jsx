@@ -1,19 +1,35 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import { AgGridReact } from "ag-grid-react";
+import { AllCommunityModule, ModuleRegistry, themeQuartz } from "ag-grid-community";
+
+ModuleRegistry.registerModules([AllCommunityModule]);
 import {
-  getLibraryStatus, previewLibraryUpload, importLibrary,
-  getCmTypes, getCmTypeBlocks, patchVarDefault, patchVarValid,
-  generateXML, getHistory,
+  getLibraryStatus, previewLibraryUpload, computeLibraryDiff, importLibrary,
+  getCmTypes, getCmTypeBlocks, getCmTypeBlockPrefs, saveCmTypeBlockPrefs, patchVarDefault, patchVarValid,
+  generateXML, generateXMLStream, getHistory,
   listProjects, getProject, saveProject, deleteProject,
   deleteCmType,
   getUnitTypes, getUnitType, createUnitType, updateUnitType, deleteUnitType,
+  getUnitTypeConnections, saveUnitTypeConnections, deleteUnitTypeConnection, getCmTypeVariablesForUnit,
   getUnitInstances, addUnitInstance, updateUnitInstance, deleteUnitInstance, expandUnitInstances,
   listCompositeCmTypes, getCompositeCmType, createCompositeCmType, updateCompositeCmType, deleteCompositeCmType,
   getProjectConfig, saveProjectConfig, parseProjectXml,
   getValveCommands, saveValveCommands,
+  getIoConnections, createIoConnection, updateIoConnection, deleteIoConnection,
+  generateConnections, getConnectionIOs,
+  listHwImports, ingestIoRowsIntoHw,
+  getLatestIoImport, getIOHeaders,
 } from "./api.js";
 import StepIOImport from "./StepIOImport.jsx";
 import StepHWConfig from "./StepHWConfig.jsx";
 import InstancesGrid from "./InstancesGrid.tsx";
+import SignalMappingModal from "./SignalMappingModal.jsx";
+import UnitConnectionsEditor from "./UnitConnectionsEditor.jsx";
+import LibraryImportReview from "./LibraryImportReview.jsx";
+import UnitTypeImportModal from "./UnitTypeImportModal.jsx";
+import Spinner from "./Spinner.jsx";
+import ProgressBar from "./ProgressBar.jsx";
+import { GlobalLoadingProvider } from "./LoadingContext.jsx";
 
 const STEPS = ["Projects", "IO Import", "Library", "Unit Types", "Hierarchy", "Instances", "HW Config", "Generate"];
 const DEFAULT_ON_OPTIONAL = ["MV_Rate"];
@@ -34,16 +50,37 @@ export default function App() {
   const [hierarchy, setHierarchy]               = useState([]);  // [{id, parentId, name, s88Type, sortOrder, dbId?}]
   const [result, setResult]           = useState(null);    // { outputs: [{userProject, xml, stats}], auditIds }
   const [loading, setLoading]         = useState("");
-  const [error, setError]             = useState("");
-  const [importPreview, setImportPreview] = useState(null); // { token, items, selectedNames: Set }
+  const [uiLoading, setUiLoading]     = useState("");      // global UI feedback spinner
+  const [genProgress, setGenProgress] = useState(null);    // { pct, phase, msg } while generating XML; null = idle
+  const [error, setErrorRaw]          = useState("");
+  const [errorConflictRows, setErrorConflictRows] = useState(null); // tabular detail for duplicate-station errors
+  // setError(str) clears conflictRows (existing call sites, unchanged behavior).
+  // setError(Error) — e.g. setError(e) from a catch block — also captures e.conflictRows
+  // (attached by api.js on "Duplicate stations" 400s) for tabular display in the banner.
+  const setError = (errOrMsg) => {
+    if (errOrMsg instanceof Error) {
+      setErrorRaw(errOrMsg.message);
+      setErrorConflictRows(errOrMsg.conflictRows || null);
+    } else {
+      setErrorRaw(errOrMsg);
+      setErrorConflictRows(null);
+    }
+  };
+  const [importPreview, setImportPreview] = useState(null); // { token, diffResult }
+  const [importDiff, setImportDiff]   = useState(null);     // diff result from compute-diff
 
   // ── Unit Type state ─────────────────────────────────────────────────────
   const [unitTypes, setUnitTypes]           = useState([]);   // global library list
   const [unitInstances, setUnitInstances]   = useState([]);   // per-project
   const [savedProjectId, setSavedProjectId] = useState(null); // DB id of current project
+  const [pendingHwMapping, setPendingHwMapping] = useState(null); // { ioImportId, hardwareMappings } handed off from unified IO screen
   const [compositeCmTypes, setCompositeCmTypes] = useState([]); // global composite library
   const [projectConfig, setProjectConfig]   = useState(null);  // PCS7 hardware IDs
   const [valveCommands, setValveCommands]   = useState([]);    // user-editable mode command lookup
+
+  // ── Unit Connections state ─────────────────────────────────────────────────
+  const [unitConnections, setUnitConnections]           = useState({});     // unitTypeId -> connections[]
+  const [cmTypeVarCache, setCmTypeVarCache]             = useState({});     // member alias -> {vars, subMembers, ...}
 
   // Check library status on mount + load unit types + composite types
   useEffect(() => {
@@ -57,6 +94,21 @@ export default function App() {
     loadCompositeCmTypesList();
     loadValveCommands();
   }, []);
+
+  // Two-phase render for the Instances tab (step 5): the grid renders 2000 rows
+  // synchronously, which blocks the main thread for several seconds and prevents
+  // the browser from painting the spinner. So we hold the grid back for one paint:
+  // goTo() sets uiLoading + step, this effect waits until the spinner has actually
+  // been painted (double rAF), then clears uiLoading so the grid mounts next frame.
+  useEffect(() => {
+    if (step === 5 && uiLoading) {
+      let raf2 = 0;
+      const raf1 = requestAnimationFrame(() => {
+        raf2 = requestAnimationFrame(() => setUiLoading(""));
+      });
+      return () => { cancelAnimationFrame(raf1); cancelAnimationFrame(raf2); };
+    }
+  }, [step, uiLoading]);
 
   async function loadValveCommands() {
     try {
@@ -74,11 +126,39 @@ export default function App() {
   }
 
   async function loadUnitInstances(projectId) {
-    try { setUnitInstances(await getUnitInstances(projectId)); } catch (_) {}
+    try {
+      setUnitInstances(await getUnitInstances(projectId));
+    } catch (_) {}
   }
 
   async function loadProjectConfig(projectId) {
     try { setProjectConfig(await getProjectConfig(projectId)); } catch (_) {}
+  }
+
+  // Load connections and variables when unit type is selected
+  async function loadUnitTypeConnections(unitTypeId) {
+    try {
+      const [conns, vars] = await Promise.all([
+        getUnitTypeConnections(unitTypeId),
+        getCmTypeVariablesForUnit(unitTypeId)
+      ]);
+      setUnitConnections(prev => ({ ...prev, [unitTypeId]: conns }));
+      setCmTypeVarCache(vars);
+    } catch (err) {
+      setError(`Failed to load connections: ${err.message}`);
+    }
+  }
+
+  async function saveUnitConnectionsEditor(unitTypeId, connections) {
+    setError("");
+    try {
+      await saveUnitTypeConnections(unitTypeId, connections, true);
+      setUnitConnections(prev => ({ ...prev, [unitTypeId]: connections }));
+    } catch (err) {
+      const msg = `Failed to save connections: ${err.message}`;
+      setError(msg);
+      throw new Error(msg); // re-throw so caller knows save failed
+    }
   }
 
   async function loadCmTypes() {
@@ -104,10 +184,25 @@ export default function App() {
     const existing = cmtProfiles.find(p => p.id === cmTypeName);
     if (existing?.subBlocks && existing?.roles !== null) return existing; // already fully loaded
     const detail = await getCmTypeBlocks(cmTypeName);
-    // Preserve any enabledBlocks restored from a saved project — otherwise use defaults.
-    const enabledBlocks = existing?.enabledBlocks ?? detail.subBlocks
-      .filter(b => !b.optional || DEFAULT_ON_OPTIONAL.includes(b.name))
-      .map(b => b.name);
+
+    // Load saved user preferences for enabled blocks
+    let enabledBlocks = existing?.enabledBlocks;
+    if (!enabledBlocks) {
+      try {
+        const prefs = await getCmTypeBlockPrefs(cmTypeName);
+        if (prefs?.enabledBlocks?.length > 0) {
+          enabledBlocks = prefs.enabledBlocks;
+        }
+      } catch (_) {}
+    }
+
+    // Fall back to defaults if no saved preferences and not from a project
+    if (!enabledBlocks) {
+      enabledBlocks = detail.subBlocks
+        .filter(b => !b.optional || DEFAULT_ON_OPTIONAL.includes(b.name))
+        .map(b => b.name);
+    }
+
     const roles = detail.roles || [];
     const roleKindMap = detail.roleKindMap || {};
     setProfiles(prev => prev.map(p =>
@@ -120,15 +215,15 @@ export default function App() {
   async function handleUpload(file) {
     setLoading("Uploading and parsing library…");
     setError("");
+    setImportDiff(null);
     try {
       const r = await previewLibraryUpload(file, pct => setLoading(`Uploading… ${pct}%`));
+      setLoading("Computing diff…");
+      // Compute diff to show what will change
+      const diff = await computeLibraryDiff(r.token);
       setLoading("");
-      // Show the selection modal; all types checked by default
-      setImportPreview({
-        token:         r.token,
-        items:         r.preview,
-        selectedNames: new Set(r.preview.map(p => p.name)),
-      });
+      setImportPreview({ token: r.token });
+      setImportDiff(diff);
     } catch (e) {
       setError(e.message);
       setLoading("");
@@ -141,7 +236,8 @@ export default function App() {
     try {
       const r = await importLibrary(importPreview.token, [...selectedNames]);
       setImportPreview(null);
-      setLoading(`Imported ${r.cmTypes} CM types, ${r.blocks} blocks, ${r.vars} vars`);
+      setImportDiff(null);
+      setLoading(`Imported ${r.new} new, ${r.updated} updated, ${r.blocks} blocks, ${r.vars} vars`);
       await loadCmTypes();
       const status = await getLibraryStatus();
       setLibStatus(status);
@@ -201,18 +297,29 @@ export default function App() {
       });
       setHierarchy(hyd);
 
-      setInstances(proj.instances.map((i, idx) => ({
-        id:               Date.now() + idx,
-        profileId:        i.cm_type,
-        instanceName:     i.instance_name,
-        samplingTime:     i.sampling_time || "1000",
-        userProject:      i.user_project || "",
-        folderId:         i.folder_id != null ? dbToClient[i.folder_id] || "" : "",
-        roleAssignments:  i.role_assignments || {},
-        compositeGroupId: i.composite_group_id ?? undefined,
-        compositeId:      i.composite_id      ?? undefined,
-        memberIdx:        i.member_idx        ?? undefined,
-      })));
+      setInstances(proj.instances.map((i, idx) => {
+        const inst = {
+          id:               Date.now() + idx,
+          profileId:        i.cm_type,
+          instanceName:     i.instance_name,
+          samplingTime:     i.sampling_time || "1000",
+          userProject:      i.user_project || "",
+          folderId:         i.folder_id != null ? dbToClient[i.folder_id] || "" : "",
+          roleAssignments:  i.role_assignments || {},
+          compositeGroupId: i.composite_group_id ?? undefined,
+          compositeId:      i.composite_id      ?? undefined,
+          memberIdx:        i.member_idx        ?? undefined,
+          source:           i.source || "manual",
+          connections:      i.connections || [],
+        };
+        // Auto-hydrate: if this is a composite member but connections are empty,
+        // it likely was created manually or is from an old save. Mark for lazy
+        // hydration so connections are populated when the composite detail loads.
+        if (inst.compositeId != null && inst.memberIdx != null && !inst.connections.length) {
+          inst._needsConnections = true;
+        }
+        return inst;
+      }));
       // Stay on the Projects step — the user reviews user projects and
       // clicks Continue when ready.
     } finally {
@@ -221,64 +328,77 @@ export default function App() {
     }
   }
 
+  // ── Save ──────────────────────────────────────────────────────────────────
+  // Persist the entire working set (user projects, hierarchy, instances incl.
+  // their IO `connections`, block prefs). Returns a promise so callers that need
+  // the DB to be current — e.g. "Generate Connections" — can await it first.
+  async function saveProjectNow() {
+    if (!savedProjectName.trim()) return;
+    // Hierarchy: send in topological order (parents before children) so the
+    // backend can resolve parentClientId → dbId in a single pass.
+    const orderedHierarchy = topoSortHierarchy(hierarchy);
+
+    const resp = await saveProject({
+      name:         savedProjectName,
+      comment:      "",
+      userProjects,
+      hierarchy:    orderedHierarchy.map((f, idx) => ({
+        clientId:       f.id,
+        parentClientId: f.parentId,
+        name:           f.name,
+        s88_type:       f.s88Type || null,
+        sort_order:     idx,
+      })),
+      instances:    instances.map(i => ({
+        cm_type:            i.profileId,
+        instance_name:      i.instanceName,
+        sampling_time:      i.samplingTime,
+        user_project:       i.userProject || null,
+        folder_client_id:   i.folderId || null,
+        role_assignments:   i.roleAssignments || {},
+        composite_group_id: i.compositeGroupId ?? null,
+        composite_id:       i.compositeId      ?? null,
+        member_idx:         i.memberIdx        ?? null,
+        source:             i.source || "manual",
+        connections:        i.connections || [],
+      })),
+      cmtProfiles:  cmtProfiles
+        .filter(p => p.enabledBlocks)
+        .map(p => ({ cmType: p.id, enabledBlocks: p.enabledBlocks })),
+    });
+
+    // Rewrite freshly-created (`cf…`) client folder ids to their assigned DB ids.
+    // Existing `db…` ids are preserved by the backend (same row reused).
+    const map = resp?.folderIdMap || {};
+    const needsRemap = Object.keys(map).some(k => !k.startsWith("db"));
+    if (needsRemap) {
+      const remap = cid => {
+        if (!cid) return cid;
+        if (cid.startsWith("db")) return cid;
+        return map[cid] != null ? `db${map[cid]}` : cid;
+      };
+      hydratingRef.current = true;
+      setHierarchy(prev => prev.map(f => ({
+        ...f,
+        id:       remap(f.id),
+        parentId: f.parentId ? remap(f.parentId) : null,
+      })));
+      setInstances(prev => prev.map(i => ({
+        ...i,
+        folderId: i.folderId ? remap(i.folderId) : "",
+      })));
+      setTimeout(() => { hydratingRef.current = false; }, 0);
+    }
+    return resp;
+  }
+
   // ── Auto-save ───────────────────────────────────────────────────────────
   // Debounce every change to the working set; persists transparently.
   useEffect(() => {
     if (!savedProjectName.trim()) return;
     if (hydratingRef.current) return;
     const handle = setTimeout(() => {
-      // Hierarchy: send in topological order (parents before children) so the
-      // backend can resolve parentClientId → dbId in a single pass.
-      const orderedHierarchy = topoSortHierarchy(hierarchy);
-
-      saveProject({
-        name:         savedProjectName,
-        comment:      "",
-        userProjects,
-        hierarchy:    orderedHierarchy.map((f, idx) => ({
-          clientId:       f.id,
-          parentClientId: f.parentId,
-          name:           f.name,
-          s88_type:       f.s88Type || null,
-          sort_order:     idx,
-        })),
-        instances:    instances.map(i => ({
-          cm_type:            i.profileId,
-          instance_name:      i.instanceName,
-          sampling_time:      i.samplingTime,
-          user_project:       i.userProject || null,
-          folder_client_id:   i.folderId || null,
-          role_assignments:   i.roleAssignments || {},
-          composite_group_id: i.compositeGroupId ?? null,
-          composite_id:       i.compositeId      ?? null,
-          member_idx:         i.memberIdx        ?? null,
-        })),
-        cmtProfiles:  cmtProfiles
-          .filter(p => p.enabledBlocks)
-          .map(p => ({ cmType: p.id, enabledBlocks: p.enabledBlocks })),
-      }).then(resp => {
-        // Rewrite freshly-created (`cf…`) client folder ids to their assigned DB ids.
-        // Existing `db…` ids are preserved by the backend (same row reused).
-        const map = resp?.folderIdMap || {};
-        const needsRemap = Object.keys(map).some(k => !k.startsWith("db"));
-        if (!needsRemap) return;
-        const remap = cid => {
-          if (!cid) return cid;
-          if (cid.startsWith("db")) return cid;
-          return map[cid] != null ? `db${map[cid]}` : cid;
-        };
-        hydratingRef.current = true;
-        setHierarchy(prev => prev.map(f => ({
-          ...f,
-          id:       remap(f.id),
-          parentId: f.parentId ? remap(f.parentId) : null,
-        })));
-        setInstances(prev => prev.map(i => ({
-          ...i,
-          folderId: i.folderId ? remap(i.folderId) : "",
-        })));
-        setTimeout(() => { hydratingRef.current = false; }, 0);
-      }).catch(e => setError(`Auto-save failed: ${e.message}`));
+      saveProjectNow().catch(e => setError(`Auto-save failed: ${e.message}`));
     }, 600);
     return () => clearTimeout(handle);
   }, [savedProjectName, userProjects, instances, cmtProfiles, hierarchy]);
@@ -287,88 +407,86 @@ export default function App() {
     setProfiles(prev => prev.map(p => {
       if (p.id !== profileId) return p;
       const has = p.enabledBlocks?.includes(blockName);
-      return { ...p, enabledBlocks: has
+      const nextEnabled = has
         ? p.enabledBlocks.filter(b => b !== blockName)
-        : [...(p.enabledBlocks || []), blockName] };
+        : [...(p.enabledBlocks || []), blockName];
+      // Save to database
+      saveCmTypeBlockPrefs(profileId, nextEnabled).catch(err => {
+        console.error('Failed to save block preferences:', err);
+      });
+      return { ...p, enabledBlocks: nextEnabled };
     }));
+  }
+
+  // ── Helper: Extract IO and Value connections for a composite member ──────
+  function extractMemberConnections(detail, memberIdx) {
+    if (!detail?.connections || memberIdx == null) return [];
+    return (detail.connections || [])
+      .filter(c => Number(c.to_member_idx) === memberIdx)
+      .map(c => {
+        if (c.conn_type === "io_connection") {
+          return {
+            conn_type: "io_connection",
+            target_block: c.block_name || "",
+            target_pin:   c.to_var_name || "",
+            prefix:       c.prefix || "",
+            suffix:       c.suffix || "",
+            signal_type:  c.dtype || c.signal_type || "DI",
+            required:     c.required ? 1 : 0,
+          };
+        } else if (c.conn_type === "value") {
+          return {
+            conn_type: "value",
+            target_pin: c.to_var_name || "",
+            value_mode: c.value_mode || "static",
+            static_value: c.static_value || "",
+            column: c.column || "",
+            prefix: c.prefix || "",
+            suffix: c.suffix || "",
+          };
+        }
+        return null;
+      })
+      .filter(Boolean);
   }
 
   // ── Add instances from a composite CM type ──────────────────────────────
   // baseName: the tag / instrument name (used as-is for the primary member)
-  // rootFolderId: the hierarchy node the user selected (e.g. rIX/DE)
-  //   each member gets a subpath of rootFolderId/member.hierarchy_folder
-  async function addCompositeInstances({ compositeId, baseName, rootFolderId, userProject }) {
+  // memberFolders: { memberIdx -> folderId } – each member's assigned folder (manual placement, no hierarchy rules)
+  // When manually adding (not from import/generation), ignore composite type's hierarchy_folder rules
+  async function addCompositeInstances({ compositeId, baseName, memberFolders = {}, userProject }) {
     const detail = await getCompositeCmType(compositeId);
 
     const members = detail.members || [];
     if (!members.length) return;
 
-    // Build derived folder ids for each member.hierarchy_folder relative to rootFolderId.
-    // We may need to create new virtual folders in hierarchy state.
     let newHierarchy = [...hierarchy];
-    const byId = () => Object.fromEntries(newHierarchy.map(f => [f.id, f]));
 
-    function findOrCreateFolder(parentId, folderName) {
-      const existing = newHierarchy.find(f => f.parentId === parentId && f.name === folderName);
-      if (existing) return existing.id;
-      const newId = newFolderClientId();
-      const sibs = newHierarchy.filter(f => (f.parentId ?? null) === parentId);
-      newHierarchy = [...newHierarchy, { id: newId, parentId, name: folderName, s88Type: "", sortOrder: sibs.length }];
-      return newId;
-    }
+    // For manual addition: use the exact folder assignments provided (memberFolders[idx]),
+    // ignoring the composite type's hierarchy_folder rules.
+    const memberFolderIds = members.map((m, idx) => memberFolders[idx] || null);
 
-    // For each member, split hierarchy_folder on "/" and resolve step-by-step from rootFolderId
-    const memberFolderIds = members.map(m => {
-      const segments = (m.hierarchy_folder || "CM").split("/").map(s => s.trim()).filter(Boolean);
-      let cur = rootFolderId || null;
-      for (const seg of segments) cur = findOrCreateFolder(cur, seg);
-      return cur;
-    });
-
-    // Project-scope members hang off level 1 of the chosen root path (its
-    // top-level ancestor), then the folder defined on the composite member.
-    // e.g. root "rIX/DE01" + member folder "Shared" → "rIX/Shared".
-    const findTopAncestor = (fid) => {
-      let cur = fid, guard = 0;
-      while (cur && guard++ < 100) {
-        const f = newHierarchy.find(x => x.id === cur);
-        if (!f || f.parentId == null) return cur;
-        cur = f.parentId;
-      }
-      return null;
-    };
-    const sharedParent = rootFolderId ? findTopAncestor(rootFolderId) : null;
-    const projectFolderIds = members.map(m => {
-      if (m.scope !== "project") return null;
-      let cur = sharedParent;
-      const segments = (m.hierarchy_folder || "").split("/").map(s => s.trim()).filter(Boolean);
-      for (const seg of segments) cur = findOrCreateFolder(cur, seg);
-      return cur;
-    });
-
-    if (newHierarchy.length !== hierarchy.length) setHierarchy(newHierarchy);
-
-    // Derive instance name for each member.
-    // Project scope → a single shared instance, deduped by name, named from
-    // prefix/suffix (no per-instance base) and placed at the project root.
+    // Derive instance name for each member
     const groupId = Date.now(); // unique id for this composite group
     const existingNames = new Set(instances.map(i => i.instanceName));
     const newInstances = [];
     members.forEach((m, i) => {
-      const isProject = m.scope === "project";
-      const name = isProject
-        ? (`${m.name_prefix || ""}${m.name_suffix || ""}`.trim() || m.cm_type_name || baseName)
+      const name = m.is_primary
+        ? baseName
         : `${m.name_prefix || ""}${baseName}${m.name_suffix || ""}`;
-      if (isProject && existingNames.has(name)) return; // reuse the shared instance
+      if (existingNames.has(name)) return; // skip duplicate (e.g. shared project-scope instance)
       existingNames.add(name);
+      const memberConnections = extractMemberConnections(detail, i);
       newInstances.push({
         id:              groupId + i,
         profileId:       m.cm_type_name || cmtProfiles[0]?.id || "",
         instanceName:    name,
         samplingTime:    "1000",
         userProject:     userProject || userProjects[0] || "",
-        folderId:        (isProject ? projectFolderIds[i] : memberFolderIds[i]) || "",
+        folderId:        memberFolderIds[i] || "",
         roleAssignments: {},
+        source:          "manual",
+        connections:     memberConnections,
         // Composite wiring metadata — used during XML generation
         compositeGroupId: groupId,
         compositeId:      compositeId,
@@ -401,6 +519,7 @@ export default function App() {
         userProject:     userProjects[0] || "",
         folderId:        leaves[0]?.id || "",
         roleAssignments: {},
+        source:          "manual",
       }];
     });
   }
@@ -417,7 +536,7 @@ export default function App() {
   }
 
   async function handleGenerate() {
-    setLoading("Generating XML…");
+    if (genProgress) return;   // already generating — prevent double-submit
     setError("");
     try {
       if (!userProjects.length) throw new Error("Define at least one user project");
@@ -453,57 +572,93 @@ export default function App() {
         };
       });
 
-      const r = await generateXML({
+      // Stream generation with a live top progress bar. Non-blocking: the user can
+      // switch tabs while this runs; the bar lives in top-level App state.
+      setGenProgress({ pct: 0, phase: "starting", msg: "Starting generation…" });
+      const r = await generateXMLStream({
         projectName: savedProjectName,
         userProjects,
         instances:   payload,
         generatedBy: "", // backend will use process.env.USERNAME
-      });
+      }, p => setGenProgress(p));
       setResult(r);
-      setLoading("");
-      setStep(8);
+      setGenProgress(null);
+      setStep(7);   // jump to the Generate tab, which renders the output
     } catch (e) {
       setError(e.message);
-      setLoading("");
+      setGenProgress(null);
     }
   }
 
   function goTo(i) {
-    if (i === 8) return; // Generate output is not a direct nav target
     if (i > 0 && !savedProjectName.trim()) {
       setError("Select or create a project first.");
       setStep(0);
       return;
     }
     setError("");
+    // Show spinner immediately when navigating to Instances tab (step 5). The
+    // grid render is what's slow (2000 rows block the main thread), so we always
+    // show it — the effect above clears it after the spinner paints, letting the
+    // grid mount on the following frame.
+    if (i === 5) {
+      setUiLoading("Loading instances...");
+    }
     setStep(i);
   }
 
   return (
-    <div style={{ padding: "1rem 0", fontFamily: "var(--font-sans)", fontSize: 14, color: "var(--color-text-primary)" }}>
-      {/* Step tabs */}
-      <div style={{ display: "flex", borderBottom: "0.5px solid var(--color-border-tertiary)", marginBottom: "1.5rem" }}>
-        {STEPS.map((s, i) => (
-          <button key={i} onClick={() => goTo(i)}
-            style={{ padding: "8px 16px", border: "none", background: "transparent",
-              cursor: "pointer",
-              fontWeight: i === step ? 500 : 400, fontSize: 13,
-              color: i === step ? "var(--color-text-primary)" : "var(--color-text-secondary)",
-              borderBottom: i === step ? "2px solid var(--color-text-primary)" : "2px solid transparent",
-              marginBottom: -1 }}>
-            {i + 1}. {s}
-          </button>
-        ))}
-      </div>
-
-      {error && (
-        <div style={{ background: "#FEE2E2", border: "1px solid #FCA5A5", borderRadius: "var(--border-radius-md)",
-            padding: "8px 12px", marginBottom: "1rem", fontSize: 13, color: "#991B1B" }}>
-          {error}
+    <GlobalLoadingProvider uiLoading={uiLoading} setUiLoading={setUiLoading}>
+      <div style={{ padding: "1rem 0", fontFamily: "var(--font-sans)", fontSize: 14, color: "var(--color-text-primary)" }}>
+        {/* Non-blocking XML-generation progress bar, pinned to the top */}
+        <ProgressBar progress={genProgress} />
+        {/* Step tabs */}
+        <div style={{ display: "flex", borderBottom: "0.5px solid var(--color-border-tertiary)", marginBottom: "1.5rem" }}>
+          {STEPS.map((s, i) => (
+            <button key={i} onClick={() => goTo(i)}
+              style={{ padding: "8px 16px", border: "none", background: "transparent",
+                cursor: "pointer",
+                fontWeight: i === step ? 500 : 400, fontSize: 13,
+                color: i === step ? "var(--color-text-primary)" : "var(--color-text-secondary)",
+                borderBottom: i === step ? "2px solid var(--color-text-primary)" : "2px solid transparent",
+                marginBottom: -1 }}>
+              {i + 1}. {s}
+            </button>
+          ))}
         </div>
-      )}
 
-      {step === 0 && (
+        {error && (
+          <div style={{ background: "#FEE2E2", border: "1px solid #FCA5A5", borderRadius: "var(--border-radius-md)",
+              padding: "8px 12px", marginBottom: "1rem", fontSize: 13, color: "#991B1B" }}>
+            <div>{error}</div>
+            {errorConflictRows && errorConflictRows.length > 0 && (
+              <table style={{ marginTop: 8, borderCollapse: "collapse", fontSize: 12, width: "100%" }}>
+                <thead>
+                  <tr style={{ borderBottom: "1px solid #FCA5A5" }}>
+                    <th style={{ textAlign: "left", padding: "4px 8px" }}>Address</th>
+                    <th style={{ textAlign: "left", padding: "4px 8px" }}>Name</th>
+                    <th style={{ textAlign: "left", padding: "4px 8px" }}>IP</th>
+                    <th style={{ textAlign: "left", padding: "4px 8px" }}>Conflict</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {errorConflictRows.map((r, i) => (
+                    <tr key={i} style={{ borderBottom: "1px solid #FEE2E2" }}>
+                      <td style={{ padding: "4px 8px", fontFamily: "monospace" }}>{r.address}</td>
+                      <td style={{ padding: "4px 8px", fontFamily: "monospace" }}>{r.name || "—"}</td>
+                      <td style={{ padding: "4px 8px", fontFamily: "monospace" }}>{r.ip || "—"}</td>
+                      <td style={{ padding: "4px 8px" }}>{r.reasons.join(", ")}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        )}
+
+        {uiLoading && <Spinner message={uiLoading} />}
+
+        {step === 0 && (
         <StepProjects libStatus={libStatus} loading={loading}
           savedProjectName={savedProjectName}
           savedProjectId={savedProjectId}
@@ -523,95 +678,136 @@ export default function App() {
           onLoadProject={loadProjectIntoState}
           setError={setError} />
       )}
-      {step === 1 && (
-        <StepIOImport
-          savedProjectId={savedProjectId}
-          cmtProfiles={cmtProfiles}
-          compositeCmTypes={compositeCmTypes}
-          onPromoted={() => savedProjectId && loadProjectIntoState(savedProjectId)}
-          setError={setError} />
-      )}
-      {step === 2 && (
-        <StepLibrary libStatus={libStatus} loading={loading}
-          onUpload={handleUpload}
-          cmtProfiles={cmtProfiles} ensureLoaded={ensureBlocksLoaded} toggleBlock={toggleBlock}
-          onDelete={handleDeleteCmType}
-          onCompositesChange={loadCompositeCmTypesList}
-          onVarDefaultChange={(cmTypeName, varId, newVal) => {
-            setProfiles(prev => prev.map(p => {
-              if (p.id !== cmTypeName || !p.subBlocks) return p;
-              return { ...p, subBlocks: p.subBlocks.map(b => ({
-                ...b,
-                vars: b.vars.map(v => v.id === varId ? { ...v, val: newVal } : v),
-              }))};
-            }));
-          }}
-          onVarValidChange={(cmTypeName, varId, isValid) => {
-            setProfiles(prev => prev.map(p => {
-              if (p.id !== cmTypeName || !p.subBlocks) return p;
-              return { ...p, subBlocks: p.subBlocks.map(b => ({
-                ...b,
-                vars: b.vars.map(v => v.id === varId ? { ...v, isValid } : v),
-              }))};
-            }));
-          }}
-          valveCommands={valveCommands}
-          onValveCommandsChange={loadValveCommands} />
-      )}
-      {importPreview && (
-        <ImportModal
-          preview={importPreview}
-          onImport={handleImportConfirm}
-          onCancel={() => setImportPreview(null)} />
-      )}
-      {step === 3 && (
-        <StepUnitTypes
-          unitTypes={unitTypes}
-          unitInstances={unitInstances}
-          cmtProfiles={cmtProfiles}
-          compositeCmTypes={compositeCmTypes}
-          userProjects={userProjects}
-          savedProjectId={savedProjectId}
-          ensureLoaded={ensureBlocksLoaded}
-          loading={loading}
-          setError={setError}
-          onUnitTypesChange={loadUnitTypes}
-          onExpand={async () => {
-            if (!savedProjectId) return;
-            setLoading("Generating instances…");
-            try {
-              await expandUnitInstances(savedProjectId);
-              await loadProjectIntoState(savedProjectId);
-              loadUnitInstances(savedProjectId);
-            } catch (e) { setError(e.message); }
-            finally { setLoading(""); }
-          }}
-          onUnitInstancesChange={() => loadUnitInstances(savedProjectId)}
-        />
-      )}
-      {step === 4 && (
-        <StepHierarchy hierarchy={hierarchy} setHierarchy={setHierarchy}
-          instances={instances} setInstances={setInstances}
-          savedProjectName={savedProjectName} />
-      )}
-      {step === 5 && (
-        <StepInstances instances={instances} cmtProfiles={cmtProfiles}
-          userProjects={userProjects} savedProjectName={savedProjectName}
-          hierarchy={hierarchy}
-          compositeCmTypes={compositeCmTypes}
-          addInstance={addInstance} removeInstance={removeInstance}
-          updateInstance={updateInstance} updateInstanceRole={updateInstanceRole}
-          addCompositeInstances={addCompositeInstances}
-          ensureLoaded={ensureBlocksLoaded} loading={loading}
-          onGenerate={handleGenerate} />
-      )}
-      {step === 6 && (
-        <StepHWConfig projectId={savedProjectId} />
-      )}
-      {step === 7 && result && (
-        <StepOutput result={result} onBack={() => setStep(5)} />
-      )}
-    </div>
+        {step === 1 && (
+          <StepIOImport
+            savedProjectId={savedProjectId}
+            cmtProfiles={cmtProfiles}
+            compositeCmTypes={compositeCmTypes}
+            onPromoted={() => savedProjectId && loadProjectIntoState(savedProjectId)}
+            onImportHardware={async (ioImportId, hardwareMappings) => {
+              // Consume the same sheet in the Hardware system: find the project's
+              // HW import (created from a baseline CFG), copy the IO rows into it,
+              // then hand the mapping to the HW screen and navigate there.
+              try {
+                const hwImports = await listHwImports(savedProjectId);
+                const hwImport = Array.isArray(hwImports) && hwImports.length > 0 ? hwImports[0] : null;
+                if (!hwImport) {
+                  setError('No Hardware import found. Upload a baseline CFG on the HW Config step first, then retry Import Hardware.');
+                  return;
+                }
+                await ingestIoRowsIntoHw(hwImport.id, ioImportId);
+                setPendingHwMapping({ hwImportId: hwImport.id, ioImportId, hardwareMappings });
+                setStep(6);
+              } catch (e) {
+                setError(e.message);
+              }
+            }}
+            setError={setError} />
+        )}
+        {step === 2 && (
+          <StepLibrary libStatus={libStatus} loading={loading}
+            onUpload={handleUpload}
+            cmtProfiles={cmtProfiles} ensureLoaded={ensureBlocksLoaded} toggleBlock={toggleBlock}
+            onDelete={handleDeleteCmType}
+            onCompositesChange={loadCompositeCmTypesList}
+            onVarDefaultChange={(cmTypeName, varId, newVal) => {
+              setProfiles(prev => prev.map(p => {
+                if (p.id !== cmTypeName || !p.subBlocks) return p;
+                return { ...p, subBlocks: p.subBlocks.map(b => ({
+                  ...b,
+                  vars: b.vars.map(v => v.id === varId ? { ...v, val: newVal } : v),
+                }))};
+              }));
+            }}
+            onVarValidChange={(cmTypeName, varId, isValid) => {
+              setProfiles(prev => prev.map(p => {
+                if (p.id !== cmTypeName || !p.subBlocks) return p;
+                return { ...p, subBlocks: p.subBlocks.map(b => ({
+                  ...b,
+                  vars: b.vars.map(v => v.id === varId ? { ...v, isValid } : v),
+                }))};
+              }));
+            }}
+            valveCommands={valveCommands}
+            onValveCommandsChange={loadValveCommands} />
+        )}
+        {importDiff && (
+          <LibraryImportReview
+            diffResult={importDiff}
+            onImport={handleImportConfirm}
+            onCancel={() => { setImportPreview(null); setImportDiff(null); }} />
+        )}
+        {step === 3 && (
+          <StepUnitTypes
+            unitTypes={unitTypes}
+            unitInstances={unitInstances}
+            cmtProfiles={cmtProfiles}
+            compositeCmTypes={compositeCmTypes}
+            userProjects={userProjects}
+            savedProjectId={savedProjectId}
+            ensureLoaded={ensureBlocksLoaded}
+            loading={loading}
+            setError={setError}
+            onUnitTypesChange={loadUnitTypes}
+            onExpand={async () => {
+              if (!savedProjectId) return;
+              setLoading("Generating instances…");
+              try {
+                await expandUnitInstances(savedProjectId);
+                await loadProjectIntoState(savedProjectId);
+                loadUnitInstances(savedProjectId);
+              } catch (e) { setError(e.message); }
+              finally { setLoading(""); }
+            }}
+            onUnitInstancesChange={() => loadUnitInstances(savedProjectId)}
+            unitConnections={unitConnections}
+            cmTypeVarCache={cmTypeVarCache}
+            onLoadConnections={loadUnitTypeConnections}
+            onSaveConnections={saveUnitConnectionsEditor}
+          />
+        )}
+        {step === 4 && (
+          <StepHierarchy hierarchy={hierarchy} setHierarchy={setHierarchy}
+            instances={instances} setInstances={setInstances}
+            savedProjectName={savedProjectName} />
+        )}
+        {step === 5 && !uiLoading && (
+          <StepInstances instances={instances} cmtProfiles={cmtProfiles}
+            userProjects={userProjects} savedProjectName={savedProjectName}
+            savedProjectId={savedProjectId}
+            hierarchy={hierarchy}
+            compositeCmTypes={compositeCmTypes}
+            addInstance={addInstance} removeInstance={removeInstance}
+            updateInstance={updateInstance} updateInstanceRole={updateInstanceRole}
+            addCompositeInstances={addCompositeInstances}
+            ensureLoaded={ensureBlocksLoaded} loading={loading}
+            generating={!!genProgress}
+            saveProjectNow={saveProjectNow}
+            onGenerate={handleGenerate}
+            setError={setError}
+            getCompositeCmType={getCompositeCmType}
+            extractMemberConnections={extractMemberConnections}
+            valveCommands={valveCommands}
+            setInstances={setInstances} />
+        )}
+        {step === 6 && (
+          <StepHWConfig
+            projectId={savedProjectId}
+            pendingHwMapping={pendingHwMapping}
+            onPendingHwMappingConsumed={() => setPendingHwMapping(null)}
+          />
+        )}
+        {step === 7 && (
+          result ? (
+            <StepOutput result={result} onBack={() => setStep(5)} />
+          ) : (
+            <div style={{ padding: "2rem", textAlign: "center", color: "var(--color-text-secondary)" }}>
+              No XML generated yet. Go to the <b>Instances</b> step and click <b>Generate XML</b>.
+            </div>
+          )
+        )}
+      </div>
+    </GlobalLoadingProvider>
   );
 }
 
@@ -654,7 +850,7 @@ function StepProjects({ loading, savedProjectName, savedProjectId,
     const name = newName.trim();
     if (!name) { setError("Project name required"); return; }
     if (projects.some(p => p.name === name)
-        && !window.confirm(`A project named '${name}' already exists. Continuing will overwrite it on the next change. Proceed?`)) return;
+          && !window.confirm(`A project named '${name}' already exists. Continuing will overwrite it on the next change. Proceed?`)) return;
     setCreating(false);
     setNewName("");
     onCreateProject(name);
@@ -671,157 +867,157 @@ function StepProjects({ loading, savedProjectName, savedProjectId,
     next[idx] = value;
     setUserProjects(next);
     if (old && old !== value) {
-      setInstances(prev => prev.map(i => i.userProject === old ? { ...i, userProject: value } : i));
+        setInstances(prev => prev.map(i => i.userProject === old ? { ...i, userProject: value } : i));
     }
   }
   function removeUserProject(idx) {
     const removed = userProjects[idx];
     if (instances.some(i => i.userProject === removed)
-        && !window.confirm(`Some instances are assigned to '${removed}'. Removing it will clear those assignments. Continue?`)) return;
+          && !window.confirm(`Some instances are assigned to '${removed}'. Removing it will clear those assignments. Continue?`)) return;
     setUserProjects(userProjects.filter((_, i) => i !== idx));
     setInstances(prev => prev.map(i => i.userProject === removed ? { ...i, userProject: "" } : i));
   }
 
   return (
     <div>
-      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: "1rem" }}>
-        <div style={{ flex: 1 }}>
-          <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 4 }}>Projects</div>
-          <div style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>
-            Resume a saved project or create a new one. Changes save automatically.
-          </div>
-        </div>
-        {!creating && (
-          <Btn primary onClick={() => setCreating(true)} disabled={busy}>
-            <i className="ti ti-plus" /> New project
-          </Btn>
-        )}
-      </div>
-
-      {creating && (
-        <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: "1rem",
-            padding: "10px 12px", border: "0.5px solid var(--color-border-secondary)",
-            borderRadius: "var(--border-radius-lg)", background: "var(--color-background-secondary)" }}>
-          <label style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>Project name:</label>
-          <input value={newName} onChange={e => setNewName(e.target.value)} autoFocus
-            placeholder="e.g. Plant_A"
-            onKeyDown={e => { if (e.key === "Enter") submitNew(); if (e.key === "Escape") { setCreating(false); setNewName(""); } }}
-            style={{ flex: 1, padding: "5px 10px", border: "0.5px solid var(--color-border-secondary)",
-              borderRadius: "var(--border-radius-md)", fontSize: 13,
-              background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
-          <Btn primary onClick={submitNew}>Create</Btn>
-          <Btn onClick={() => { setCreating(false); setNewName(""); }}>Cancel</Btn>
-        </div>
-      )}
-
-      <SLabel text="Saved projects" />
-      {projects.length === 0 ? (
-        <div style={{ border: "1.5px dashed var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)",
-            padding: "1.5rem", textAlign: "center", color: "var(--color-text-secondary)", fontSize: 13, marginBottom: "1.5rem" }}>
-          No saved projects yet — create a new one above.
-        </div>
-      ) : (
-        <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)",
-            overflow: "hidden", marginBottom: "1.5rem" }}>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 52px 52px 52px 180px 80px",
-              padding: "6px 12px", borderBottom: "0.5px solid var(--color-border-tertiary)",
-              background: "var(--color-background-secondary)" }}>
-            {["Name", "CM", "EM", "EPH", "Updated", ""].map((h, i) => (
-              <div key={i} style={{ fontSize: 11, color: "var(--color-text-secondary)",
-                  fontWeight: 500, textTransform: "uppercase", letterSpacing: "0.04em" }}>{h}</div>
-            ))}
-          </div>
-          {projects.map((p, idx) => {
-            const active = p.name === savedProjectName;
-            return (
-              <div key={p.id} onClick={() => !active && handleLoad(p)}
-                style={{ display: "grid", gridTemplateColumns: "1fr 52px 52px 52px 180px 80px",
-                  padding: "8px 12px", alignItems: "center",
-                  cursor: active ? "default" : (busy ? "wait" : "pointer"),
-                  background: active ? "#EEEDFE" : "transparent",
-                  borderBottom: idx < projects.length - 1 ? "0.5px solid var(--color-border-tertiary)" : "none" }}>
-                <div>
-                  <div style={{ fontSize: 13, fontFamily: "var(--font-mono)", fontWeight: 500 }}>
-                    {p.name}
-                    {active && <span style={{ marginLeft: 8, fontSize: 10, padding: "1px 6px", borderRadius: 8,
-                      background: "#7F77DD", color: "white", fontWeight: 500, fontFamily: "var(--font-sans)" }}>active</span>}
-                  </div>
-                  {p.comment && <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 1 }}>{p.comment}</div>}
-                </div>
-                <div style={{ fontSize: 12 }}>{p.cm_count || 0}</div>
-                <div style={{ fontSize: 12 }}>{p.em_count || 0}</div>
-                <div style={{ fontSize: 12 }}>{p.eph_count || 0}</div>
-                <div style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>
-                  {p.updated_at ? new Date(p.updated_at + "Z").toLocaleString() : ""}
-                </div>
-                <button onClick={e => { e.stopPropagation(); handleDelete(p); }}
-                  style={{ background: "transparent", border: "none", cursor: "pointer",
-                    color: "var(--color-text-secondary)", fontSize: 16, padding: 0, justifySelf: "end" }}>
-                  <i className="ti ti-trash" />
-                </button>
-              </div>
-            );
-          })}
-        </div>
-      )}
-
-      {hasActive && (
-        <>
-          <SLabel text={`User projects · ${savedProjectName}`} top />
-          <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 8 }}>
-            One XML will be generated per user project (AS01.xml, AS02.xml, …).
-          </div>
-
-          {userProjects.length === 0 ? (
-            <div style={{ border: "1.5px dashed var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)",
-                padding: "1.5rem", textAlign: "center", color: "var(--color-text-secondary)", fontSize: 13, marginBottom: "1rem" }}>
-              No user projects yet — add one below
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: "1rem" }}>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 4 }}>Projects</div>
+            <div style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>
+              Resume a saved project or create a new one. Changes save automatically.
             </div>
-          ) : (
-            <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)",
-                overflow: "hidden", marginBottom: "1rem" }}>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 32px",
-                  padding: "6px 12px", borderBottom: "0.5px solid var(--color-border-tertiary)",
-                  background: "var(--color-background-secondary)" }}>
-                <div style={{ fontSize: 11, color: "var(--color-text-secondary)", fontWeight: 500,
-                  textTransform: "uppercase", letterSpacing: "0.04em" }}>User project name</div>
-                <div />
-              </div>
-              {userProjects.map((name, idx) => (
-                <div key={idx} style={{ display: "grid", gridTemplateColumns: "1fr 32px",
-                    padding: "6px 12px", alignItems: "center",
-                    borderBottom: idx < userProjects.length - 1 ? "0.5px solid var(--color-border-tertiary)" : "none" }}>
-                  <input value={name} onChange={e => updateUserProject(idx, e.target.value)}
-                    style={{ width: "100%", padding: "4px 8px", border: "0.5px solid var(--color-border-secondary)",
-                      borderRadius: "var(--border-radius-md)", fontSize: 12, fontFamily: "var(--font-mono)",
-                      background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
-                  <button onClick={() => removeUserProject(idx)}
+          </div>
+          {!creating && (
+            <Btn primary onClick={() => setCreating(true)} disabled={busy}>
+              <i className="ti ti-plus" /> New project
+            </Btn>
+          )}
+        </div>
+
+        {creating && (
+          <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: "1rem",
+              padding: "10px 12px", border: "0.5px solid var(--color-border-secondary)",
+              borderRadius: "var(--border-radius-lg)", background: "var(--color-background-secondary)" }}>
+            <label style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>Project name:</label>
+            <input value={newName} onChange={e => setNewName(e.target.value)} autoFocus
+              placeholder="e.g. Plant_A"
+              onKeyDown={e => { if (e.key === "Enter") submitNew(); if (e.key === "Escape") { setCreating(false); setNewName(""); } }}
+              style={{ flex: 1, padding: "5px 10px", border: "0.5px solid var(--color-border-secondary)",
+                borderRadius: "var(--border-radius-md)", fontSize: 13,
+                background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
+            <Btn primary onClick={submitNew}>Create</Btn>
+            <Btn onClick={() => { setCreating(false); setNewName(""); }}>Cancel</Btn>
+          </div>
+        )}
+
+        <SLabel text="Saved projects" />
+        {projects.length === 0 ? (
+          <div style={{ border: "1.5px dashed var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)",
+              padding: "1.5rem", textAlign: "center", color: "var(--color-text-secondary)", fontSize: 13, marginBottom: "1.5rem" }}>
+            No saved projects yet — create a new one above.
+          </div>
+        ) : (
+          <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)",
+              overflow: "hidden", marginBottom: "1.5rem" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 52px 52px 52px 180px 80px",
+                padding: "6px 12px", borderBottom: "0.5px solid var(--color-border-tertiary)",
+                background: "var(--color-background-secondary)" }}>
+              {["Name", "CM", "EM", "EPH", "Updated", ""].map((h, i) => (
+                <div key={i} style={{ fontSize: 11, color: "var(--color-text-secondary)",
+                    fontWeight: 500, textTransform: "uppercase", letterSpacing: "0.04em" }}>{h}</div>
+              ))}
+            </div>
+            {projects.map((p, idx) => {
+              const active = p.name === savedProjectName;
+              return (
+                <div key={p.id} onClick={() => !active && handleLoad(p)}
+                  style={{ display: "grid", gridTemplateColumns: "1fr 52px 52px 52px 180px 80px",
+                    padding: "8px 12px", alignItems: "center",
+                    cursor: active ? "default" : (busy ? "wait" : "pointer"),
+                    background: active ? "#EEEDFE" : "transparent",
+                    borderBottom: idx < projects.length - 1 ? "0.5px solid var(--color-border-tertiary)" : "none" }}>
+                  <div>
+                    <div style={{ fontSize: 13, fontFamily: "var(--font-mono)", fontWeight: 500 }}>
+                      {p.name}
+                      {active && <span style={{ marginLeft: 8, fontSize: 10, padding: "1px 6px", borderRadius: 8,
+                        background: "#7F77DD", color: "white", fontWeight: 500, fontFamily: "var(--font-sans)" }}>active</span>}
+                    </div>
+                    {p.comment && <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 1 }}>{p.comment}</div>}
+                  </div>
+                  <div style={{ fontSize: 12 }}>{p.cm_count || 0}</div>
+                  <div style={{ fontSize: 12 }}>{p.em_count || 0}</div>
+                  <div style={{ fontSize: 12 }}>{p.eph_count || 0}</div>
+                  <div style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>
+                    {p.updated_at ? new Date(p.updated_at + "Z").toLocaleString() : ""}
+                  </div>
+                  <button onClick={e => { e.stopPropagation(); handleDelete(p); }}
                     style={{ background: "transparent", border: "none", cursor: "pointer",
-                      color: "var(--color-text-secondary)", fontSize: 16, padding: 0, marginLeft: 6 }}>
+                      color: "var(--color-text-secondary)", fontSize: 16, padding: 0, justifySelf: "end" }}>
                     <i className="ti ti-trash" />
                   </button>
                 </div>
-              ))}
-            </div>
-          )}
-
-          <div style={{ display: "flex", justifyContent: "flex-start" }}>
-            <Btn onClick={addUserProject}><i className="ti ti-plus" /> Add user project</Btn>
+              );
+            })}
           </div>
+        )}
 
-          <Pcs7ConfigPanel
-            projectId={savedProjectId}
-            config={projectConfig}
-            onConfigChange={onProjectConfigChange}
-            setError={setError} />
-        </>
-      )}
+        {hasActive && (
+          <>
+            <SLabel text={`User projects · ${savedProjectName}`} top />
+            <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 8 }}>
+              One XML will be generated per user project (AS01.xml, AS02.xml, …).
+            </div>
 
-      {loading && (
-        <div style={{ textAlign: "center", marginTop: 12, fontSize: 13, color: "var(--color-text-secondary)" }}>
-          {loading}
-        </div>
-      )}
+            {userProjects.length === 0 ? (
+              <div style={{ border: "1.5px dashed var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)",
+                  padding: "1.5rem", textAlign: "center", color: "var(--color-text-secondary)", fontSize: 13, marginBottom: "1rem" }}>
+                No user projects yet — add one below
+              </div>
+            ) : (
+              <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)",
+                  overflow: "hidden", marginBottom: "1rem" }}>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 32px",
+                    padding: "6px 12px", borderBottom: "0.5px solid var(--color-border-tertiary)",
+                    background: "var(--color-background-secondary)" }}>
+                  <div style={{ fontSize: 11, color: "var(--color-text-secondary)", fontWeight: 500,
+                    textTransform: "uppercase", letterSpacing: "0.04em" }}>User project name</div>
+                  <div />
+                </div>
+                {userProjects.map((name, idx) => (
+                  <div key={idx} style={{ display: "grid", gridTemplateColumns: "1fr 32px",
+                      padding: "6px 12px", alignItems: "center",
+                      borderBottom: idx < userProjects.length - 1 ? "0.5px solid var(--color-border-tertiary)" : "none" }}>
+                    <input value={name} onChange={e => updateUserProject(idx, e.target.value)}
+                      style={{ width: "100%", padding: "4px 8px", border: "0.5px solid var(--color-border-secondary)",
+                        borderRadius: "var(--border-radius-md)", fontSize: 12, fontFamily: "var(--font-mono)",
+                        background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
+                    <button onClick={() => removeUserProject(idx)}
+                      style={{ background: "transparent", border: "none", cursor: "pointer",
+                        color: "var(--color-text-secondary)", fontSize: 16, padding: 0, marginLeft: 6 }}>
+                      <i className="ti ti-trash" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div style={{ display: "flex", justifyContent: "flex-start" }}>
+              <Btn onClick={addUserProject}><i className="ti ti-plus" /> Add user project</Btn>
+            </div>
+
+            <Pcs7ConfigPanel
+              projectId={savedProjectId}
+              config={projectConfig}
+              onConfigChange={onProjectConfigChange}
+              setError={setError} />
+          </>
+        )}
+
+        {loading && (
+          <div style={{ textAlign: "center", marginTop: 12, fontSize: 13, color: "var(--color-text-secondary)" }}>
+            {loading}
+          </div>
+        )}
     </div>
   );
 }
@@ -860,9 +1056,9 @@ function Pcs7ConfigPanel({ projectId, config, onConfigChange, setError }) {
     if (!projectId || !draft) return;
     setSaving(true);
     try {
-      const saved = await saveProjectConfig(projectId, draft);
-      onConfigChange(saved);
-      setDraft(null);
+        const saved = await saveProjectConfig(projectId, draft);
+        onConfigChange(saved);
+        setDraft(null);
     } catch (e) { setError(e.message); }
     finally { setSaving(false); }
   }
@@ -872,16 +1068,16 @@ function Pcs7ConfigPanel({ projectId, config, onConfigChange, setError }) {
     if (!file || !projectId) return;
     setParseMsg("Parsing…");
     try {
-      const { config: saved, missing } = await parseProjectXml(projectId, file);
-      onConfigChange(saved);
-      setParseMsg(missing.length
-        ? `Loaded. Not found in XML: ${missing.join(", ")}`
-        : "All fields extracted successfully.");
+        const { config: saved, missing } = await parseProjectXml(projectId, file);
+        onConfigChange(saved);
+        setParseMsg(missing.length
+          ? `Loaded. Not found in XML: ${missing.join(", ")}`
+          : "All fields extracted successfully.");
     } catch (err) {
-      setError(err.message);
-      setParseMsg("");
+        setError(err.message);
+        setParseMsg("");
     } finally {
-      e.target.value = "";
+        e.target.value = "";
     }
   }
 
@@ -889,88 +1085,55 @@ function Pcs7ConfigPanel({ projectId, config, onConfigChange, setError }) {
 
   return (
     <div style={{ marginTop: "1.5rem" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
-        <button onClick={() => setExpanded(x => !x)}
-          style={{ display: "flex", alignItems: "center", gap: 6, background: "none", border: "none",
-            cursor: "pointer", padding: 0, fontSize: 13, fontWeight: 500,
-            color: "var(--color-text-primary)" }}>
-          <i className={`ti ti-chevron-${expanded ? "down" : "right"}`} style={{ fontSize: 12 }} />
-          PCS7 Project Config
-          {hasConfig && !expanded && (
-            <span style={{ fontSize: 11, marginLeft: 4, color: "var(--color-text-secondary)", fontWeight: 400 }}>
-              ({config.project_name || config.device_name || "configured"})
-            </span>
-          )}
-          {!hasConfig && (
-            <span style={{ fontSize: 11, marginLeft: 4, color: "#D97706", fontWeight: 400 }}>
-              — using default IDs
-            </span>
-          )}
-        </button>
-      </div>
-
-      {expanded && (
-        <div style={{ border: "0.5px solid var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)",
-            padding: "12px 14px", background: "var(--color-background-secondary)" }}>
-          <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 10 }}>
-            Upload a PCS7 SimaticML export to fill in project-level hardware IDs automatically,
-            or edit fields manually. These IDs are written into the generated XML.
-          </div>
-
-          {/* Upload row */}
-          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
-            <input ref={fileRef} type="file" accept=".xml,.XML" style={{ display: "none" }}
-              onChange={handleParseXml} />
-            <Btn onClick={() => fileRef.current?.click()}>
-              <i className="ti ti-upload" /> Upload PCS7 XML
-            </Btn>
-            {parseMsg && (
-              <span style={{ fontSize: 12, color: parseMsg.includes("Not found") ? "#D97706" : "#166534" }}>
-                {parseMsg}
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+          <button onClick={() => setExpanded(x => !x)}
+            style={{ display: "flex", alignItems: "center", gap: 6, background: "none", border: "none",
+              cursor: "pointer", padding: 0, fontSize: 13, fontWeight: 500,
+              color: "var(--color-text-primary)" }}>
+            <i className={`ti ti-chevron-${expanded ? "down" : "right"}`} style={{ fontSize: 12 }} />
+            PCS7 Project Config
+            {hasConfig && !expanded && (
+              <span style={{ fontSize: 11, marginLeft: 4, color: "var(--color-text-secondary)", fontWeight: 400 }}>
+                ({config.project_name || config.device_name || "configured"})
               </span>
             )}
-          </div>
+            {!hasConfig && (
+              <span style={{ fontSize: 11, marginLeft: 4, color: "#D97706", fontWeight: 400 }}>
+                — using default IDs
+              </span>
+            )}
+          </button>
+        </div>
 
-          {/* Field table */}
-          {draft ? (
-            <>
-              <div style={{ display: "grid", gridTemplateColumns: "160px 1fr",
-                  border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-md)",
-                  overflow: "hidden", marginBottom: 10 }}>
-                {PCS7_CONFIG_FIELDS.map((f, idx) => (
-                  <React.Fragment key={f.key}>
-                    <div style={{ padding: "5px 10px", fontSize: 12,
-                        color: "var(--color-text-secondary)", fontWeight: 500,
-                        background: "var(--color-background-secondary)",
-                        borderBottom: idx < PCS7_CONFIG_FIELDS.length - 1 ? "0.5px solid var(--color-border-tertiary)" : "none" }}>
-                      {f.label}
-                    </div>
-                    <div style={{ padding: "3px 8px",
-                        borderLeft: "0.5px solid var(--color-border-tertiary)",
-                        borderBottom: idx < PCS7_CONFIG_FIELDS.length - 1 ? "0.5px solid var(--color-border-tertiary)" : "none" }}>
-                      <input value={draft[f.key] || ""} onChange={e => setDraft(d => ({ ...d, [f.key]: e.target.value }))}
-                        style={{ width: "100%", padding: "3px 6px", fontSize: 12, fontFamily: "var(--font-mono)",
-                          border: "0.5px solid var(--color-border-secondary)", borderRadius: "var(--border-radius-sm)",
-                          background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
-                    </div>
-                  </React.Fragment>
-                ))}
-              </div>
-              <div style={{ display: "flex", gap: 8 }}>
-                <Btn primary onClick={handleSave} disabled={saving}>
-                  {saving ? "Saving…" : "Save"}
-                </Btn>
-                <Btn onClick={cancelEdit}>Cancel</Btn>
-              </div>
-            </>
-          ) : (
-            <>
-              <div style={{ display: "grid", gridTemplateColumns: "160px 1fr",
-                  border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-md)",
-                  overflow: "hidden", marginBottom: 10 }}>
-                {PCS7_CONFIG_FIELDS.map((f, idx) => {
-                  const val = config?.[f.key];
-                  return (
+        {expanded && (
+          <div style={{ border: "0.5px solid var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)",
+              padding: "12px 14px", background: "var(--color-background-secondary)" }}>
+            <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 10 }}>
+              Upload a PCS7 SimaticML export to fill in project-level hardware IDs automatically,
+              or edit fields manually. These IDs are written into the generated XML.
+            </div>
+
+            {/* Upload row */}
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+              <input ref={fileRef} type="file" accept=".xml,.XML" style={{ display: "none" }}
+                onChange={handleParseXml} />
+              <Btn onClick={() => fileRef.current?.click()}>
+                <i className="ti ti-upload" /> Upload PCS7 XML
+              </Btn>
+              {parseMsg && (
+                <span style={{ fontSize: 12, color: parseMsg.includes("Not found") ? "#D97706" : "#166534" }}>
+                  {parseMsg}
+                </span>
+              )}
+            </div>
+
+            {/* Field table */}
+            {draft ? (
+              <>
+                <div style={{ display: "grid", gridTemplateColumns: "160px 1fr",
+                    border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-md)",
+                    overflow: "hidden", marginBottom: 10 }}>
+                  {PCS7_CONFIG_FIELDS.map((f, idx) => (
                     <React.Fragment key={f.key}>
                       <div style={{ padding: "5px 10px", fontSize: 12,
                           color: "var(--color-text-secondary)", fontWeight: 500,
@@ -978,21 +1141,54 @@ function Pcs7ConfigPanel({ projectId, config, onConfigChange, setError }) {
                           borderBottom: idx < PCS7_CONFIG_FIELDS.length - 1 ? "0.5px solid var(--color-border-tertiary)" : "none" }}>
                         {f.label}
                       </div>
-                      <div style={{ padding: "5px 10px", fontSize: 12, fontFamily: "var(--font-mono)",
-                          color: val ? "var(--color-text-primary)" : "var(--color-text-secondary)",
+                      <div style={{ padding: "3px 8px",
                           borderLeft: "0.5px solid var(--color-border-tertiary)",
                           borderBottom: idx < PCS7_CONFIG_FIELDS.length - 1 ? "0.5px solid var(--color-border-tertiary)" : "none" }}>
-                        {val || <em style={{ fontStyle: "italic" }}>— default</em>}
+                        <input value={draft[f.key] || ""} onChange={e => setDraft(d => ({ ...d, [f.key]: e.target.value }))}
+                          style={{ width: "100%", padding: "3px 6px", fontSize: 12, fontFamily: "var(--font-mono)",
+                            border: "0.5px solid var(--color-border-secondary)", borderRadius: "var(--border-radius-sm)",
+                            background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
                       </div>
                     </React.Fragment>
-                  );
-                })}
-              </div>
-              <Btn onClick={startEdit}><i className="ti ti-edit" /> Edit</Btn>
-            </>
-          )}
-        </div>
-      )}
+                  ))}
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <Btn primary onClick={handleSave} disabled={saving}>
+                    {saving ? "Saving…" : "Save"}
+                  </Btn>
+                  <Btn onClick={cancelEdit}>Cancel</Btn>
+                </div>
+              </>
+            ) : (
+              <>
+                <div style={{ display: "grid", gridTemplateColumns: "160px 1fr",
+                    border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-md)",
+                    overflow: "hidden", marginBottom: 10 }}>
+                  {PCS7_CONFIG_FIELDS.map((f, idx) => {
+                    const val = config?.[f.key];
+                    return (
+                      <React.Fragment key={f.key}>
+                        <div style={{ padding: "5px 10px", fontSize: 12,
+                            color: "var(--color-text-secondary)", fontWeight: 500,
+                            background: "var(--color-background-secondary)",
+                            borderBottom: idx < PCS7_CONFIG_FIELDS.length - 1 ? "0.5px solid var(--color-border-tertiary)" : "none" }}>
+                          {f.label}
+                        </div>
+                        <div style={{ padding: "5px 10px", fontSize: 12, fontFamily: "var(--font-mono)",
+                            color: val ? "var(--color-text-primary)" : "var(--color-text-secondary)",
+                            borderLeft: "0.5px solid var(--color-border-tertiary)",
+                            borderBottom: idx < PCS7_CONFIG_FIELDS.length - 1 ? "0.5px solid var(--color-border-tertiary)" : "none" }}>
+                          {val || <em style={{ fontStyle: "italic" }}>— default</em>}
+                        </div>
+                      </React.Fragment>
+                    );
+                  })}
+                </div>
+                <Btn onClick={startEdit}><i className="ti ti-edit" /> Edit</Btn>
+              </>
+            )}
+          </div>
+        )}
     </div>
   );
 }
@@ -1010,40 +1206,40 @@ function StepLibrary({ libStatus, loading, onUpload, cmtProfiles, ensureLoaded, 
 
   return (
     <div>
-      {/* Sub-tab bar */}
-      <div style={{ display: "flex", borderBottom: "0.5px solid var(--color-border-tertiary)", marginBottom: "1.5rem" }}>
-        {LIBRARY_SUBTABS.map(t => {
-          const active = libSubTab === t.key;
-          return (
-            <button key={t.key} onClick={() => setLibSubTab(t.key)}
-              style={{ padding: "7px 18px", border: "none", background: "transparent",
-                cursor: "pointer", fontSize: 13, fontWeight: active ? 500 : 400,
-                color: active ? "var(--color-text-primary)" : "var(--color-text-secondary)",
-                borderBottom: active ? "2px solid var(--color-text-primary)" : "2px solid transparent",
-                marginBottom: -1 }}>
-              {t.label}
-            </button>
-          );
-        })}
-      </div>
+        {/* Sub-tab bar */}
+        <div style={{ display: "flex", borderBottom: "0.5px solid var(--color-border-tertiary)", marginBottom: "1.5rem" }}>
+          {LIBRARY_SUBTABS.map(t => {
+            const active = libSubTab === t.key;
+            return (
+              <button key={t.key} onClick={() => setLibSubTab(t.key)}
+                style={{ padding: "7px 18px", border: "none", background: "transparent",
+                  cursor: "pointer", fontSize: 13, fontWeight: active ? 500 : 400,
+                  color: active ? "var(--color-text-primary)" : "var(--color-text-secondary)",
+                  borderBottom: active ? "2px solid var(--color-text-primary)" : "2px solid transparent",
+                  marginBottom: -1 }}>
+                {t.label}
+              </button>
+            );
+          })}
+        </div>
 
-      {libSubTab === "upload" && (
-        <LibraryUploadPanel
-          libStatus={libStatus} loading={loading} onUpload={onUpload} />
-      )}
-      {libSubTab === "config" && (
-        <CmtPanel
-          cmtProfiles={cmtProfiles} ensureLoaded={ensureLoaded}
-          toggleBlock={toggleBlock} onDelete={onDelete}
-          onVarDefaultChange={onVarDefaultChange}
-          onVarValidChange={onVarValidChange} />
-      )}
-      {libSubTab === "composite" && (
-        <CompositeCmPanel cmtProfiles={cmtProfiles} ensureLoaded={ensureLoaded} onCompositesChange={onCompositesChange} valveCommands={valveCommands} />
-      )}
-      {libSubTab === "commands" && (
-        <ModeCommandsPanel valveCommands={valveCommands} onValveCommandsChange={onValveCommandsChange} />
-      )}
+        {libSubTab === "upload" && (
+          <LibraryUploadPanel
+            libStatus={libStatus} loading={loading} onUpload={onUpload} />
+        )}
+        {libSubTab === "config" && (
+          <CmtPanel
+            cmtProfiles={cmtProfiles} ensureLoaded={ensureLoaded}
+            toggleBlock={toggleBlock} onDelete={onDelete}
+            onVarDefaultChange={onVarDefaultChange}
+            onVarValidChange={onVarValidChange} />
+        )}
+        {libSubTab === "composite" && (
+          <CompositeCmPanel cmtProfiles={cmtProfiles} ensureLoaded={ensureLoaded} onCompositesChange={onCompositesChange} valveCommands={valveCommands} />
+        )}
+        {libSubTab === "commands" && (
+          <ModeCommandsPanel valveCommands={valveCommands} onValveCommandsChange={onValveCommandsChange} />
+        )}
     </div>
   );
 }
@@ -1055,35 +1251,35 @@ function LibraryUploadPanel({ libStatus, loading, onUpload }) {
 
   return (
     <div>
-      {loaded && (
-        <div style={{ background: "#DCFCE7", border: "1px solid #86EFAC", borderRadius: "var(--border-radius-md)",
-            padding: "10px 14px", marginBottom: "1rem" }}>
-          <span style={{ fontWeight: 500, color: "#166534" }}>
-            ✓ Library loaded — {libStatus.cm_count} CM/EM/EPH types
-          </span>
-          <span style={{ fontSize: 12, color: "#15803D", marginLeft: 10 }}>
-            Last updated: {new Date(libStatus.last_loaded).toLocaleString()}
-          </span>
+        {loaded && (
+          <div style={{ background: "#DCFCE7", border: "1px solid #86EFAC", borderRadius: "var(--border-radius-md)",
+              padding: "10px 14px", marginBottom: "1rem" }}>
+            <span style={{ fontWeight: 500, color: "#166534" }}>
+              ✓ Library loaded — {libStatus.cm_count} CM/EM/EPH types
+            </span>
+            <span style={{ fontSize: 12, color: "#15803D", marginLeft: 10 }}>
+              Last updated: {new Date(libStatus.last_loaded).toLocaleString()}
+            </span>
+          </div>
+        )}
+        <div style={{ border: "1.5px dashed var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)",
+            padding: "2.5rem 2rem", textAlign: "center", cursor: "pointer" }}
+          onClick={() => fileRef.current?.click()}
+          onDragOver={e => e.preventDefault()}
+          onDrop={e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) onUpload(f); }}>
+          <i className="ti ti-file-code" style={{ fontSize: 32, color: "var(--color-text-secondary)", display: "block", marginBottom: 12 }} />
+          <div style={{ fontSize: 15, fontWeight: 500 }}>{loaded ? "Reload SIE_LIB.XML" : "Drop SIE_LIB.XML here"}</div>
+          <div style={{ fontSize: 13, color: "var(--color-text-secondary)", marginTop: 4 }}>
+            {loaded ? "Upload a new version to replace the current library" : "Parsed once and stored in database — never needed again"}
+          </div>
         </div>
-      )}
-      <div style={{ border: "1.5px dashed var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)",
-          padding: "2.5rem 2rem", textAlign: "center", cursor: "pointer" }}
-        onClick={() => fileRef.current?.click()}
-        onDragOver={e => e.preventDefault()}
-        onDrop={e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) onUpload(f); }}>
-        <i className="ti ti-file-code" style={{ fontSize: 32, color: "var(--color-text-secondary)", display: "block", marginBottom: 12 }} />
-        <div style={{ fontSize: 15, fontWeight: 500 }}>{loaded ? "Reload SIE_LIB.XML" : "Drop SIE_LIB.XML here"}</div>
-        <div style={{ fontSize: 13, color: "var(--color-text-secondary)", marginTop: 4 }}>
-          {loaded ? "Upload a new version to replace the current library" : "Parsed once and stored in database — never needed again"}
-        </div>
-      </div>
-      <input ref={fileRef} type="file" accept=".xml,.XML" style={{ display: "none" }}
-        onChange={e => e.target.files[0] && onUpload(e.target.files[0])} />
-      {loading && (
-        <div style={{ textAlign: "center", marginTop: 12, fontSize: 13, color: "var(--color-text-secondary)" }}>
-          {loading}
-        </div>
-      )}
+        <input ref={fileRef} type="file" accept=".xml,.XML" style={{ display: "none" }}
+          onChange={e => e.target.files[0] && onUpload(e.target.files[0])} />
+        {loading && (
+          <div style={{ textAlign: "center", marginTop: 12, fontSize: 13, color: "var(--color-text-secondary)" }}>
+            {loading}
+          </div>
+        )}
     </div>
   );
 }
@@ -1119,9 +1315,9 @@ function CmtPanel({ cmtProfiles, ensureLoaded, toggleBlock, onDelete, onVarDefau
     setSelected(id);
     const p = cmtProfiles.find(x => x.id === id);
     if (!p?.subBlocks) {
-      setLoading(true);
-      await ensureLoaded(id);
-      setLoading(false);
+        setLoading(true);
+        await ensureLoaded(id);
+        setLoading(false);
     }
   }
 
@@ -1140,145 +1336,146 @@ function CmtPanel({ cmtProfiles, ensureLoaded, toggleBlock, onDelete, onVarDefau
 
   if (!cmtProfiles.length) {
     return (
-      <div style={{ border: "1.5px dashed var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)",
-          padding: "2.5rem", textAlign: "center", color: "var(--color-text-secondary)", fontSize: 13 }}>
-        No library loaded — upload SIE_LIB.XML first.
-      </div>
+        <div style={{ border: "1.5px dashed var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)",
+            padding: "2.5rem", textAlign: "center", color: "var(--color-text-secondary)", fontSize: 13 }}>
+          No library loaded — upload SIE_LIB.XML first.
+        </div>
     );
   }
 
   return (
     <div>
-      <div style={{ marginBottom: "1rem" }}>
-        <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 4 }}>CMT block configuration</div>
-        <div style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>
-          Toggle optional blocks per CM type. Data is loaded from the database.
+        <div style={{ marginBottom: "1rem" }}>
+          <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 4 }}>CMT block configuration</div>
+          <div style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>
+            Toggle optional blocks per CM type. Data is loaded from the database.
+          </div>
         </div>
-      </div>
-      <div style={{ display: "grid", gridTemplateColumns: "210px 1fr", gap: 12, minHeight: 400 }}>
-        {/* CM list */}
-        <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", overflow: "hidden" }}>
-          <div style={{ display: "flex", borderBottom: "0.5px solid var(--color-border-tertiary)", background: "var(--color-background-secondary)" }}>
-            {LIB_TABS.map(t => {
-              const count = t.key === "all"
-                ? cmtProfiles.length
-                : cmtProfiles.filter(p => p.libType === t.key).length;
-              const active = libTab === t.key;
-              return (
-                <button key={t.key} onClick={() => setLibTab(t.key)}
-                  style={{ flex: 1, padding: "5px 4px", border: "none", background: "transparent",
-                    cursor: "pointer", fontSize: 11, fontWeight: active ? 600 : 400,
-                    color: active ? "var(--color-text-primary)" : "var(--color-text-secondary)",
-                    borderBottom: active ? "2px solid var(--color-text-primary)" : "2px solid transparent",
-                    marginBottom: -1 }}>
-                  {t.label}
-                  <span style={{ marginLeft: 3, fontSize: 10, opacity: 0.7 }}>({count})</span>
-                </button>
-              );
-            })}
-          </div>
-          <div style={{ padding: "6px 8px", borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
-            <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Filter CMs…"
-              style={{ width: "100%", padding: "4px 8px", border: "0.5px solid var(--color-border-secondary)",
-                borderRadius: "var(--border-radius-md)", fontSize: 12,
-                background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
-          </div>
-          <div style={{ overflowY: "auto", maxHeight: 520 }}>
-            {filtered.map(p => {
-              const optOn = p.enabledBlocks?.filter(b => p.subBlocks?.find(s => s.name === b && s.optional)).length || 0;
-              return (
-                <div key={p.id} onClick={() => selectCM(p.id)}
-                  style={{ padding: "7px 10px", cursor: "pointer", borderBottom: "0.5px solid var(--color-border-tertiary)",
-                    background: selected === p.id ? "#EEEDFE" : "transparent",
-                    display: "flex", alignItems: "center", gap: 4 }}>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 12, fontWeight: 500, fontFamily: "var(--font-mono)" }}>{p.cmType}</div>
-                    <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 1 }}>
-                      {p.subBlocks ? `${optOn}/${p.optionalBlocks} optional on` : `${p.optionalBlocks} optional`}
+        <div style={{ display: "grid", gridTemplateColumns: "210px 1fr", gap: 12, height: "calc(100vh - 200px)" }}>
+          {/* CM list */}
+          <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", overflow: "hidden", display: "flex", flexDirection: "column" }}>
+            <div style={{ display: "flex", borderBottom: "0.5px solid var(--color-border-tertiary)", background: "var(--color-background-secondary)", flexShrink: 0 }}>
+              {LIB_TABS.map(t => {
+                const count = t.key === "all"
+                  ? cmtProfiles.length
+                  : cmtProfiles.filter(p => p.libType === t.key).length;
+                const active = libTab === t.key;
+                return (
+                  <button key={t.key} onClick={() => setLibTab(t.key)}
+                    style={{ flex: 1, padding: "5px 4px", border: "none", background: "transparent",
+                      cursor: "pointer", fontSize: 11, fontWeight: active ? 600 : 400,
+                      color: active ? "var(--color-text-primary)" : "var(--color-text-secondary)",
+                      borderBottom: active ? "2px solid var(--color-text-primary)" : "2px solid transparent",
+                      marginBottom: -1 }}>
+                    {t.label}
+                    <span style={{ marginLeft: 3, fontSize: 10, opacity: 0.7 }}>({count})</span>
+                  </button>
+                );
+              })}
+            </div>
+            <div style={{ padding: "6px 8px", borderBottom: "0.5px solid var(--color-border-tertiary)", flexShrink: 0 }}>
+              <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Filter CMs…"
+                style={{ width: "100%", padding: "4px 8px", border: "0.5px solid var(--color-border-secondary)",
+                  borderRadius: "var(--border-radius-md)", fontSize: 12,
+                  background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
+            </div>
+            <div style={{ overflowY: "auto", flex: 1 }}>
+              {filtered.map(p => {
+                const optOn = p.enabledBlocks?.filter(b => p.subBlocks?.find(s => s.name === b && s.optional)).length || 0;
+                return (
+                  <div key={p.id} onClick={() => selectCM(p.id)}
+                    style={{ padding: "7px 10px", cursor: "pointer", borderBottom: "0.5px solid var(--color-border-tertiary)",
+                      background: selected === p.id ? "#EEEDFE" : "transparent",
+                      display: "flex", alignItems: "center", gap: 4 }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 12, fontWeight: 500, fontFamily: "var(--font-mono)" }}>{p.cmType}</div>
+                      <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 1 }}>
+                        {p.subBlocks ? `${optOn}/${p.optionalBlocks} optional on` : `${p.optionalBlocks} optional`}
+                      </div>
                     </div>
+                    {onDelete && (
+                      <button onClick={e => { e.stopPropagation(); onDelete(p.cmType); }}
+                        title="Remove from library"
+                        style={{ flexShrink: 0, border: "none", background: "transparent", cursor: "pointer",
+                          padding: "2px 4px", borderRadius: "var(--border-radius-md)",
+                          color: "var(--color-text-secondary)", fontSize: 13, lineHeight: 1 }}>
+                        <i className="ti ti-trash" />
+                      </button>
+                    )}
                   </div>
-                  {onDelete && (
-                    <button onClick={e => { e.stopPropagation(); onDelete(p.cmType); }}
-                      title="Remove from library"
-                      style={{ flexShrink: 0, border: "none", background: "transparent", cursor: "pointer",
-                        padding: "2px 4px", borderRadius: "var(--border-radius-md)",
-                        color: "var(--color-text-secondary)", fontSize: 13, lineHeight: 1 }}>
-                      <i className="ti ti-trash" />
-                    </button>
-                  )}
-                </div>
-              );
-            })}
+                );
+              })}
+            </div>
           </div>
-        </div>
 
-        {/* Detail panel with sub-tabs */}
-        <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)",
-            display: "flex", flexDirection: "column", maxHeight: 560 }}>
-          <div style={{ display: "flex", borderBottom: "0.5px solid var(--color-border-tertiary)",
-              background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-lg) var(--border-radius-lg) 0 0",
-              flexShrink: 0 }}>
-            {DETAIL_TABS.map(t => {
-              const count = t.key === "blocks"
-                ? (profile?.subBlocks?.length ?? 0)
-                : t.key === "inputs" ? inputVars.length : outputVars.length;
-              const active = detailTab === t.key;
-              return (
-                <button key={t.key} onClick={() => setDetailTab(t.key)}
-                  style={{ padding: "6px 14px", border: "none", background: "transparent",
-                    cursor: "pointer", fontSize: 12, fontWeight: active ? 600 : 400,
-                    color: active ? "var(--color-text-primary)" : "var(--color-text-secondary)",
-                    borderBottom: active ? "2px solid var(--color-text-primary)" : "2px solid transparent",
-                    marginBottom: -1 }}>
-                  {t.label}
-                  {profile?.subBlocks && (
-                    <span style={{ marginLeft: 4, fontSize: 10, opacity: 0.65 }}>({count})</span>
+          {/* Detail panel with sub-tabs */}
+          <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)",
+              display: "flex", flexDirection: "column" }}>
+            <div style={{ display: "flex", borderBottom: "0.5px solid var(--color-border-tertiary)",
+                background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-lg) var(--border-radius-lg) 0 0",
+                flexShrink: 0 }}>
+              {DETAIL_TABS.map(t => {
+                const count = t.key === "blocks"
+                  ? (profile?.subBlocks?.length ?? 0)
+                  : t.key === "inputs" ? inputVars.length : outputVars.length;
+                const active = detailTab === t.key;
+                return (
+                  <button key={t.key} onClick={() => setDetailTab(t.key)}
+                    style={{ padding: "6px 14px", border: "none", background: "transparent",
+                      cursor: "pointer", fontSize: 12, fontWeight: active ? 600 : 400,
+                      color: active ? "var(--color-text-primary)" : "var(--color-text-secondary)",
+                      borderBottom: active ? "2px solid var(--color-text-primary)" : "2px solid transparent",
+                      marginBottom: -1 }}>
+                    {t.label}
+                    {profile?.subBlocks && (
+                      <span style={{ marginLeft: 4, fontSize: 10, opacity: 0.65 }}>({count})</span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+            <div style={{ flex: 1, overflowY: "auto", padding: "1rem 1.25rem" }}>
+              {loadingBlocks ? (
+                <div style={{ color: "var(--color-text-secondary)", fontSize: 13 }}>Loading…</div>
+              ) : !profile?.subBlocks ? (
+                <div style={{ color: "var(--color-text-secondary)", fontSize: 13 }}>Select a CM type</div>
+              ) : (
+                <>
+                  <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 2 }}>{profile.cmType}</div>
+                  <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: "1rem" }}>
+                    {profile.comment}{profile.samplingTime ? ` · ${profile.samplingTime} ms` : ""}
+                  </div>
+                  {detailTab === "blocks" && (
+                    <>
+                      <SLabel text={`Required (${reqBlocks.length})`} />
+                      {reqBlocks.map(b => <BlockRow key={b.name} block={b} on={true} required={true} onToggle={() => {}} />)}
+                      <SLabel text={`Optional (${optBlocks.length})`} top />
+                      {optBlocks.map(b => (
+                        <BlockRow key={b.name} block={b} on={profile.enabledBlocks?.includes(b.name)}
+                          required={false} onToggle={() => toggleBlock(profile.id, b.name)} />
+                      ))}
+                    </>
                   )}
-                </button>
-              );
-            })}
-          </div>
-          <div style={{ flex: 1, overflowY: "auto", padding: "1rem 1.25rem" }}>
-            {loadingBlocks ? (
-              <div style={{ color: "var(--color-text-secondary)", fontSize: 13 }}>Loading…</div>
-            ) : !profile?.subBlocks ? (
-              <div style={{ color: "var(--color-text-secondary)", fontSize: 13 }}>Select a CM type</div>
-            ) : (
-              <>
-                <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 2 }}>{profile.cmType}</div>
-                <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: "1rem" }}>
-                  {profile.comment}{profile.samplingTime ? ` · ${profile.samplingTime} ms` : ""}
-                </div>
-                {detailTab === "blocks" && (
-                  <>
-                    <SLabel text={`Required (${reqBlocks.length})`} />
-                    {reqBlocks.map(b => <BlockRow key={b.name} block={b} on={true} required={true} onToggle={() => {}} />)}
-                    <SLabel text={`Optional (${optBlocks.length})`} top />
-                    {optBlocks.map(b => (
-                      <BlockRow key={b.name} block={b} on={profile.enabledBlocks?.includes(b.name)}
-                        required={false} onToggle={() => toggleBlock(profile.id, b.name)} />
-                    ))}
-                  </>
-                )}
-                {(detailTab === "inputs" || detailTab === "outputs") && (
-                  <VarTable
-                    vars={detailTab === "inputs" ? inputVars : outputVars}
-                    cmTypeName={profile.id}
-                    editable={detailTab === "inputs"}
-                    showValid={true}
-                    onVarDefaultChange={(varId, newVal) => onVarDefaultChange?.(profile.id, varId, newVal)}
-                    onVarValidChange={(varId, isValid) => onVarValidChange?.(profile.id, varId, isValid)} />
-                )}
-              </>
-            )}
+                  {(detailTab === "inputs" || detailTab === "outputs") && (
+                    <VarTable
+                      vars={detailTab === "inputs" ? inputVars : outputVars}
+                      cmTypeName={profile.id}
+                      editable={detailTab === "inputs"}
+                      showValid={true}
+                      onVarDefaultChange={(varId, newVal) => onVarDefaultChange?.(profile.id, varId, newVal)}
+                      onVarValidChange={(varId, isValid) => onVarValidChange?.(profile.id, varId, isValid)} />
+                  )}
+                </>
+              )}
+            </div>
           </div>
         </div>
-      </div>
     </div>
   );
 }
 
 function VarTable({ vars, cmTypeName, editable, showValid, onVarDefaultChange, onVarValidChange }) {
+  const gridRef = useRef(null);
   const [drafts, setDrafts] = useState({});
   const [saving, setSaving] = useState({});
   const [validSaving, setValidSaving] = useState({});
@@ -1291,12 +1488,12 @@ function VarTable({ vars, cmTypeName, editable, showValid, onVarDefaultChange, o
     if (newVal === (v.val || "")) { setDrafts(d => { const n = {...d}; delete n[v.id]; return n; }); return; }
     setSaving(s => ({ ...s, [v.id]: true }));
     try {
-      await patchVarDefault(cmTypeName, v.id, newVal);
-      onVarDefaultChange?.(v.id, newVal);
+        await patchVarDefault(cmTypeName, v.id, newVal);
+        onVarDefaultChange?.(v.id, newVal);
     } catch (_) {}
     finally {
-      setSaving(s => { const n = {...s}; delete n[v.id]; return n; });
-      setDrafts(d => { const n = {...d}; delete n[v.id]; return n; });
+        setSaving(s => { const n = {...s}; delete n[v.id]; return n; });
+        setDrafts(d => { const n = {...d}; delete n[v.id]; return n; });
     }
   }
 
@@ -1305,94 +1502,145 @@ function VarTable({ vars, cmTypeName, editable, showValid, onVarDefaultChange, o
     const next = !v.isValid;
     setValidSaving(s => ({ ...s, [v.id]: true }));
     try {
-      await patchVarValid(cmTypeName, v.id, next);
-      onVarValidChange?.(v.id, next);
+        await patchVarValid(cmTypeName, v.id, next);
+        onVarValidChange?.(v.id, next);
     } catch (_) {}
     finally { setValidSaving(s => { const n = {...s}; delete n[v.id]; return n; }); }
   }
 
-  const COL = showValid
-    ? ["Block", "Parameter", "Data Type", "Dir", "Default", "Valid", "Comment"]
-    : ["Block", "Parameter", "Data Type", "Dir", "Default", "Comment"];
-  const colW = showValid
-    ? ["16%", "20%", "9%", "6%", "11%", "5%", "33%"]
-    : ["18%", "22%", "10%", "7%", "12%", "31%"];
+  const theme = useMemo(() => themeQuartz.withParams({
+    fontSize: 12, rowHeight: 36, headerHeight: 36,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    accentColor: '#0C447C', browserColorScheme: 'light',
+  }), []);
 
-  return (
-    <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-md)", overflow: "hidden" }}>
-      <div style={{ display: "grid", gridTemplateColumns: colW.join(" "),
-          padding: "5px 10px", background: "var(--color-background-secondary)",
-          borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
-        {COL.map((h, hi) => (
-          <div key={h} style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
-              letterSpacing: "0.04em", color: "var(--color-text-secondary)",
-              textAlign: showValid && hi === 5 ? "center" : "left" }}>{h}</div>
-        ))}
-      </div>
-      <div style={{ maxHeight: 420, overflowY: "auto" }}>
-        {vars.map((v, i) => {
+  const defaultColDef = useMemo(() => ({
+    sortable: true, resizable: true, suppressMovable: false,
+  }), []);
+
+  const columnDefs = useMemo(() => {
+    const isInput = vars.length > 0 && /input/i.test(vars[0].dir);
+    const cols = [
+      {
+        headerName: 'Block', field: 'blockName',
+        filter: 'agTextColumnFilter', floatingFilter: true, minWidth: 120, flex: 1,
+        cellStyle: { fontFamily: 'ui-monospace, monospace', fontSize: 11, color: 'var(--color-text-secondary)' },
+      },
+      {
+        headerName: 'Parameter', field: 'name',
+        filter: 'agTextColumnFilter', floatingFilter: true, minWidth: 140, flex: 1.2,
+        cellStyle: { fontFamily: 'ui-monospace, monospace', fontWeight: 500 },
+      },
+      {
+        headerName: 'Data Type', field: 'dtype',
+        filter: 'agTextColumnFilter', floatingFilter: true, minWidth: 100, flex: 0.8,
+        cellStyle: { fontSize: 11, color: 'var(--color-text-secondary)' },
+      },
+      {
+        headerName: 'Dir', field: 'dir',
+        filter: 'agTextColumnFilter', floatingFilter: true, minWidth: 70, flex: 0.6,
+        cellRenderer: p => (
+          <span style={{
+            padding: '1px 5px', borderRadius: 4, fontSize: 10, fontWeight: 500,
+            background: isInput ? '#DBEAFE' : '#DCFCE7',
+            color: isInput ? '#1D4ED8' : '#166534',
+          }}>
+            {p.value || '—'}
+          </span>
+        ),
+      },
+      {
+        headerName: 'Default', field: 'val',
+        filter: 'agTextColumnFilter', floatingFilter: true, minWidth: 110, flex: 1,
+        cellRenderer: p => {
+          const v = p.data;
           const isDraft = v.id in drafts;
-          const draftVal = isDraft ? drafts[v.id] : (v.val || "");
+          const draftVal = isDraft ? drafts[v.id] : (v.val || '');
           const isSaving = !!saving[v.id];
-          const isVSaving = !!validSaving[v.id];
           const canEdit = editable && !!v.id;
-          const isInput = /input/i.test(v.dir);
+
+          if (canEdit) {
+            return (
+              <input
+                value={draftVal}
+                onChange={e => setDrafts(d => ({ ...d, [v.id]: e.target.value }))}
+                onFocus={() => { if (!isDraft) setDrafts(d => ({ ...d, [v.id]: v.val || '' })); }}
+                onBlur={e => commitVal(v, e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') e.target.blur();
+                  if (e.key === 'Escape') { setDrafts(d => { const n={...d}; delete n[v.id]; return n; }); e.target.blur(); }
+                }}
+                disabled={isSaving}
+                title="Click to edit default value"
+                style={{
+                  width: '100%', padding: '2px 5px', fontSize: 11, fontFamily: 'var(--font-mono)',
+                  border: isDraft ? '1px solid #7F77DD' : '1px solid transparent',
+                  borderRadius: '4px', background: isDraft ? 'var(--color-background-primary)' : 'transparent',
+                  color: draftVal ? 'var(--color-text-primary)' : 'var(--color-text-secondary)',
+                  cursor: 'text', outline: 'none', opacity: isSaving ? 0.5 : 1
+                }}
+              />
+            );
+          }
+          return <div style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--color-text-secondary)' }}>{v.val || '—'}</div>;
+        },
+      },
+    ];
+
+    if (showValid) {
+      cols.push({
+        headerName: '', colId: 'valid', sortable: false, filter: false, resizable: false,
+        width: 70, maxWidth: 70,
+        cellRenderer: p => {
+          const v = p.data;
+          const isVSaving = !!validSaving[v.id];
+          const isInputVar = /input/i.test(v.dir);
           return (
-            <div key={i} style={{ display: "grid", gridTemplateColumns: colW.join(" "),
-                padding: "5px 10px", borderBottom: i < vars.length - 1 ? "0.5px solid var(--color-border-tertiary)" : "none",
-                background: v.isValid ? (isInput ? "#EFF6FF" : "#F0FDF4") : (i % 2 === 0 ? "transparent" : "var(--color-background-secondary)"),
-                alignItems: "center" }}>
-              <div style={{ fontSize: 11, fontFamily: "var(--font-mono)", color: "var(--color-text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{v.blockName}</div>
-              <div style={{ fontSize: 11, fontFamily: "var(--font-mono)", fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={v.name}>{v.name}</div>
-              <div style={{ fontSize: 11, color: "var(--color-text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{v.dtype}</div>
-              <div style={{ fontSize: 10 }}>
-                <span style={{ padding: "1px 5px", borderRadius: 4, fontSize: 10, fontWeight: 500,
-                  background: isInput ? "#DBEAFE" : "#DCFCE7",
-                  color: isInput ? "#1D4ED8" : "#166534" }}>
-                  {v.dir || "—"}
-                </span>
-              </div>
-              <div style={{ overflow: "hidden" }}>
-                {canEdit ? (
-                  <input
-                    value={draftVal}
-                    onChange={e => setDrafts(d => ({ ...d, [v.id]: e.target.value }))}
-                    onFocus={() => { if (!isDraft) setDrafts(d => ({ ...d, [v.id]: v.val || "" })); }}
-                    onBlur={e => commitVal(v, e.target.value)}
-                    onKeyDown={e => { if (e.key === "Enter") e.target.blur(); if (e.key === "Escape") { setDrafts(d => { const n={...d}; delete n[v.id]; return n; }); e.target.blur(); } }}
-                    disabled={isSaving}
-                    title="Click to edit default value"
-                    style={{ width: "100%", padding: "2px 5px", fontSize: 11, fontFamily: "var(--font-mono)",
-                      border: isDraft ? "1px solid #7F77DD" : "1px solid transparent",
-                      borderRadius: "var(--border-radius-sm)", background: isDraft ? "var(--color-background-primary)" : "transparent",
-                      color: draftVal ? "var(--color-text-primary)" : "var(--color-text-secondary)",
-                      cursor: "text", outline: "none", opacity: isSaving ? 0.5 : 1 }} />
-                ) : (
-                  <div style={{ fontSize: 11, fontFamily: "var(--font-mono)", color: "var(--color-text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {v.val || "—"}
-                  </div>
-                )}
-              </div>
-              {showValid && (
-                <div style={{ textAlign: "center" }}>
-                  <button
-                    onClick={() => toggleValid(v)}
-                    disabled={isVSaving || !v.id}
-                    title={v.isValid ? "Remove from wiring palette" : "Mark as available for wiring in Composite CM"}
-                    style={{ border: "none", background: "transparent", cursor: v.id ? "pointer" : "default",
-                      padding: "2px 4px", fontSize: 14, lineHeight: 1,
-                      opacity: isVSaving ? 0.4 : 1,
-                      color: v.isValid ? (isInput ? "#1D4ED8" : "#166534") : "var(--color-text-secondary)" }}>
-                    {v.isValid
-                      ? <i className={isInput ? "ti ti-plug-connected" : "ti ti-plug-connected"} />
-                      : <i className="ti ti-plug" />}
-                  </button>
-                </div>
-              )}
-              <div style={{ fontSize: 11, color: "var(--color-text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={v.comment}>{v.comment || ""}</div>
+            <div style={{ display: 'flex', justifyContent: 'center' }}>
+              <button
+                onClick={() => toggleValid(v)}
+                disabled={isVSaving || !v.id}
+                title={v.isValid ? 'Remove from wiring palette' : 'Mark as available for wiring'}
+                style={{
+                  border: 'none', background: 'transparent', cursor: v.id ? 'pointer' : 'default',
+                  padding: '2px 4px', fontSize: 14, lineHeight: 1,
+                  opacity: isVSaving ? 0.4 : 1,
+                  color: v.isValid ? (isInputVar ? '#1D4ED8' : '#166534') : 'var(--color-text-secondary)',
+                }}
+              >
+                {v.isValid
+                  ? <i className="ti ti-plug-connected" />
+                  : <i className="ti ti-plug" />}
+              </button>
             </div>
           );
-        })}
+        },
+      });
+    }
+
+    cols.push({
+      headerName: 'Comment', field: 'comment',
+      filter: 'agTextColumnFilter', floatingFilter: true, minWidth: 160, flex: 1.5,
+      cellStyle: { fontSize: 11, color: 'var(--color-text-secondary)' },
+    });
+
+    return cols;
+  }, [drafts, saving, validSaving, editable, showValid, vars]);
+
+  const getRowId = useCallback(p => String(p.data.id || p.data.name), []);
+
+  return (
+    <div className="ig-root" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+      <div className="ig-grid-wrap" style={{ flex: 1, minHeight: 0 }}>
+        <AgGridReact
+          ref={gridRef}
+          theme={theme}
+          rowData={vars}
+          columnDefs={columnDefs}
+          defaultColDef={defaultColDef}
+          getRowId={getRowId}
+          animateRows={false}
+        />
       </div>
     </div>
   );
@@ -1419,23 +1667,23 @@ function ModeCommandsPanel({ valveCommands, onValveCommandsChange }) {
   }
   function updateRow(i, field, rawVal) {
     setDraft(d => d.map((r, j) => j !== i ? r : {
-      ...r,
-      [field]: field === "value" ? (parseInt(rawVal) || 0) : rawVal,
+        ...r,
+        [field]: field === "value" ? (parseInt(rawVal) || 0) : rawVal,
     }));
   }
 
   async function handleSave() {
     setErr("");
     for (const r of draft) {
-      if (!r.name.trim()) { setErr("All rows must have a name"); return; }
+        if (!r.name.trim()) { setErr("All rows must have a name"); return; }
     }
     setBusy(true);
     try {
-      await saveValveCommands(draft.map(r => ({ name: r.name.trim().toUpperCase(), value: r.value })));
-      setDraft(null);
-      if (onValveCommandsChange) await onValveCommandsChange();
+        await saveValveCommands(draft.map(r => ({ name: r.name.trim().toUpperCase(), value: r.value })));
+        setDraft(null);
+        if (onValveCommandsChange) await onValveCommandsChange();
     } catch (e) {
-      setErr(e.message);
+        setErr(e.message);
     } finally { setBusy(false); }
   }
 
@@ -1447,86 +1695,86 @@ function ModeCommandsPanel({ valveCommands, onValveCommandsChange }) {
 
   return (
     <div>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "1rem" }}>
-        <div>
-          <div style={{ fontWeight: 600, fontSize: 14 }}>Mode Commands</div>
-          <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginTop: 2 }}>
-            Define the named command → integer value lookup used in matrix cell dropdowns.
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "1rem" }}>
+          <div>
+            <div style={{ fontWeight: 600, fontSize: 14 }}>Mode Commands</div>
+            <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginTop: 2 }}>
+              Define the named command → integer value lookup used in matrix cell dropdowns.
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 6 }}>
+            {draft ? (
+              <>
+                <Btn onClick={addRow} style={{ fontSize: 11 }}><i className="ti ti-plus" /> Add row</Btn>
+                <Btn onClick={handleSave} disabled={busy} style={{ fontSize: 11, background: "var(--color-primary)", color: "#fff" }}>
+                  {busy ? "Saving…" : "Save"}
+                </Btn>
+                <Btn onClick={cancelEdit} style={{ fontSize: 11 }}>Cancel</Btn>
+              </>
+            ) : (
+              <Btn onClick={startEdit} style={{ fontSize: 11 }}><i className="ti ti-pencil" /> Edit</Btn>
+            )}
           </div>
         </div>
-        <div style={{ display: "flex", gap: 6 }}>
-          {draft ? (
-            <>
-              <Btn onClick={addRow} style={{ fontSize: 11 }}><i className="ti ti-plus" /> Add row</Btn>
-              <Btn onClick={handleSave} disabled={busy} style={{ fontSize: 11, background: "var(--color-primary)", color: "#fff" }}>
-                {busy ? "Saving…" : "Save"}
-              </Btn>
-              <Btn onClick={cancelEdit} style={{ fontSize: 11 }}>Cancel</Btn>
-            </>
-          ) : (
-            <Btn onClick={startEdit} style={{ fontSize: 11 }}><i className="ti ti-pencil" /> Edit</Btn>
-          )}
-        </div>
-      </div>
 
-      {err && <div style={{ color: "#DC2626", fontSize: 12, marginBottom: 8 }}>{err}</div>}
+        {err && <div style={{ color: "#DC2626", fontSize: 12, marginBottom: 8 }}>{err}</div>}
 
-      <div style={{ overflowX: "auto" }}>
-        <table style={{ borderCollapse: "collapse", fontSize: 12, width: "100%", maxWidth: 480 }}>
-          <thead>
-            <tr style={{ background: "var(--color-background-secondary)" }}>
-              <th style={{ padding: "4px 8px", borderBottom: "0.5px solid var(--color-border-tertiary)", textAlign: "left", fontWeight: 600 }}>Command Name</th>
-              <th style={{ padding: "4px 8px", borderBottom: "0.5px solid var(--color-border-tertiary)", textAlign: "center", fontWeight: 600, width: 90 }}>Value</th>
-              {draft && <th style={{ width: 30 }} />}
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((r, i) => (
-              <tr key={i} style={{ borderBottom: "0.5px solid var(--color-border-tertiary)",
-                  background: i % 2 === 0 ? "transparent" : "var(--color-background-secondary)" }}>
-                <td style={{ padding: "3px 8px" }}>
-                  {draft ? (
-                    <input value={r.name} onChange={e => updateRow(i, "name", e.target.value)}
-                      placeholder="e.g. OPEN" style={{ ...inputSx, width: "100%", fontFamily: "var(--font-mono)" }} />
-                  ) : (
-                    <span style={{ fontFamily: "var(--font-mono)", fontSize: 12 }}>{r.name}</span>
-                  )}
-                </td>
-                <td style={{ padding: "3px 8px", textAlign: "center" }}>
-                  {draft ? (
-                    <input type="number" value={r.value} onChange={e => updateRow(i, "value", e.target.value)}
-                      style={{ ...inputSx, width: 80, textAlign: "center", fontFamily: "var(--font-mono)" }} />
-                  ) : (
-                    <span style={{ fontFamily: "var(--font-mono)", fontSize: 12 }}>{r.value}</span>
-                  )}
-                </td>
-                {draft && (
-                  <td style={{ padding: "3px 4px", textAlign: "center" }}>
-                    <button onClick={() => removeRow(i)}
-                      style={{ border: "none", background: "transparent", cursor: "pointer", color: "#DC2626", fontSize: 13 }}>
-                      <i className="ti ti-x" />
-                    </button>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ borderCollapse: "collapse", fontSize: 12, width: "100%", maxWidth: 480 }}>
+            <thead>
+              <tr style={{ background: "var(--color-background-secondary)" }}>
+                <th style={{ padding: "4px 8px", borderBottom: "0.5px solid var(--color-border-tertiary)", textAlign: "left", fontWeight: 600 }}>Command Name</th>
+                <th style={{ padding: "4px 8px", borderBottom: "0.5px solid var(--color-border-tertiary)", textAlign: "center", fontWeight: 600, width: 90 }}>Value</th>
+                {draft && <th style={{ width: 30 }} />}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r, i) => (
+                <tr key={i} style={{ borderBottom: "0.5px solid var(--color-border-tertiary)",
+                    background: i % 2 === 0 ? "transparent" : "var(--color-background-secondary)" }}>
+                  <td style={{ padding: "3px 8px" }}>
+                    {draft ? (
+                      <input value={r.name} onChange={e => updateRow(i, "name", e.target.value)}
+                        placeholder="e.g. OPEN" style={{ ...inputSx, width: "100%", fontFamily: "var(--font-mono)" }} />
+                    ) : (
+                      <span style={{ fontFamily: "var(--font-mono)", fontSize: 12 }}>{r.name}</span>
+                    )}
                   </td>
-                )}
-              </tr>
-            ))}
-            {rows.length === 0 && (
-              <tr>
-                <td colSpan={draft ? 3 : 2} style={{ padding: "1rem", textAlign: "center", fontSize: 12, color: "var(--color-text-secondary)" }}>
-                  No commands defined — click Edit to add entries.
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
-      </div>
+                  <td style={{ padding: "3px 8px", textAlign: "center" }}>
+                    {draft ? (
+                      <input type="number" value={r.value} onChange={e => updateRow(i, "value", e.target.value)}
+                        style={{ ...inputSx, width: 80, textAlign: "center", fontFamily: "var(--font-mono)" }} />
+                    ) : (
+                      <span style={{ fontFamily: "var(--font-mono)", fontSize: 12 }}>{r.value}</span>
+                    )}
+                  </td>
+                  {draft && (
+                    <td style={{ padding: "3px 4px", textAlign: "center" }}>
+                      <button onClick={() => removeRow(i)}
+                        style={{ border: "none", background: "transparent", cursor: "pointer", color: "#DC2626", fontSize: 13 }}>
+                        <i className="ti ti-x" />
+                      </button>
+                    </td>
+                  )}
+                </tr>
+              ))}
+              {rows.length === 0 && (
+                <tr>
+                  <td colSpan={draft ? 3 : 2} style={{ padding: "1rem", textAlign: "center", fontSize: 12, color: "var(--color-text-secondary)" }}>
+                    No commands defined — click Edit to add entries.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
     </div>
   );
 }
 
 // ── Composite CM Types sub-tab ────────────────────────────────────────────────
 const EMPTY_COMPOSITE = { name: "", description: "", members: [], is_matrix: false, matrixColumns: [], matrixModes: [] };
-const EMPTY_MEMBER    = { cm_type_name: "", hierarchy_folder: "CM", name_prefix: "", name_suffix: "", scope: "unit" };
+const EMPTY_MEMBER    = { cm_type_name: "", hierarchy_folder: "", name_prefix: "", name_suffix: "", scope: "unit" };
 
 function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valveCommands }) {
   const [composites, setComposites]   = useState([]);
@@ -1537,7 +1785,31 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
   // Cache of valid vars per cm type name: { [cmTypeName]: { inputs: [], outputs: [] } }
   const [validVarsCache, setValidVarsCache] = useState({});
   // Add-connection controls
-  const [wire, setWire] = useState({ type: "interconnection", fromIdx: "", fromVar: "", toIdx: "", toVar: "", staticValue: "" });
+  const [wire, setWire] = useState({ type: "interconnection", fromIdx: "", fromVar: "", toIdx: "", toVar: "", staticValue: "", valueMode: "static", column: "", prefix: "", suffix: "" });
+
+  // IO Connection state — rules per member cm_type_name, keyed by cm_type_name
+  // { [cmTypeName]: { cmType, rules, blocks, vars } }
+  const [ioRulesCache, setIoRulesCache]   = useState({});
+  // New-rule draft: paramKey encodes "block>>var" of the selected input parameter
+  const [ioWire, setIoWire] = useState({ memberIdx: "", paramKey: "", suffix: "", prefix: "", required: true });
+  const [ioErr, setIoErr]                 = useState("");
+
+  // Column-name suggestions for derived Value connections, sourced from the most
+  // recently uploaded IO import across all projects (this panel has no single project
+  // in scope). Column names are stored as free strings, so this only seeds the
+  // dropdown — actual resolution always uses whichever import the target project has.
+  const [ioColumns, setIoColumns] = useState([]);
+  useEffect(() => {
+    (async () => {
+      try {
+        const latest = await getLatestIoImport();
+        if (latest?.id) {
+          const { headers } = await getIOHeaders(latest.id);
+          setIoColumns(headers || []);
+        }
+      } catch { setIoColumns([]); }
+    })();
+  }, []);
 
   useEffect(() => { load(); }, []);
 
@@ -1545,12 +1817,12 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
   useEffect(() => {
     const updates = {};
     for (const p of cmtProfiles) {
-      if (!p.subBlocks) continue;
-      const allVars = p.subBlocks.flatMap(b => b.vars.map(v => ({ ...v, blockName: b.name })));
-      updates[p.id] = {
-        inputs:  allVars.filter(v => /input/i.test(v.dir) && v.isValid),
-        outputs: allVars.filter(v => /output/i.test(v.dir) && v.isValid),
-      };
+        if (!p.subBlocks) continue;
+        const allVars = p.subBlocks.flatMap(b => b.vars.map(v => ({ ...v, blockName: b.name })));
+        updates[p.id] = {
+          inputs:  allVars.filter(v => /input/i.test(v.dir) && v.isValid),
+          outputs: allVars.filter(v => /output/i.test(v.dir) && v.isValid),
+        };
     }
     if (Object.keys(updates).length) setValidVarsCache(prev => ({ ...prev, ...updates }));
   }, [cmtProfiles]);
@@ -1562,7 +1834,9 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
   function startNew() {
     setSelectedId(null);
     setEditing({ ...EMPTY_COMPOSITE, members: [], connections: [], matrixColumns: [], matrixModes: [] });
-    setWire({ type: "interconnection", fromIdx: "", fromVar: "", toIdx: "", toVar: "", staticValue: "" });
+    setWire({ type: "interconnection", fromIdx: "", fromVar: "", toIdx: "", toVar: "", staticValue: "", valueMode: "static", column: "", prefix: "", suffix: "" });
+    setIoWire({ memberIdx: "", paramKey: "", suffix: "", prefix: "", required: true });
+    setIoErr("");
     setLocalErr("");
   }
 
@@ -1572,38 +1846,57 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
     const results = await Promise.all(missing.map(n => ensureLoaded?.(n).catch(() => null)));
     const updates = {};
     missing.forEach((n, i) => {
-      const profile = results[i];
-      if (!profile?.subBlocks) return;
-      const allVars = profile.subBlocks.flatMap(b => b.vars.map(v => ({ ...v, blockName: b.name })));
-      updates[n] = {
-        inputs:  allVars.filter(v => /input/i.test(v.dir) && v.isValid),
-        outputs: allVars.filter(v => /output/i.test(v.dir) && v.isValid),
-      };
+        const profile = results[i];
+        if (!profile?.subBlocks) return;
+        const allVars = profile.subBlocks.flatMap(b => b.vars.map(v => ({ ...v, blockName: b.name })));
+        updates[n] = {
+          inputs:  allVars.filter(v => /input/i.test(v.dir) && v.isValid),
+          outputs: allVars.filter(v => /output/i.test(v.dir) && v.isValid),
+        };
     });
     if (Object.keys(updates).length) setValidVarsCache(prev => ({ ...prev, ...updates }));
+  }
+
+  async function loadIoRulesForMembers(members) {
+    const missing = members.filter(m => m.cm_type_name && !ioRulesCache[m.cm_type_name]);
+    if (!missing.length) return;
+    const results = await Promise.all(
+        missing.map(m =>
+          getIoConnections(
+            // We need the lib_cm_types.id — look it up from cmtProfiles
+            cmtProfiles.find(p => p.cmType === m.cm_type_name)?.id
+          ).catch(() => null)
+        )
+    );
+    const updates = {};
+    missing.forEach((m, i) => {
+        if (results[i]) updates[m.cm_type_name] = results[i];
+    });
+    if (Object.keys(updates).length) setIoRulesCache(prev => ({ ...prev, ...updates }));
   }
 
   async function selectComposite(id) {
     setSelectedId(id);
     setLocalErr("");
-    setWire({ type: "interconnection", fromIdx: "", fromVar: "", toIdx: "", toVar: "", staticValue: "" });
+    setWire({ type: "interconnection", fromIdx: "", fromVar: "", toIdx: "", toVar: "", staticValue: "", valueMode: "static", column: "", prefix: "", suffix: "" });
     try {
-      const detail = await getCompositeCmType(id);
-      const members = detail.members || [];
-      setEditing({
-        name:          detail.name,
-        description:   detail.description || "",
-        members,
-        connections:   detail.connections || [],
-        is_matrix:     !!detail.is_matrix,
-        matrixColumns: detail.matrixColumns || [],
-        matrixModes:   (detail.matrixModes || []).map(m => ({
-          mode_nr:   m.mode_nr,
-          mode_name: m.mode_name,
-          cells:     m.cells || {},
-        })),
-      });
-      await ensureValidVars(members.map(m => m.cm_type_name).filter(Boolean));
+        const detail = await getCompositeCmType(id);
+        const members = detail.members || [];
+        setEditing({
+          name:          detail.name,
+          description:   detail.description || "",
+          members,
+          connections:   detail.connections || [],
+          is_matrix:     !!detail.is_matrix,
+          matrixColumns: detail.matrixColumns || [],
+          matrixModes:   (detail.matrixModes || []).map(m => ({
+            mode_nr:   m.mode_nr,
+            mode_name: m.mode_name,
+            cells:     m.cells || {},
+          })),
+        });
+        await ensureValidVars(members.map(m => m.cm_type_name).filter(Boolean));
+        await loadIoRulesForMembers(members);
     } catch (e) { setLocalErr(e.message); }
   }
 
@@ -1613,30 +1906,30 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
     const invalidMember = editing.members.find(m => !m.cm_type_name.trim());
     if (invalidMember) { setLocalErr("All members must have a CM type selected"); return; }
     if (editing.is_matrix) {
-      if (!editing.matrixColumns?.length) { setLocalErr("Add at least one valve column"); return; }
-      if (!editing.matrixModes?.length) { setLocalErr("Add at least one mode row"); return; }
+        if (!editing.matrixColumns?.length) { setLocalErr("Add at least one valve column"); return; }
+        if (!editing.matrixModes?.length) { setLocalErr("Add at least one mode row"); return; }
     }
 
     setBusy(true);
     setLocalErr("");
     try {
-      const payload = {
-        name:          editing.name.trim(),
-        description:   editing.description.trim(),
-        is_matrix:     !!editing.is_matrix,
-        members:       editing.members,
-        connections:   editing.is_matrix ? [] : (editing.connections || []),
-        matrixColumns: editing.is_matrix ? (editing.matrixColumns || []) : [],
-        matrixModes:   editing.is_matrix ? (editing.matrixModes || []) : [],
-      };
-      if (selectedId) {
-        await updateCompositeCmType(selectedId, payload);
-      } else {
-        const r = await createCompositeCmType(payload);
-        setSelectedId(r.id);
-      }
-      await load();
-      onCompositesChange?.();
+        const payload = {
+          name:          editing.name.trim(),
+          description:   editing.description.trim(),
+          is_matrix:     !!editing.is_matrix,
+          members:       editing.members,
+          connections:   editing.connections || [],
+          matrixColumns: editing.is_matrix ? (editing.matrixColumns || []) : [],
+          matrixModes:   editing.is_matrix ? (editing.matrixModes || []) : [],
+        };
+        if (selectedId) {
+          await updateCompositeCmType(selectedId, payload);
+        } else {
+          const r = await createCompositeCmType(payload);
+          setSelectedId(r.id);
+        }
+        await load();
+        onCompositesChange?.();
     } catch (e) { setLocalErr(e.message); }
     finally { setBusy(false); }
   }
@@ -1646,10 +1939,10 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
     if (!window.confirm(`Delete composite "${comp?.name}"?`)) return;
     setBusy(true);
     try {
-      await deleteCompositeCmType(id);
-      if (selectedId === id) { setSelectedId(null); setEditing(null); }
-      await load();
-      onCompositesChange?.();
+        await deleteCompositeCmType(id);
+        if (selectedId === id) { setSelectedId(null); setEditing(null); }
+        await load();
+        onCompositesChange?.();
     } catch (e) { setLocalErr(e.message); }
     finally { setBusy(false); }
   }
@@ -1660,67 +1953,83 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
 
   function updateMember(idx, key, value) {
     setEditing(prev => {
-      const members = prev.members.map((m, i) => i === idx ? { ...m, [key]: value } : m);
-      if (key === "cm_type_name" && value) {
-        // Load valid vars for the newly selected type
-        ensureValidVars([value]);
-        // Drop connections that reference this member's old type variables
-        const connections = (prev.connections || []).filter(c => c.from_member_idx !== idx && c.to_member_idx !== idx);
-        return { ...prev, members, connections };
-      }
-      return { ...prev, members };
+        const members = prev.members.map((m, i) => i === idx ? { ...m, [key]: value } : m);
+        if (key === "cm_type_name" && value) {
+          // Load valid vars and IO rules for the newly selected type
+          ensureValidVars([value]);
+          loadIoRulesForMembers([{ cm_type_name: value }]);
+          // Drop connections that reference this member's old type variables
+          const connections = (prev.connections || []).filter(c => c.from_member_idx !== idx && c.to_member_idx !== idx);
+          return { ...prev, members, connections };
+        }
+        return { ...prev, members };
     });
   }
 
   function removeMember(idx) {
     setEditing(prev => ({
-      ...prev,
-      members: prev.members.filter((_, i) => i !== idx),
-      connections: (prev.connections || []).filter(c => c.from_member_idx !== idx && c.to_member_idx !== idx),
+        ...prev,
+        members: prev.members.filter((_, i) => i !== idx),
+        connections: (prev.connections || []).filter(c => c.from_member_idx !== idx && c.to_member_idx !== idx),
     }));
   }
 
   function moveMember(idx, dir) {
     setEditing(prev => {
-      const members = [...prev.members];
-      const target = idx + dir;
-      if (target < 0 || target >= members.length) return prev;
-      [members[idx], members[target]] = [members[target], members[idx]];
-      return { ...prev, members };
+        const members = [...prev.members];
+        const target = idx + dir;
+        if (target < 0 || target >= members.length) return prev;
+        [members[idx], members[target]] = [members[target], members[idx]];
+        return { ...prev, members };
     });
   }
 
   function addConnection() {
-    const { type, fromIdx, fromVar, toIdx, toVar, staticValue } = wire;
+    const { type, fromIdx, fromVar, toIdx, toVar, staticValue, valueMode, column, prefix, suffix } = wire;
     if (toIdx === "" || !toVar) return;
     if (type === "interconnection") {
-      if (fromIdx === "" || !fromVar) return;
-      const fi = parseInt(fromIdx), ti = parseInt(toIdx);
-      if (fi === ti) { setLocalErr("Cannot connect a member to itself"); return; }
-      const duplicate = (editing.connections || []).some(
-        c => c.conn_type !== "value" && c.from_member_idx === fi && c.from_var_name === fromVar && c.to_member_idx === ti && c.to_var_name === toVar
-      );
-      if (duplicate) { setLocalErr("This connection already exists"); return; }
-      setLocalErr("");
-      setEditing(prev => ({
-        ...prev,
-        connections: [...(prev.connections || []), { conn_type: "interconnection", from_member_idx: fi, from_var_name: fromVar, to_member_idx: ti, to_var_name: toVar }],
-      }));
-      setWire(w => ({ ...w, fromVar: "", toVar: "" }));
+        if (fromIdx === "" || !fromVar) return;
+        const fi = parseInt(fromIdx), ti = parseInt(toIdx);
+        if (fi === ti) { setLocalErr("Cannot connect a member to itself"); return; }
+        const duplicate = (editing.connections || []).some(
+          c => c.conn_type !== "value" && c.from_member_idx === fi && c.from_var_name === fromVar && c.to_member_idx === ti && c.to_var_name === toVar
+        );
+        if (duplicate) { setLocalErr("This connection already exists"); return; }
+        setLocalErr("");
+        setEditing(prev => ({
+          ...prev,
+          connections: [...(prev.connections || []), { conn_type: "interconnection", from_member_idx: fi, from_var_name: fromVar, to_member_idx: ti, to_var_name: toVar }],
+        }));
+        setWire(w => ({ ...w, fromVar: "", toVar: "" }));
     } else {
-      // value type
-      if (!staticValue.trim()) return;
-      const ti = parseInt(toIdx);
-      const duplicate = (editing.connections || []).some(
-        c => c.conn_type === "value" && c.to_member_idx === ti && c.to_var_name === toVar
-      );
-      if (duplicate) { setLocalErr("A value is already assigned to that input"); return; }
-      setLocalErr("");
-      setEditing(prev => ({
-        ...prev,
-        connections: [...(prev.connections || []), { conn_type: "value", from_member_idx: -1, from_var_name: "", to_member_idx: ti, to_var_name: toVar, static_value: staticValue.trim() }],
-      }));
-      setWire(w => ({ ...w, toVar: "", staticValue: "" }));
+        // value type — static or derived
+        const ti = parseInt(toIdx);
+        const duplicate = (editing.connections || []).some(
+          c => c.conn_type === "value" && c.to_member_idx === ti && c.to_var_name === toVar
+        );
+        if (duplicate) { setLocalErr("A value is already assigned to that input"); return; }
+
+        if (valueMode === "derived") {
+          if (!column) return;
+          setLocalErr("");
+          setEditing(prev => ({
+            ...prev,
+            connections: [...(prev.connections || []), {
+              conn_type: "value", from_member_idx: -1, from_var_name: "",
+              to_member_idx: ti, to_var_name: toVar,
+              value_mode: "derived", column, prefix: prefix.trim(), suffix: suffix.trim(),
+            }],
+          }));
+          setWire(w => ({ ...w, toVar: "", column: "", prefix: "", suffix: "" }));
+        } else {
+          if (!staticValue.trim()) return;
+          setLocalErr("");
+          setEditing(prev => ({
+            ...prev,
+            connections: [...(prev.connections || []), { conn_type: "value", from_member_idx: -1, from_var_name: "", to_member_idx: ti, to_var_name: toVar, value_mode: "static", static_value: staticValue.trim() }],
+          }));
+          setWire(w => ({ ...w, toVar: "", staticValue: "" }));
+        }
     }
   }
 
@@ -1732,639 +2041,787 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
 
   return (
     <div>
-      <div style={{ marginBottom: "1rem" }}>
-        <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 4 }}>Composite CM Types</div>
-        <div style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>
-          Group multiple CM types into a single reusable entity. Each member is placed in its own hierarchy folder and can carry a naming prefix/suffix.
-        </div>
-      </div>
-
-      {localErr && (
-        <div style={{ background: "#FEE2E2", border: "1px solid #FCA5A5", borderRadius: "var(--border-radius-md)",
-            padding: "8px 12px", marginBottom: "1rem", fontSize: 13, color: "#991B1B" }}>
-          {localErr}
-        </div>
-      )}
-
-      <div style={{ display: "grid", gridTemplateColumns: "220px 1fr", gap: 12, minHeight: 420 }}>
-        {/* List panel */}
-        <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)",
-            display: "flex", flexDirection: "column", overflow: "hidden" }}>
-          <div style={{ padding: "8px", borderBottom: "0.5px solid var(--color-border-tertiary)",
-              background: "var(--color-background-secondary)", flexShrink: 0 }}>
-            <Btn primary onClick={startNew} style={{ width: "100%", justifyContent: "center" }}>
-              <i className="ti ti-plus" /> New Composite
-            </Btn>
-          </div>
-          <div style={{ overflowY: "auto", flex: 1 }}>
-            {composites.length === 0 ? (
-              <div style={{ padding: "1rem", fontSize: 12, color: "var(--color-text-secondary)", textAlign: "center" }}>
-                No composites yet
-              </div>
-            ) : composites.map(c => (
-              <div key={c.id} onClick={() => selectComposite(c.id)}
-                style={{ padding: "8px 10px", cursor: "pointer",
-                  borderBottom: "0.5px solid var(--color-border-tertiary)",
-                  background: selectedId === c.id ? "#EEEDFE" : "transparent",
-                  display: "flex", alignItems: "center", gap: 4 }}>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-                    <span style={{ fontSize: 12, fontWeight: 500, fontFamily: "var(--font-mono)" }}>{c.name}</span>
-                    {!!c.is_matrix && (
-                      <span style={{ fontSize: 9, padding: "0 4px", borderRadius: 3,
-                          background: "#DCFCE7", color: "#166534", fontWeight: 700, flexShrink: 0 }}>MTX</span>
-                    )}
-                  </div>
-                  <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 1 }}>
-                    {c.is_matrix ? "Matrix CM" : `${c.member_count} member${c.member_count !== 1 ? "s" : ""}`}
-                  </div>
-                </div>
-                <button onClick={e => { e.stopPropagation(); handleDelete(c.id); }}
-                  style={{ border: "none", background: "transparent", cursor: "pointer",
-                    padding: "2px 4px", color: "var(--color-text-secondary)", fontSize: 13, lineHeight: 1 }}>
-                  <i className="ti ti-trash" />
-                </button>
-              </div>
-            ))}
+        <div style={{ marginBottom: "1rem" }}>
+          <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 4 }}>Composite CM Types</div>
+          <div style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>
+            Group multiple CM types into a single reusable entity. Each member is placed in its own hierarchy folder and can carry a naming prefix/suffix.
           </div>
         </div>
 
-        {/* Editor panel */}
-        <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)",
-            padding: "1rem 1.25rem", overflowY: "auto", maxHeight: 620 }}>
-          {!editing ? (
-            <div style={{ color: "var(--color-text-secondary)", fontSize: 13, paddingTop: "2rem", textAlign: "center" }}>
-              Select a composite or create a new one
+        {localErr && (
+          <div style={{ background: "#FEE2E2", border: "1px solid #FCA5A5", borderRadius: "var(--border-radius-md)",
+              padding: "8px 12px", marginBottom: "1rem", fontSize: 13, color: "#991B1B" }}>
+            {localErr}
+          </div>
+        )}
+
+        <div style={{ display: "grid", gridTemplateColumns: "220px 1fr", gap: 12, minHeight: "100vh" }}>
+          {/* List panel */}
+          <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)",
+              display: "flex", flexDirection: "column", overflow: "hidden" }}>
+            <div style={{ padding: "8px", borderBottom: "0.5px solid var(--color-border-tertiary)",
+                background: "var(--color-background-secondary)", flexShrink: 0 }}>
+              <Btn primary onClick={startNew} style={{ width: "100%", justifyContent: "center" }}>
+                <i className="ti ti-plus" /> New Composite
+              </Btn>
             </div>
-          ) : (
-            <>
-              {/* Header fields */}
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: "1.25rem" }}>
-                <div>
-                  <label style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em",
-                      color: "var(--color-text-secondary)", display: "block", marginBottom: 4 }}>Name *</label>
-                  <input value={editing.name} onChange={e => setEditing(p => ({ ...p, name: e.target.value }))}
-                    placeholder="e.g. Composite_CM_AO"
-                    style={{ width: "100%", padding: "6px 10px", border: "0.5px solid var(--color-border-secondary)",
-                      borderRadius: "var(--border-radius-md)", fontSize: 13, boxSizing: "border-box",
-                      background: "var(--color-background-primary)", color: "var(--color-text-primary)",
-                      fontFamily: "var(--font-mono)" }} />
+            <div style={{ overflowY: "auto", flex: 1 }}>
+              {composites.length === 0 ? (
+                <div style={{ padding: "1rem", fontSize: 12, color: "var(--color-text-secondary)", textAlign: "center" }}>
+                  No composites yet
                 </div>
-                <div>
-                  <label style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em",
-                      color: "var(--color-text-secondary)", display: "block", marginBottom: 4 }}>Description</label>
-                  <input value={editing.description} onChange={e => setEditing(p => ({ ...p, description: e.target.value }))}
-                    placeholder="Optional description"
-                    style={{ width: "100%", padding: "6px 10px", border: "0.5px solid var(--color-border-secondary)",
-                      borderRadius: "var(--border-radius-md)", fontSize: 13, boxSizing: "border-box",
-                      background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
-                </div>
-              </div>
-
-              {/* Members table */}
-              <div style={{ marginBottom: "1rem" }}>
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-                  <SLabel text="Members" />
-                  <Btn onClick={addMember} style={{ fontSize: 11 }}>
-                    <i className="ti ti-plus" /> Add member
-                  </Btn>
-                </div>
-
-                {editing.members.length === 0 ? (
-                  <div style={{ border: "1.5px dashed var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)",
-                      padding: "1.5rem", textAlign: "center", fontSize: 13, color: "var(--color-text-secondary)" }}>
-                    No members — click "Add member" to start
-                  </div>
-                ) : (
-                  <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-md)", overflow: "hidden" }}>
-                    {/* Table header */}
-                    <div style={{ display: "grid",
-                        gridTemplateColumns: "28px 1fr 110px 95px 95px 96px 56px",
-                        padding: "5px 8px", background: "var(--color-background-secondary)",
-                        borderBottom: "0.5px solid var(--color-border-tertiary)", gap: 6 }}>
-                      {["", "CM Type", "Folder", "Prefix", "Suffix", "Scope", ""].map((h, i) => (
-                        <div key={i} style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
-                            letterSpacing: "0.04em", color: "var(--color-text-secondary)" }}>{h}</div>
-                      ))}
-                    </div>
-
-                    {editing.members.map((m, idx) => (
-                      <div key={idx} style={{ display: "grid",
-                          gridTemplateColumns: "28px 1fr 110px 95px 95px 96px 56px",
-                          padding: "6px 8px", gap: 6, alignItems: "center",
-                          borderBottom: idx < editing.members.length - 1 ? "0.5px solid var(--color-border-tertiary)" : "none",
-                          background: idx % 2 === 0 ? "transparent" : "var(--color-background-secondary)" }}>
-
-                        {/* Reorder */}
-                        <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
-                          <button onClick={() => moveMember(idx, -1)} disabled={idx === 0}
-                            style={{ border: "none", background: "transparent", cursor: idx === 0 ? "default" : "pointer",
-                              color: "var(--color-text-secondary)", fontSize: 11, padding: "1px 2px", lineHeight: 1, opacity: idx === 0 ? 0.3 : 1 }}>
-                            <i className="ti ti-chevron-up" />
-                          </button>
-                          <button onClick={() => moveMember(idx, 1)} disabled={idx === editing.members.length - 1}
-                            style={{ border: "none", background: "transparent",
-                              cursor: idx === editing.members.length - 1 ? "default" : "pointer",
-                              color: "var(--color-text-secondary)", fontSize: 11, padding: "1px 2px", lineHeight: 1,
-                              opacity: idx === editing.members.length - 1 ? 0.3 : 1 }}>
-                            <i className="ti ti-chevron-down" />
-                          </button>
-                        </div>
-
-                        {/* CM Type */}
-                        <select value={m.cm_type_name} onChange={e => updateMember(idx, "cm_type_name", e.target.value)}
-                          style={{ width: "100%", padding: "4px 6px", border: "0.5px solid var(--color-border-secondary)",
-                            borderRadius: "var(--border-radius-md)", fontSize: 12,
-                            background: "var(--color-background-primary)", color: "var(--color-text-primary)",
-                            fontFamily: "var(--font-mono)" }}>
-                          <option value="">— select —</option>
-                          {cmTypeOptions.map(t => <option key={t} value={t}>{t}</option>)}
-                        </select>
-
-                        {/* Hierarchy Folder */}
-                        <input value={m.hierarchy_folder} onChange={e => updateMember(idx, "hierarchy_folder", e.target.value)}
-                          placeholder="CM"
-                          style={{ width: "100%", padding: "4px 6px", border: "0.5px solid var(--color-border-secondary)",
-                            borderRadius: "var(--border-radius-md)", fontSize: 12, boxSizing: "border-box",
-                            background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
-
-                        {/* Prefix */}
-                        <input value={m.name_prefix} onChange={e => updateMember(idx, "name_prefix", e.target.value)}
-                          placeholder="e.g. NIF_"
-                          style={{ width: "100%", padding: "4px 6px", border: "0.5px solid var(--color-border-secondary)",
-                            borderRadius: "var(--border-radius-md)", fontSize: 12, boxSizing: "border-box",
-                            background: "var(--color-background-primary)", color: "var(--color-text-primary)",
-                            fontFamily: "var(--font-mono)" }} />
-
-                        {/* Suffix */}
-                        <input value={m.name_suffix} onChange={e => updateMember(idx, "name_suffix", e.target.value)}
-                          placeholder="e.g. _1"
-                          style={{ width: "100%", padding: "4px 6px", border: "0.5px solid var(--color-border-secondary)",
-                            borderRadius: "var(--border-radius-md)", fontSize: 12, boxSizing: "border-box",
-                            background: "var(--color-background-primary)", color: "var(--color-text-primary)",
-                            fontFamily: "var(--font-mono)" }} />
-
-                        {/* Scope — unit (per unit) vs project (one shared instance) */}
-                        <select value={m.scope || "unit"} onChange={e => updateMember(idx, "scope", e.target.value)}
-                          title="Unit: one instance per unit. Project: a single shared instance per User Project."
-                          style={{ width: "100%", padding: "4px 6px", border: "0.5px solid var(--color-border-secondary)",
-                            borderRadius: "var(--border-radius-md)", fontSize: 11, boxSizing: "border-box",
-                            background: m.scope === "project" ? "#FEF3C7" : "var(--color-background-primary)",
-                            color: "var(--color-text-primary)" }}>
-                          <option value="unit">Unit</option>
-                          <option value="project">Project</option>
-                        </select>
-
-                        {/* Remove */}
-                        <button onClick={() => removeMember(idx)}
-                          style={{ border: "none", background: "transparent", cursor: "pointer",
-                            color: "#DC2626", fontSize: 14, padding: "2px 4px" }}>
-                          <i className="ti ti-x" />
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {/* Naming preview */}
-                {editing.members.length > 0 && editing.members.some(m => m.cm_type_name) && (
-                  <div style={{ marginTop: 10, padding: "8px 12px",
-                      background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)",
-                      border: "0.5px solid var(--color-border-tertiary)" }}>
-                    <div style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em",
-                        color: "var(--color-text-secondary)", marginBottom: 6 }}>
-                      Naming preview (base name = "TAG")
-                    </div>
-                    {editing.members.filter(m => m.cm_type_name).map((m, i) => {
-                      const derivedName = `${m.name_prefix || ""}TAG${m.name_suffix || ""}`;
-                      return (
-                        <div key={i} style={{ display: "flex", gap: 10, alignItems: "center",
-                            fontSize: 12, marginBottom: 3, fontFamily: "var(--font-mono)" }}>
-                          <span style={{ color: "var(--color-text-secondary)", minWidth: 130, overflow: "hidden",
-                              textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.cm_type_name}</span>
-                          <span style={{ color: "var(--color-text-secondary)" }}>→</span>
-                          <span style={{ fontWeight: 500 }}>{derivedName}</span>
-                          <span style={{ color: "var(--color-text-secondary)", fontSize: 11 }}>
-                            in <em>{m.hierarchy_folder || "CM"}</em>
-                            {m.scope === "project" && <span style={{ marginLeft: 6, padding: "1px 5px", borderRadius: 4,
-                                background: "#FEF3C7", color: "#92400E", fontSize: 10, fontWeight: 600,
-                                fontFamily: "var(--font-sans)" }}>project · shared</span>}
-                          </span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-
-              {/* Matrix toggle — shown after members are defined */}
-              <div style={{ marginBottom: "1rem", display: "flex", alignItems: "center", gap: 10,
-                  padding: "8px 12px", background: editing.is_matrix ? "#F0FDF4" : "var(--color-background-secondary)",
-                  borderRadius: "var(--border-radius-md)", border: `0.5px solid ${editing.is_matrix ? "#86EFAC" : "var(--color-border-tertiary)"}` }}>
-                <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 13 }}>
-                  <input type="checkbox" checked={!!editing.is_matrix}
-                    onChange={e => setEditing(p => ({ ...p, is_matrix: e.target.checked }))} />
-                  <span style={{ fontWeight: 600 }}>Matrix CM</span>
-                </label>
-                <span style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>
-                  {editing.is_matrix
-                    ? "Matrix grid is active — configure modes and valve states below"
-                    : "Enable to configure an IEMT_MTX mode × valve state grid for this composite"}
-                </span>
-              </div>
-
-              {/* ── Matrix editor ─────────────────────────────────────────── */}
-              {editing.is_matrix && (() => {
-                const columns    = editing.matrixColumns || [];
-                const modes      = editing.matrixModes   || [];
-                const cellSx     = { padding: "2px 4px", border: "0.5px solid var(--color-border-secondary)",
-                  borderRadius: "var(--border-radius-md)", fontSize: 11, boxSizing: "border-box",
-                  background: "var(--color-background-primary)", color: "var(--color-text-primary)", width: "100%" };
-
-                function addColumn() {
-                  setEditing(p => ({ ...p, matrixColumns: [...(p.matrixColumns || []), ""] }));
-                }
-                function updateColumn(ci, val) {
-                  setEditing(p => {
-                    const matrixColumns = [...(p.matrixColumns || [])];
-                    const oldName = matrixColumns[ci];
-                    matrixColumns[ci] = val;
-                    const matrixModes = (p.matrixModes || []).map(m => {
-                      const cells = { ...m.cells };
-                      if (oldName && cells[oldName] !== undefined) {
-                        cells[val] = cells[oldName];
-                        delete cells[oldName];
-                      }
-                      return { ...m, cells };
-                    });
-                    return { ...p, matrixColumns, matrixModes };
-                  });
-                }
-                function removeColumn(ci) {
-                  setEditing(p => {
-                    const colName = (p.matrixColumns || [])[ci];
-                    const matrixColumns = (p.matrixColumns || []).filter((_, i) => i !== ci);
-                    const matrixModes = (p.matrixModes || []).map(m => {
-                      const cells = { ...m.cells };
-                      delete cells[colName];
-                      return { ...m, cells };
-                    });
-                    return { ...p, matrixColumns, matrixModes };
-                  });
-                }
-                function addMode() {
-                  setEditing(p => {
-                    const modes = p.matrixModes || [];
-                    const maxNr = modes.reduce((mx, m) => Math.max(mx, m.mode_nr ?? 0), 0);
-                    return { ...p, matrixModes: [...modes, { mode_nr: maxNr + 1, mode_name: "", cells: {} }] };
-                  });
-                }
-                function removeMode(mi) {
-                  setEditing(p => ({ ...p, matrixModes: (p.matrixModes || []).filter((_, i) => i !== mi) }));
-                }
-                function updateModeField(mi, key, val) {
-                  setEditing(p => ({
-                    ...p,
-                    matrixModes: (p.matrixModes || []).map((m, i) =>
-                      i === mi ? { ...m, [key]: key === "mode_nr" ? (parseInt(val) || 0) : val } : m
-                    ),
-                  }));
-                }
-                function setCell(mi, colName, rawVal) {
-                  const intVal = parseInt(rawVal);
-                  setEditing(p => ({
-                    ...p,
-                    matrixModes: (p.matrixModes || []).map((m, i) =>
-                      i === mi ? { ...m, cells: { ...m.cells, [colName]: isNaN(intVal) ? 0 : intVal } } : m
-                    ),
-                  }));
-                }
-
-                // Shared styles for the header row background
-                const hdrBg = "var(--color-background-secondary)";
-                const borderH = "0.5px solid var(--color-border-tertiary)";
-
-                function exportCsv() {
-                  const SEP = ",";
-                  const esc = v => {
-                    const s = String(v);
-                    return /[,"\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-                  };
-                  // "sep=," as first line tells Excel which delimiter to use regardless of locale.
-                  // Mode headers formatted as "Nr. Name" — plain text, no colon, easy to read in Excel.
-                  const hdr = [esc("CM \\ Mode"), ...modes.map(m => esc(`${m.mode_nr ?? m.mode_nr}. ${m.mode_name ?? ""}`))];
-                  const dataRows = columns.map(colName => [
-                    esc(colName),
-                    ...modes.map(m => esc((m.cells || {})[colName] ?? 0)),
-                  ]);
-                  // UTF-8 BOM (﻿) makes Excel open without the encoding/import dialog
-                  const csv = "﻿" + [`sep=${SEP}`, hdr, ...dataRows].map(r =>
-                    Array.isArray(r) ? r.join(SEP) : r
-                  ).join("\r\n");
-                  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-                  const url = URL.createObjectURL(blob);
-                  const a = document.createElement("a");
-                  a.href = url; a.download = `${editing.name || "matrix"}.csv`;
-                  a.click();
-                  URL.revokeObjectURL(url);
-                }
-
-                function importCsv(file) {
-                  const reader = new FileReader();
-                  reader.onload = e => {
-                    // Strip BOM if present, normalise line endings
-                    let text = e.target.result.replace(/^﻿/, "");
-                    text = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-
-                    // Auto-detect separator from the first line (handles locales that save with ;)
-                    const firstLine = text.split("\n")[0] || "";
-                    const SEP = firstLine.includes(";") && !firstLine.includes(",") ? ";" : ",";
-
-                    const parseRow = line => {
-                      const cells = []; let cur = ""; let inQ = false;
-                      for (let i = 0; i < line.length; i++) {
-                        const ch = line[i];
-                        if (inQ) {
-                          if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; }
-                          else if (ch === '"') { inQ = false; }
-                          else cur += ch;
-                        } else {
-                          if (ch === '"') { inQ = true; }
-                          else if (ch === SEP) { cells.push(cur.trim()); cur = ""; }
-                          else cur += ch;
-                        }
-                      }
-                      cells.push(cur.trim());
-                      return cells;
-                    };
-
-                    let lines = text.split("\n").filter(l => l.trim());
-                    // Skip "sep=X" hint line if present
-                    if (lines.length && /^sep=/i.test(lines[0])) lines = lines.slice(1);
-                    if (lines.length < 2) return;
-
-                    const headerCells = parseRow(lines[0]);
-                    // headerCells[0] = corner cell (ignored). Rest = mode headers "Nr. Name"
-                    // Accepts: "1. Auto", "1:Auto", "1 - Auto", or bare "Auto"
-                    const newModes = headerCells.slice(1).map((h, i) => {
-                      const m = h.match(/^(\d+)[.\-: ]+(.*)$/);
-                      const nr = m ? (parseInt(m[1]) || i + 1) : i + 1;
-                      const name = m ? m[2].trim() : h.trim();
-                      return { mode_nr: nr, mode_name: name, cells: {} };
-                    });
-
-                    const newColumns = [];
-                    for (let ri = 1; ri < lines.length; ri++) {
-                      const cells = parseRow(lines[ri]);
-                      const cmName = cells[0] || "";
-                      if (!cmName) continue;
-                      newColumns.push(cmName);
-                      newModes.forEach((m, mi) => {
-                        const raw = cells[mi + 1] ?? "";
-                        const v = parseInt(raw);
-                        m.cells[cmName] = isNaN(v) ? 0 : v;
-                      });
-                    }
-                    setEditing(p => ({ ...p, matrixColumns: newColumns, matrixModes: newModes }));
-                  };
-                  reader.readAsText(file, "UTF-8");
-                }
-
-                return (
-                  <div style={{ marginBottom: "1.25rem" }}>
-                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 2 }}>
-                      <SLabel text="Mode × CM Matrix" />
-                      <div style={{ display: "flex", gap: 6 }}>
-                        <Btn onClick={exportCsv} style={{ fontSize: 11 }}
-                          title="Export matrix to CSV (open in Excel, edit, then re-import)">
-                          <i className="ti ti-download" /> Export CSV
-                        </Btn>
-                        <label style={{ display: "inline-flex", alignItems: "center", gap: 4,
-                            cursor: "pointer", fontSize: 11,
-                            padding: "4px 10px", borderRadius: "var(--border-radius-md)",
-                            border: "0.5px solid var(--color-border-secondary)",
-                            background: "var(--color-background-primary)",
-                            color: "var(--color-text-primary)", userSelect: "none" }}
-                          title="Import a previously exported CSV (replaces current matrix)">
-                          <i className="ti ti-upload" /> Import CSV
-                          <input type="file" accept=".csv" style={{ display: "none" }}
-                            onChange={e => { const f = e.target.files[0]; if (f) { importCsv(f); e.target.value = ""; } }} />
-                        </label>
-                      </div>
-                    </div>
-
-                    {columns.length === 0 && modes.length === 0 ? (
-                      <div style={{ border: "1.5px dashed var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)",
-                          padding: "1rem", textAlign: "center", fontSize: 12, color: "var(--color-text-secondary)", marginTop: 8 }}>
-                        No CMs or modes yet — use the buttons inside the table to start
-                      </div>
-                    ) : null}
-
-                    <div style={{ overflowX: "auto", marginTop: 8 }}>
-                      <table style={{ borderCollapse: "collapse", fontSize: 11 }}>
-                        <thead>
-                          <tr style={{ background: hdrBg }}>
-
-                            {/* ── Corner cell: diagonal split "Mode / CM" ── */}
-                            <th style={{ position: "relative", width: 110, minWidth: 110,
-                                padding: 0, borderBottom: borderH, borderRight: borderH,
-                                background: hdrBg }}>
-                              <svg style={{ position: "absolute", inset: 0, width: "100%", height: "100%",
-                                  pointerEvents: "none" }} preserveAspectRatio="none">
-                                <line x1="0" y1="0" x2="100%" y2="100%"
-                                  stroke="var(--color-border-tertiary)" strokeWidth="1" />
-                              </svg>
-                              {/* "Mode" in upper-right — describes the column axis */}
-                              <span style={{ position: "absolute", top: 5, right: 7,
-                                  fontSize: 10, fontWeight: 600, color: "var(--color-text-secondary)",
-                                  lineHeight: 1, userSelect: "none" }}>
-                                Mode
-                              </span>
-                              {/* "CM" in lower-left — describes the row axis */}
-                              <span style={{ position: "absolute", bottom: 5, left: 7,
-                                  fontSize: 10, fontWeight: 600, color: "var(--color-text-secondary)",
-                                  lineHeight: 1, userSelect: "none" }}>
-                                CM
-                              </span>
-                              {/* Invisible spacer so the th has height */}
-                              <div style={{ visibility: "hidden", padding: "14px 8px", fontSize: 10 }}>CM{"\n"}Mode</div>
-                            </th>
-
-                            {/* ── One <th> per mode: Nr input + Name input + X ── */}
-                            {modes.map((mode, mi) => (
-                              <th key={mi} style={{ padding: "5px 6px", borderBottom: borderH,
-                                  borderRight: borderH, textAlign: "center", minWidth: 140,
-                                  verticalAlign: "bottom", background: hdrBg }}>
-                                <div style={{ display: "flex", flexDirection: "column", gap: 3, alignItems: "stretch" }}>
-                                  <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
-                                    <input type="number" value={mode.mode_nr ?? mi + 1} min={1}
-                                      onChange={e => updateModeField(mi, "mode_nr", e.target.value)}
-                                      style={{ ...cellSx, width: 42, textAlign: "center",
-                                        fontFamily: "var(--font-mono)", fontWeight: 600 }} />
-                                    {/* X: delete this mode column */}
-                                    <button onClick={() => removeMode(mi)}
-                                      style={{ border: "none", background: "transparent", cursor: "pointer",
-                                        color: "#DC2626", fontSize: 13, padding: "0 2px", marginLeft: "auto" }}>
-                                      <i className="ti ti-x" />
-                                    </button>
-                                  </div>
-                                  <input value={mode.mode_name ?? ""} placeholder="e.g. Auto"
-                                    onChange={e => updateModeField(mi, "mode_name", e.target.value)}
-                                    style={{ ...cellSx, width: "100%" }} />
-                                </div>
-                              </th>
-                            ))}
-
-                            {/* ── "+ Add mode" as the last header cell ── */}
-                            <th style={{ padding: "6px 8px", borderBottom: borderH,
-                                verticalAlign: "middle", background: hdrBg, whiteSpace: "nowrap" }}>
-                              <Btn onClick={addMode} style={{ fontSize: 11 }}>
-                                <i className="ti ti-plus" /> Add mode
-                              </Btn>
-                            </th>
-                          </tr>
-                        </thead>
-
-                        <tbody>
-                          {/* ── One row per CM ── */}
-                          {columns.map((colName, ci) => (
-                            <tr key={ci} style={{ borderBottom: borderH,
-                                background: ci % 2 === 0 ? "transparent" : hdrBg }}>
-
-                              {/* X then editable CM name — delete is at the START for easy scanning */}
-                              <td style={{ padding: "3px 6px", borderRight: borderH, whiteSpace: "nowrap" }}>
-                                <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                                  <button onClick={() => removeColumn(ci)}
-                                    style={{ border: "none", background: "transparent", cursor: "pointer",
-                                      color: "#DC2626", fontSize: 13, padding: "0 2px", flexShrink: 0 }}>
-                                    <i className="ti ti-x" />
-                                  </button>
-                                  <input value={colName} onChange={e => updateColumn(ci, e.target.value)}
-                                    placeholder={`RCM${String(ci + 1).padStart(2, "0")}`}
-                                    style={{ ...cellSx, width: 90, fontFamily: "var(--font-mono)", fontWeight: 600 }} />
-                                </div>
-                              </td>
-
-                              {/* ── One dropdown cell per mode ── */}
-                              {modes.map((mode, mi) => {
-                                const currentVal = (mode.cells || {})[colName] ?? 0;
-                                const knownOption = valveCommands.find(o => o.value === currentVal);
-                                return (
-                                  <td key={mi} style={{ padding: "3px 6px", borderRight: borderH }}>
-                                    <select
-                                      value={knownOption ? currentVal : "__other__"}
-                                      onChange={e => {
-                                        if (e.target.value !== "__other__") setCell(mi, colName, e.target.value);
-                                      }}
-                                      style={{ ...cellSx, marginBottom: knownOption ? 0 : 3 }}>
-                                      {valveCommands.map(o => (
-                                        <option key={o.value} value={o.value}>{o.label}</option>
-                                      ))}
-                                      <option value="__other__">Other…</option>
-                                    </select>
-                                    {!knownOption && (
-                                      <input type="number" value={currentVal} min={0}
-                                        onChange={e => setCell(mi, colName, e.target.value)}
-                                        placeholder="code"
-                                        style={{ ...cellSx, fontFamily: "var(--font-mono)", marginTop: 2 }} />
-                                    )}
-                                  </td>
-                                );
-                              })}
-
-                              {/* Empty cell under "+ Add mode" column */}
-                              <td />
-                            </tr>
-                          ))}
-
-                          {/* ── "+ Add CM" as the last body row, in the label column ── */}
-                          <tr>
-                            <td style={{ padding: "5px 6px", borderRight: borderH }} colSpan={1}>
-                              <Btn onClick={addColumn} style={{ fontSize: 11 }}>
-                                <i className="ti ti-plus" /> Add CM
-                              </Btn>
-                            </td>
-                            {/* Span remaining mode cells + the add-mode column */}
-                            <td colSpan={modes.length + 1} />
-                          </tr>
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-                );
-              })()}
-
-              {/* ── Connections (Interconnection + Value) ────────────────── */}
-              {!editing.is_matrix && editing.members.length >= 1 && (() => {
-                const namedMembers = editing.members.filter(m => m.cm_type_name);
-                if (namedMembers.length < 1) return null;
-
-                const memberVars  = editing.members.map(m => validVarsCache[m.cm_type_name] || { inputs: [], outputs: [] });
-                const hasAnyValid = memberVars.some(mv => mv.inputs.length || mv.outputs.length);
-
-                const isInterconn = wire.type === "interconnection";
-
-                const fromMember  = isInterconn && wire.fromIdx !== "" ? editing.members[parseInt(wire.fromIdx)] : null;
-                const fromOutputs = fromMember ? (validVarsCache[fromMember.cm_type_name]?.outputs || []) : [];
-                const toMember    = wire.toIdx !== "" ? editing.members[parseInt(wire.toIdx)] : null;
-                const toInputs    = toMember ? (validVarsCache[toMember.cm_type_name]?.inputs || []) : [];
-
-                const canAdd = isInterconn
-                  ? wire.fromIdx !== "" && !!wire.fromVar && wire.toIdx !== "" && !!wire.toVar
-                  : wire.toIdx !== "" && !!wire.toVar && !!wire.staticValue.trim();
-
-                const conns = editing.connections || [];
-
-                // Badge helpers
-                const TagOUT = () => (
-                  <span style={{ padding: "1px 6px", borderRadius: 4, fontSize: 10, fontWeight: 700,
-                      background: "#DCFCE7", color: "#166534", fontFamily: "var(--font-mono)", flexShrink: 0 }}>OUT</span>
-                );
-                const TagIN = () => (
-                  <span style={{ padding: "1px 6px", borderRadius: 4, fontSize: 10, fontWeight: 700,
-                      background: "#DBEAFE", color: "#1D4ED8", fontFamily: "var(--font-mono)", flexShrink: 0 }}>IN</span>
-                );
-                const TagVAL = () => (
-                  <span style={{ padding: "1px 6px", borderRadius: 4, fontSize: 10, fontWeight: 700,
-                      background: "#FEF9C3", color: "#854D0E", fontFamily: "var(--font-mono)", flexShrink: 0 }}>VAL</span>
-                );
-
-                const selStyle = (borderColor) => ({
-                  width: "100%", padding: "5px 6px", border: `0.5px solid ${borderColor}`,
-                  borderRadius: "var(--border-radius-md)", fontSize: 11, boxSizing: "border-box",
-                  background: "var(--color-background-primary)", color: "var(--color-text-primary)",
-                  fontFamily: "var(--font-mono)",
-                });
-
-                return (
-                  <div style={{ marginTop: "1.5rem" }}>
-                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-                      <SLabel text="Connections" />
-                      {!hasAnyValid && (
-                        <span style={{ fontSize: 11, color: "#B45309", background: "#FEF3C7",
-                            padding: "2px 8px", borderRadius: 4, border: "0.5px solid #FDE68A" }}>
-                          Mark input/output variables as "Valid" in Type Configuration first
-                        </span>
+              ) : composites.map(c => (
+                <div key={c.id} onClick={() => selectComposite(c.id)}
+                  style={{ padding: "8px 10px", cursor: "pointer",
+                    borderBottom: "0.5px solid var(--color-border-tertiary)",
+                    background: selectedId === c.id ? "#EEEDFE" : "transparent",
+                    display: "flex", alignItems: "center", gap: 4 }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                      <span style={{ fontSize: 12, fontWeight: 500, fontFamily: "var(--font-mono)" }}>{c.name}</span>
+                      {!!c.is_matrix && (
+                        <span style={{ fontSize: 9, padding: "0 4px", borderRadius: 3,
+                            background: "#DCFCE7", color: "#166534", fontWeight: 700, flexShrink: 0 }}>MTX</span>
                       )}
                     </div>
+                    <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 1 }}>
+                      {c.is_matrix ? "Matrix CM" : `${c.member_count} member${c.member_count !== 1 ? "s" : ""}`}
+                    </div>
+                  </div>
+                  <button onClick={e => { e.stopPropagation(); handleDelete(c.id); }}
+                    style={{ border: "none", background: "transparent", cursor: "pointer",
+                      padding: "2px 4px", color: "var(--color-text-secondary)", fontSize: 13, lineHeight: 1 }}>
+                    <i className="ti ti-trash" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
 
-                    {/* Existing connections list */}
-                    {conns.length > 0 && (
-                      <div style={{ marginBottom: 12, display: "flex", flexDirection: "column", gap: 4 }}>
-                        {conns.map((c, ci) => {
-                          const toM = editing.members[c.to_member_idx];
-                          if (!toM) return null;
-                          const toLabel = `${toM.cm_type_name} · ${c.to_var_name}`;
+          {/* Editor panel */}
+          <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)",
+              padding: "1rem 1.25rem", overflowY: "auto", flex: 1 }}>
+            {!editing ? (
+              <div style={{ color: "var(--color-text-secondary)", fontSize: 13, paddingTop: "2rem", textAlign: "center" }}>
+                Select a composite or create a new one
+              </div>
+            ) : (
+              <>
+                {/* Header fields */}
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: "1.25rem" }}>
+                  <div>
+                    <label style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em",
+                        color: "var(--color-text-secondary)", display: "block", marginBottom: 4 }}>Name *</label>
+                    <input value={editing.name} onChange={e => setEditing(p => ({ ...p, name: e.target.value }))}
+                      placeholder="e.g. Composite_CM_AO"
+                      style={{ width: "100%", padding: "6px 10px", border: "0.5px solid var(--color-border-secondary)",
+                        borderRadius: "var(--border-radius-md)", fontSize: 13, boxSizing: "border-box",
+                        background: "var(--color-background-primary)", color: "var(--color-text-primary)",
+                        fontFamily: "var(--font-mono)" }} />
+                  </div>
+                  <div>
+                    <label style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em",
+                        color: "var(--color-text-secondary)", display: "block", marginBottom: 4 }}>Description</label>
+                    <input value={editing.description} onChange={e => setEditing(p => ({ ...p, description: e.target.value }))}
+                      placeholder="Optional description"
+                      style={{ width: "100%", padding: "6px 10px", border: "0.5px solid var(--color-border-secondary)",
+                        borderRadius: "var(--border-radius-md)", fontSize: 13, boxSizing: "border-box",
+                        background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
+                  </div>
+                </div>
 
-                          if (c.conn_type === "value") {
+                {/* Members table */}
+                <div style={{ marginBottom: "1rem" }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                    <SLabel text="Members" />
+                    <Btn onClick={addMember} style={{ fontSize: 11 }}>
+                      <i className="ti ti-plus" /> Add member
+                    </Btn>
+                  </div>
+
+                  {editing.members.length === 0 ? (
+                    <div style={{ border: "1.5px dashed var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)",
+                        padding: "1.5rem", textAlign: "center", fontSize: 13, color: "var(--color-text-secondary)" }}>
+                      No members — click "Add member" to start
+                    </div>
+                  ) : (
+                    <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-md)", overflow: "hidden" }}>
+                      {/* Table header */}
+                      <div style={{ display: "grid",
+                          gridTemplateColumns: "28px 1fr 110px 95px 95px 96px 56px",
+                          padding: "5px 8px", background: "var(--color-background-secondary)",
+                          borderBottom: "0.5px solid var(--color-border-tertiary)", gap: 6 }}>
+                        {["", "CM Type", "Folder", "Prefix", "Suffix", "Scope", ""].map((h, i) => (
+                          <div key={i} style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                              letterSpacing: "0.04em", color: "var(--color-text-secondary)" }}>{h}</div>
+                        ))}
+                      </div>
+
+                      {editing.members.map((m, idx) => (
+                        <div key={idx} style={{ display: "grid",
+                            gridTemplateColumns: "28px 1fr 110px 95px 95px 96px 56px",
+                            padding: "6px 8px", gap: 6, alignItems: "center",
+                            borderBottom: idx < editing.members.length - 1 ? "0.5px solid var(--color-border-tertiary)" : "none",
+                            background: idx % 2 === 0 ? "transparent" : "var(--color-background-secondary)" }}>
+
+                          {/* Reorder */}
+                          <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
+                            <button onClick={() => moveMember(idx, -1)} disabled={idx === 0}
+                              style={{ border: "none", background: "transparent", cursor: idx === 0 ? "default" : "pointer",
+                                color: "var(--color-text-secondary)", fontSize: 11, padding: "1px 2px", lineHeight: 1, opacity: idx === 0 ? 0.3 : 1 }}>
+                              <i className="ti ti-chevron-up" />
+                            </button>
+                            <button onClick={() => moveMember(idx, 1)} disabled={idx === editing.members.length - 1}
+                              style={{ border: "none", background: "transparent",
+                                cursor: idx === editing.members.length - 1 ? "default" : "pointer",
+                                color: "var(--color-text-secondary)", fontSize: 11, padding: "1px 2px", lineHeight: 1,
+                                opacity: idx === editing.members.length - 1 ? 0.3 : 1 }}>
+                              <i className="ti ti-chevron-down" />
+                            </button>
+                          </div>
+
+                          {/* CM Type */}
+                          <select value={m.cm_type_name} onChange={e => updateMember(idx, "cm_type_name", e.target.value)}
+                            style={{ width: "100%", padding: "4px 6px", border: "0.5px solid var(--color-border-secondary)",
+                              borderRadius: "var(--border-radius-md)", fontSize: 12,
+                              background: "var(--color-background-primary)", color: "var(--color-text-primary)",
+                              fontFamily: "var(--font-mono)" }}>
+                            <option value="">— select —</option>
+                            {cmTypeOptions.map(t => <option key={t} value={t}>{t}</option>)}
+                          </select>
+
+                          {/* Hierarchy Folder */}
+                          <input value={m.hierarchy_folder} onChange={e => updateMember(idx, "hierarchy_folder", e.target.value)}
+                            placeholder="CM"
+                            style={{ width: "100%", padding: "4px 6px", border: "0.5px solid var(--color-border-secondary)",
+                              borderRadius: "var(--border-radius-md)", fontSize: 12, boxSizing: "border-box",
+                              background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
+
+                          {/* Prefix */}
+                          <input value={m.name_prefix} onChange={e => updateMember(idx, "name_prefix", e.target.value)}
+                            placeholder="e.g. NIF_"
+                            style={{ width: "100%", padding: "4px 6px", border: "0.5px solid var(--color-border-secondary)",
+                              borderRadius: "var(--border-radius-md)", fontSize: 12, boxSizing: "border-box",
+                              background: "var(--color-background-primary)", color: "var(--color-text-primary)",
+                              fontFamily: "var(--font-mono)" }} />
+
+                          {/* Suffix */}
+                          <input value={m.name_suffix} onChange={e => updateMember(idx, "name_suffix", e.target.value)}
+                            placeholder="e.g. _1"
+                            style={{ width: "100%", padding: "4px 6px", border: "0.5px solid var(--color-border-secondary)",
+                              borderRadius: "var(--border-radius-md)", fontSize: 12, boxSizing: "border-box",
+                              background: "var(--color-background-primary)", color: "var(--color-text-primary)",
+                              fontFamily: "var(--font-mono)" }} />
+
+                          {/* Scope — unit (per unit) vs project (one shared instance) */}
+                          <select value={m.scope || "unit"} onChange={e => updateMember(idx, "scope", e.target.value)}
+                            title="Unit: one instance per unit. Project: a single shared instance per User Project."
+                            style={{ width: "100%", padding: "4px 6px", border: "0.5px solid var(--color-border-secondary)",
+                              borderRadius: "var(--border-radius-md)", fontSize: 11, boxSizing: "border-box",
+                              background: m.scope === "project" ? "#FEF3C7" : "var(--color-background-primary)",
+                              color: "var(--color-text-primary)" }}>
+                            <option value="unit">Unit</option>
+                            <option value="project">Project</option>
+                          </select>
+
+                          {/* Remove */}
+                          <button onClick={() => removeMember(idx)}
+                            style={{ border: "none", background: "transparent", cursor: "pointer",
+                              color: "#DC2626", fontSize: 14, padding: "2px 4px" }}>
+                            <i className="ti ti-x" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Naming preview */}
+                  {editing.members.length > 0 && editing.members.some(m => m.cm_type_name) && (
+                    <div style={{ marginTop: 10, padding: "8px 12px",
+                        background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)",
+                        border: "0.5px solid var(--color-border-tertiary)" }}>
+                      <div style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em",
+                          color: "var(--color-text-secondary)", marginBottom: 6 }}>
+                        Naming preview (base name = "TAG")
+                      </div>
+                      {editing.members.filter(m => m.cm_type_name).map((m, i) => {
+                        const derivedName = `${m.name_prefix || ""}TAG${m.name_suffix || ""}`;
+                        return (
+                          <div key={i} style={{ display: "flex", gap: 10, alignItems: "center",
+                              fontSize: 12, marginBottom: 3, fontFamily: "var(--font-mono)" }}>
+                            <span style={{ color: "var(--color-text-secondary)", minWidth: 130, overflow: "hidden",
+                                textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.cm_type_name}</span>
+                            <span style={{ color: "var(--color-text-secondary)" }}>→</span>
+                            <span style={{ fontWeight: 500 }}>{derivedName}</span>
+                            <span style={{ color: "var(--color-text-secondary)", fontSize: 11 }}>
+                              in <em>{m.hierarchy_folder || "(unit root — no subfolder)"}</em>
+                              {m.scope === "project" && <span style={{ marginLeft: 6, padding: "1px 5px", borderRadius: 4,
+                                  background: "#FEF3C7", color: "#92400E", fontSize: 10, fontWeight: 600,
+                                  fontFamily: "var(--font-sans)" }}>project · shared</span>}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
+                {/* Matrix toggle — shown after members are defined */}
+                <div style={{ marginBottom: "1rem", display: "flex", alignItems: "center", gap: 10,
+                    padding: "8px 12px", background: editing.is_matrix ? "#F0FDF4" : "var(--color-background-secondary)",
+                    borderRadius: "var(--border-radius-md)", border: `0.5px solid ${editing.is_matrix ? "#86EFAC" : "var(--color-border-tertiary)"}` }}>
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 13 }}>
+                    <input type="checkbox" checked={!!editing.is_matrix}
+                      onChange={e => setEditing(p => ({ ...p, is_matrix: e.target.checked }))} />
+                    <span style={{ fontWeight: 600 }}>Matrix CM</span>
+                  </label>
+                  <span style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>
+                    {editing.is_matrix
+                      ? "Matrix grid is active — configure modes and valve states below"
+                      : "Enable to configure an IEMT_MTX mode × valve state grid for this composite"}
+                  </span>
+                </div>
+
+                {/* ── Matrix editor ─────────────────────────────────────────── */}
+                {editing.is_matrix && (() => {
+                  const columns    = editing.matrixColumns || [];
+                  const modes      = editing.matrixModes   || [];
+                  const cellSx     = { padding: "2px 4px", border: "0.5px solid var(--color-border-secondary)",
+                    borderRadius: "var(--border-radius-md)", fontSize: 11, boxSizing: "border-box",
+                    background: "var(--color-background-primary)", color: "var(--color-text-primary)", width: "100%" };
+
+                  function addColumn() {
+                    setEditing(p => ({ ...p, matrixColumns: [...(p.matrixColumns || []), ""] }));
+                  }
+                  function updateColumn(ci, val) {
+                    setEditing(p => {
+                      const matrixColumns = [...(p.matrixColumns || [])];
+                      const oldName = matrixColumns[ci];
+                      matrixColumns[ci] = val;
+                      const matrixModes = (p.matrixModes || []).map(m => {
+                        const cells = { ...m.cells };
+                        if (oldName && cells[oldName] !== undefined) {
+                          cells[val] = cells[oldName];
+                          delete cells[oldName];
+                        }
+                        return { ...m, cells };
+                      });
+                      return { ...p, matrixColumns, matrixModes };
+                    });
+                  }
+                  function removeColumn(ci) {
+                    setEditing(p => {
+                      const colName = (p.matrixColumns || [])[ci];
+                      const matrixColumns = (p.matrixColumns || []).filter((_, i) => i !== ci);
+                      const matrixModes = (p.matrixModes || []).map(m => {
+                        const cells = { ...m.cells };
+                        delete cells[colName];
+                        return { ...m, cells };
+                      });
+                      return { ...p, matrixColumns, matrixModes };
+                    });
+                  }
+                  function addMode() {
+                    setEditing(p => {
+                      const modes = p.matrixModes || [];
+                      const maxNr = modes.reduce((mx, m) => Math.max(mx, m.mode_nr ?? 0), 0);
+                      return { ...p, matrixModes: [...modes, { mode_nr: maxNr + 1, mode_name: "", cells: {} }] };
+                    });
+                  }
+                  function removeMode(mi) {
+                    setEditing(p => ({ ...p, matrixModes: (p.matrixModes || []).filter((_, i) => i !== mi) }));
+                  }
+                  function updateModeField(mi, key, val) {
+                    setEditing(p => ({
+                      ...p,
+                      matrixModes: (p.matrixModes || []).map((m, i) =>
+                        i === mi ? { ...m, [key]: key === "mode_nr" ? (parseInt(val) || 0) : val } : m
+                      ),
+                    }));
+                  }
+                  function setCell(mi, colName, rawVal) {
+                    const intVal = parseInt(rawVal);
+                    setEditing(p => ({
+                      ...p,
+                      matrixModes: (p.matrixModes || []).map((m, i) =>
+                        i === mi ? { ...m, cells: { ...m.cells, [colName]: isNaN(intVal) ? 0 : intVal } } : m
+                      ),
+                    }));
+                  }
+
+                  // Shared styles for the header row background
+                  const hdrBg = "var(--color-background-secondary)";
+                  const borderH = "0.5px solid var(--color-border-tertiary)";
+
+                  function exportCsv() {
+                    const SEP = ",";
+                    const esc = v => {
+                      const s = String(v);
+                      return /[,"\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+                    };
+                    // "sep=," as first line tells Excel which delimiter to use regardless of locale.
+                    // Mode headers formatted as "Nr. Name" — plain text, no colon, easy to read in Excel.
+                    const hdr = [esc("CM \\ Mode"), ...modes.map(m => esc(`${m.mode_nr ?? m.mode_nr}. ${m.mode_name ?? ""}`))];
+                    const dataRows = columns.map(colName => [
+                      esc(colName),
+                      ...modes.map(m => esc((m.cells || {})[colName] ?? 0)),
+                    ]);
+                    // UTF-8 BOM (﻿) makes Excel open without the encoding/import dialog
+                    const csv = "﻿" + [`sep=${SEP}`, hdr, ...dataRows].map(r =>
+                      Array.isArray(r) ? r.join(SEP) : r
+                    ).join("\r\n");
+                    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url; a.download = `${editing.name || "matrix"}.csv`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  }
+
+                  function importCsv(file) {
+                    const reader = new FileReader();
+                    reader.onload = e => {
+                      // Strip BOM if present, normalise line endings
+                      let text = e.target.result.replace(/^﻿/, "");
+                      text = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
+                      // Auto-detect separator from the first line (handles locales that save with ;)
+                      const firstLine = text.split("\n")[0] || "";
+                      const SEP = firstLine.includes(";") && !firstLine.includes(",") ? ";" : ",";
+
+                      const parseRow = line => {
+                        const cells = []; let cur = ""; let inQ = false;
+                        for (let i = 0; i < line.length; i++) {
+                          const ch = line[i];
+                          if (inQ) {
+                            if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+                            else if (ch === '"') { inQ = false; }
+                            else cur += ch;
+                          } else {
+                            if (ch === '"') { inQ = true; }
+                            else if (ch === SEP) { cells.push(cur.trim()); cur = ""; }
+                            else cur += ch;
+                          }
+                        }
+                        cells.push(cur.trim());
+                        return cells;
+                      };
+
+                      let lines = text.split("\n").filter(l => l.trim());
+                      // Skip "sep=X" hint line if present
+                      if (lines.length && /^sep=/i.test(lines[0])) lines = lines.slice(1);
+                      if (lines.length < 2) return;
+
+                      const headerCells = parseRow(lines[0]);
+                      // headerCells[0] = corner cell (ignored). Rest = mode headers "Nr. Name"
+                      // Accepts: "1. Auto", "1:Auto", "1 - Auto", or bare "Auto"
+                      const newModes = headerCells.slice(1).map((h, i) => {
+                        const m = h.match(/^(\d+)[.\-: ]+(.*)$/);
+                        const nr = m ? (parseInt(m[1]) || i + 1) : i + 1;
+                        const name = m ? m[2].trim() : h.trim();
+                        return { mode_nr: nr, mode_name: name, cells: {} };
+                      });
+
+                      const newColumns = [];
+                      for (let ri = 1; ri < lines.length; ri++) {
+                        const cells = parseRow(lines[ri]);
+                        const cmName = cells[0] || "";
+                        if (!cmName) continue;
+                        newColumns.push(cmName);
+                        newModes.forEach((m, mi) => {
+                          const raw = cells[mi + 1] ?? "";
+                          const v = parseInt(raw);
+                          m.cells[cmName] = isNaN(v) ? 0 : v;
+                        });
+                      }
+                      setEditing(p => ({ ...p, matrixColumns: newColumns, matrixModes: newModes }));
+                    };
+                    reader.readAsText(file, "UTF-8");
+                  }
+
+                  return (
+                    <div style={{ marginBottom: "1.25rem" }}>
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 2 }}>
+                        <SLabel text="Mode × CM Matrix" />
+                        <div style={{ display: "flex", gap: 6 }}>
+                          <Btn onClick={exportCsv} style={{ fontSize: 11 }}
+                            title="Export matrix to CSV (open in Excel, edit, then re-import)">
+                            <i className="ti ti-download" /> Export CSV
+                          </Btn>
+                          <label style={{ display: "inline-flex", alignItems: "center", gap: 4,
+                              cursor: "pointer", fontSize: 11,
+                              padding: "4px 10px", borderRadius: "var(--border-radius-md)",
+                              border: "0.5px solid var(--color-border-secondary)",
+                              background: "var(--color-background-primary)",
+                              color: "var(--color-text-primary)", userSelect: "none" }}
+                            title="Import a previously exported CSV (replaces current matrix)">
+                            <i className="ti ti-upload" /> Import CSV
+                            <input type="file" accept=".csv" style={{ display: "none" }}
+                              onChange={e => { const f = e.target.files[0]; if (f) { importCsv(f); e.target.value = ""; } }} />
+                          </label>
+                        </div>
+                      </div>
+
+                      {columns.length === 0 && modes.length === 0 ? (
+                        <div style={{ border: "1.5px dashed var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)",
+                            padding: "1rem", textAlign: "center", fontSize: 12, color: "var(--color-text-secondary)", marginTop: 8 }}>
+                          No CMs or modes yet — use the buttons inside the table to start
+                        </div>
+                      ) : null}
+
+                      <div style={{ overflowX: "auto", marginTop: 8 }}>
+                        <table style={{ borderCollapse: "collapse", fontSize: 11 }}>
+                          <thead>
+                            <tr style={{ background: hdrBg }}>
+
+                              {/* ── Corner cell: diagonal split "Mode / CM" ── */}
+                              <th style={{ position: "relative", width: 110, minWidth: 110,
+                                  padding: 0, borderBottom: borderH, borderRight: borderH,
+                                  background: hdrBg }}>
+                                <svg style={{ position: "absolute", inset: 0, width: "100%", height: "100%",
+                                    pointerEvents: "none" }} preserveAspectRatio="none">
+                                  <line x1="0" y1="0" x2="100%" y2="100%"
+                                    stroke="var(--color-border-tertiary)" strokeWidth="1" />
+                                </svg>
+                                {/* "Mode" in upper-right — describes the column axis */}
+                                <span style={{ position: "absolute", top: 5, right: 7,
+                                    fontSize: 10, fontWeight: 600, color: "var(--color-text-secondary)",
+                                    lineHeight: 1, userSelect: "none" }}>
+                                  Mode
+                                </span>
+                                {/* "CM" in lower-left — describes the row axis */}
+                                <span style={{ position: "absolute", bottom: 5, left: 7,
+                                    fontSize: 10, fontWeight: 600, color: "var(--color-text-secondary)",
+                                    lineHeight: 1, userSelect: "none" }}>
+                                  CM
+                                </span>
+                                {/* Invisible spacer so the th has height */}
+                                <div style={{ visibility: "hidden", padding: "14px 8px", fontSize: 10 }}>CM{"\n"}Mode</div>
+                              </th>
+
+                              {/* ── One <th> per mode: Nr input + Name input + X ── */}
+                              {modes.map((mode, mi) => (
+                                <th key={mi} style={{ padding: "5px 6px", borderBottom: borderH,
+                                    borderRight: borderH, textAlign: "center", minWidth: 140,
+                                    verticalAlign: "bottom", background: hdrBg }}>
+                                  <div style={{ display: "flex", flexDirection: "column", gap: 3, alignItems: "stretch" }}>
+                                    <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+                                      <input type="number" value={mode.mode_nr ?? mi + 1} min={1}
+                                        onChange={e => updateModeField(mi, "mode_nr", e.target.value)}
+                                        style={{ ...cellSx, width: 42, textAlign: "center",
+                                          fontFamily: "var(--font-mono)", fontWeight: 600 }} />
+                                      {/* X: delete this mode column */}
+                                      <button onClick={() => removeMode(mi)}
+                                        style={{ border: "none", background: "transparent", cursor: "pointer",
+                                          color: "#DC2626", fontSize: 13, padding: "0 2px", marginLeft: "auto" }}>
+                                        <i className="ti ti-x" />
+                                      </button>
+                                    </div>
+                                    <input value={mode.mode_name ?? ""} placeholder="e.g. Auto"
+                                      onChange={e => updateModeField(mi, "mode_name", e.target.value)}
+                                      style={{ ...cellSx, width: "100%" }} />
+                                  </div>
+                                </th>
+                              ))}
+
+                              {/* ── "+ Add mode" as the last header cell ── */}
+                              <th style={{ padding: "6px 8px", borderBottom: borderH,
+                                  verticalAlign: "middle", background: hdrBg, whiteSpace: "nowrap" }}>
+                                <Btn onClick={addMode} style={{ fontSize: 11 }}>
+                                  <i className="ti ti-plus" /> Add mode
+                                </Btn>
+                              </th>
+                            </tr>
+                          </thead>
+
+                          <tbody>
+                            {/* ── One row per CM ── */}
+                            {columns.map((colName, ci) => (
+                              <tr key={ci} style={{ borderBottom: borderH,
+                                  background: ci % 2 === 0 ? "transparent" : hdrBg }}>
+
+                                {/* X then editable CM name — delete is at the START for easy scanning */}
+                                <td style={{ padding: "3px 6px", borderRight: borderH, whiteSpace: "nowrap" }}>
+                                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                                    <button onClick={() => removeColumn(ci)}
+                                      style={{ border: "none", background: "transparent", cursor: "pointer",
+                                        color: "#DC2626", fontSize: 13, padding: "0 2px", flexShrink: 0 }}>
+                                      <i className="ti ti-x" />
+                                    </button>
+                                    <input value={colName} onChange={e => updateColumn(ci, e.target.value)}
+                                      placeholder={`RCM${String(ci + 1).padStart(2, "0")}`}
+                                      style={{ ...cellSx, width: 90, fontFamily: "var(--font-mono)", fontWeight: 600 }} />
+                                  </div>
+                                </td>
+
+                                {/* ── One dropdown cell per mode ── */}
+                                {modes.map((mode, mi) => {
+                                  const currentVal = (mode.cells || {})[colName] ?? 0;
+                                  const knownOption = valveCommands.find(o => o.value === currentVal);
+                                  return (
+                                    <td key={mi} style={{ padding: "3px 6px", borderRight: borderH }}>
+                                      <select
+                                        value={knownOption ? currentVal : "__other__"}
+                                        onChange={e => {
+                                          if (e.target.value !== "__other__") setCell(mi, colName, e.target.value);
+                                        }}
+                                        style={{ ...cellSx, marginBottom: knownOption ? 0 : 3 }}>
+                                        {valveCommands.map(o => (
+                                          <option key={o.value} value={o.value}>{o.label}</option>
+                                        ))}
+                                        <option value="__other__">Other…</option>
+                                      </select>
+                                      {!knownOption && (
+                                        <input type="number" value={currentVal} min={0}
+                                          onChange={e => setCell(mi, colName, e.target.value)}
+                                          placeholder="code"
+                                          style={{ ...cellSx, fontFamily: "var(--font-mono)", marginTop: 2 }} />
+                                      )}
+                                    </td>
+                                  );
+                                })}
+
+                                {/* Empty cell under "+ Add mode" column */}
+                                <td />
+                              </tr>
+                            ))}
+
+                            {/* ── "+ Add CM" as the last body row, in the label column ── */}
+                            <tr>
+                              <td style={{ padding: "5px 6px", borderRight: borderH }} colSpan={1}>
+                                <Btn onClick={addColumn} style={{ fontSize: 11 }}>
+                                  <i className="ti ti-plus" /> Add CM
+                                </Btn>
+                              </td>
+                              {/* Span remaining mode cells + the add-mode column */}
+                              <td colSpan={modes.length + 1} />
+                            </tr>
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                {/* ── Connections (Interconnection + Value + IO) ────────────── */}
+                {!editing.is_matrix && editing.members.length >= 1 && (() => {
+                  const namedMembers = editing.members.filter(m => m.cm_type_name);
+                  if (namedMembers.length < 1) return null;
+
+                  const memberVars  = editing.members.map(m => validVarsCache[m.cm_type_name] || { inputs: [], outputs: [] });
+                  const hasAnyValid = memberVars.some(mv => mv.inputs.length || mv.outputs.length);
+
+                  const isInterconn = wire.type === "interconnection";
+                  const isValue     = wire.type === "value";
+                  const isIo        = wire.type === "io";
+
+                  const fromMember  = isInterconn && wire.fromIdx !== "" ? editing.members[parseInt(wire.fromIdx)] : null;
+                  const fromOutputs = fromMember ? (validVarsCache[fromMember.cm_type_name]?.outputs || []) : [];
+                  const toMember    = wire.toIdx !== "" ? editing.members[parseInt(wire.toIdx)] : null;
+                  const toInputs    = toMember ? (validVarsCache[toMember.cm_type_name]?.inputs || []) : [];
+
+                  const conns = editing.connections || [];
+
+                  // ── IO connection rules (persisted per lib_cm_type via API) ──
+                  const ioRules = editing.members.flatMap((m, mIdx) => {
+                    if (!m.cm_type_name) return [];
+                    const cache = ioRulesCache[m.cm_type_name];
+                    if (!cache) return [];
+                    return (cache.rules || []).map(r => ({ ...r, memberIdx: mIdx, member: m }));
+                  });
+
+                  // Input and output parameters for the selected member (block is derived from the parameter)
+                  // Only show valid parameters (is_valid = 1)
+                  function ioParamsForMember(cmTypeName) {
+                    const cache = ioRulesCache[cmTypeName];
+                    if (!cache) return [];
+                    return (cache.vars || []).filter(v => v.is_valid);
+                  }
+                  const ioMember   = ioWire.memberIdx !== "" ? editing.members[parseInt(ioWire.memberIdx)] : null;
+                  const ioParams   = ioMember ? ioParamsForMember(ioMember.cm_type_name) : [];
+                  const ioSelParam = ioWire.paramKey
+                    ? ioParams.find(v => `${v.block_name}>>${v.name}` === ioWire.paramKey)
+                    : null;
+                  const ioDtype    = ioSelParam?.dtype || "";
+
+                  const canAddIo = ioWire.memberIdx !== "" && !!ioSelParam;
+
+                  function handleAddIoRule() {
+                    if (!canAddIo) return;
+                    setIoErr("");
+                    // Add to connections array like Interconnection/Value
+                    setEditing(prev => ({
+                      ...prev,
+                      connections: [...(prev.connections || []), {
+                        conn_type: 'io_connection',
+                        to_member_idx: parseInt(ioWire.memberIdx),
+                        to_var_name: ioSelParam.name,        // parameter name (pin)
+                        block_name: ioSelParam.block_name,   // block name (derived from param)
+                        prefix: ioWire.prefix,
+                        suffix: ioWire.suffix,
+                        dtype: ioDtype,                      // data type (derived from param)
+                        required: ioWire.required,
+                      }],
+                    }));
+                    setIoWire(w => ({ ...w, paramKey: "", suffix: "", prefix: "" }));
+                  }
+
+                  function handleDeleteIoRule(index) {
+                    setEditing(prev => ({
+                      ...prev,
+                      connections: (prev.connections || []).filter((_, i) => i !== index),
+                    }));
+                  }
+
+                  const isDerived = isValue && wire.valueMode === "derived";
+
+                  const canAdd = isInterconn
+                    ? wire.fromIdx !== "" && !!wire.fromVar && wire.toIdx !== "" && !!wire.toVar
+                    : isValue
+                      ? (isDerived
+                          ? wire.toIdx !== "" && !!wire.toVar && !!wire.column
+                          : wire.toIdx !== "" && !!wire.toVar && !!wire.staticValue.trim())
+                      : false;
+
+                  // Badge helpers
+                  const TagOUT = () => (
+                    <span style={{ padding: "1px 6px", borderRadius: 4, fontSize: 10, fontWeight: 700,
+                        background: "#DCFCE7", color: "#166534", fontFamily: "var(--font-mono)", flexShrink: 0 }}>OUT</span>
+                  );
+                  const TagIN = () => (
+                    <span style={{ padding: "1px 6px", borderRadius: 4, fontSize: 10, fontWeight: 700,
+                        background: "#DBEAFE", color: "#1D4ED8", fontFamily: "var(--font-mono)", flexShrink: 0 }}>IN</span>
+                  );
+                  const TagVAL = () => (
+                    <span style={{ padding: "1px 6px", borderRadius: 4, fontSize: 10, fontWeight: 700,
+                        background: "#FEF9C3", color: "#854D0E", fontFamily: "var(--font-mono)", flexShrink: 0 }}>VAL</span>
+                  );
+                  const TagIO = () => (
+                    <span style={{ padding: "1px 6px", borderRadius: 4, fontSize: 10, fontWeight: 700,
+                        background: "#CCFBF1", color: "#0F766E", fontFamily: "var(--font-mono)", flexShrink: 0 }}>IO</span>
+                  );
+
+                  const selStyle = (borderColor) => ({
+                    width: "100%", padding: "5px 6px", border: `0.5px solid ${borderColor}`,
+                    borderRadius: "var(--border-radius-md)", fontSize: 11, boxSizing: "border-box",
+                    background: "var(--color-background-primary)", color: "var(--color-text-primary)",
+                    fontFamily: "var(--font-mono)",
+                  });
+
+                  const hasAnyConn = conns.length > 0 || ioRules.length > 0;
+
+                  return (
+                    <div style={{ marginTop: "1.5rem" }}>
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                        <SLabel text="Connections" />
+                        {!hasAnyValid && !isIo && (
+                          <span style={{ fontSize: 11, color: "#B45309", background: "#FEF3C7",
+                              padding: "2px 8px", borderRadius: 4, border: "0.5px solid #FDE68A" }}>
+                            Mark input/output variables as "Valid" in Type Configuration first
+                          </span>
+                        )}
+                      </div>
+
+                      {ioErr && (
+                        <div style={{ background: "#FEE2E2", border: "1px solid #FCA5A5", borderRadius: "var(--border-radius-md)",
+                            padding: "5px 10px", marginBottom: 8, fontSize: 12, color: "#991B1B" }}>
+                          {ioErr}
+                        </div>
+                      )}
+
+                      {/* Existing connections list (interconnection + value + IO) */}
+                      {hasAnyConn && (
+                        <div style={{ marginBottom: 12, display: "flex", flexDirection: "column", gap: 4 }}>
+                          {conns.map((c, ci) => {
+                            // IO Connection
+                            if (c.conn_type === 'io_connection') {
+                              const toM = editing.members[c.to_member_idx];
+                              if (!toM) return null;
+                              return (
+                                <div key={ci} style={{ display: "flex", alignItems: "center", gap: 6,
+                                    padding: "5px 10px", background: "#F0FDFA",
+                                    border: "0.5px solid #99F6E4", borderRadius: "var(--border-radius-md)" }}>
+                                  <TagIO />
+                                  <span style={{ fontSize: 11, fontFamily: "var(--font-mono)", color: "var(--color-text-secondary)", flexShrink: 0 }}>
+                                    [{c.to_member_idx}] {toM.cm_type_name}
+                                  </span>
+                                  <span style={{ fontSize: 11, fontFamily: "var(--font-mono)" }}>
+                                    {c.block_name}·{c.to_var_name}
+                                  </span>
+                                  <i className="ti ti-arrow-right" style={{ color: "var(--color-text-secondary)", fontSize: 13 }} />
+                                  <span style={{ fontSize: 11, fontFamily: "var(--font-mono)", fontWeight: 600, color: "#0F766E" }}>
+                                    {c.prefix || ""}<span style={{ color: "#9CA3AF" }}>&lt;tag&gt;</span>{c.suffix || ""}
+                                  </span>
+                                  {c.dtype && (
+                                    <span style={{ padding: "0 5px", borderRadius: 3, fontSize: 10, fontWeight: 700,
+                                        background: "#E0E7FF", color: "#3730A3", fontFamily: "var(--font-mono)" }}>
+                                      {c.dtype}
+                                    </span>
+                                  )}
+                                  {!c.required && (
+                                    <span style={{ padding: "0 5px", borderRadius: 3, fontSize: 10,
+                                        background: "#F3F4F6", color: "#6B7280" }}>optional</span>
+                                  )}
+                                  <div style={{ flex: 1 }} />
+                                  <button onClick={() => handleDeleteIoRule(ci)}
+                                    style={{ border: "none", background: "transparent", cursor: "pointer",
+                                      color: "#DC2626", fontSize: 14, padding: "2px 4px" }}>
+                                    <i className="ti ti-x" />
+                                  </button>
+                                </div>
+                              );
+                            }
+
+                            // Value connection
+                            const toM = editing.members[c.to_member_idx];
+                            if (!toM) return null;
+                            const toLabel = `${toM.cm_type_name} · ${c.to_var_name}`;
+
+                            if (c.conn_type === "value") {
+                              const derived = c.value_mode === "derived";
+                              return (
+                                <div key={ci} style={{ display: "flex", alignItems: "center", gap: 6,
+                                    padding: "5px 10px", background: "#FEFCE8",
+                                    border: "0.5px solid #FDE68A", borderRadius: "var(--border-radius-md)" }}>
+                                  <TagVAL />
+                                  {derived ? (
+                                    <>
+                                      <span style={{ fontSize: 11, fontFamily: "var(--font-mono)", fontWeight: 600, color: "#854D0E" }}>
+                                        {c.prefix || ""}<span style={{ color: "#9CA3AF" }}>&lt;tag&gt;</span>{c.suffix || ""}
+                                      </span>
+                                      <span style={{ padding: "0 5px", borderRadius: 3, fontSize: 10, fontWeight: 700,
+                                          background: "#E0E7FF", color: "#3730A3", fontFamily: "var(--font-mono)" }}>
+                                        {c.column}
+                                      </span>
+                                    </>
+                                  ) : (
+                                    <span style={{ fontSize: 11, fontFamily: "var(--font-mono)", fontWeight: 600, color: "#854D0E" }}>
+                                      {c.static_value}
+                                    </span>
+                                  )}
+                                  <i className="ti ti-arrow-right" style={{ color: "var(--color-text-secondary)", fontSize: 13 }} />
+                                  <TagIN />
+                                  <span style={{ fontSize: 11, fontFamily: "var(--font-mono)" }}>{toLabel}</span>
+                                  <div style={{ flex: 1 }} />
+                                  <button onClick={() => removeConnection(ci)}
+                                    style={{ border: "none", background: "transparent", cursor: "pointer",
+                                      color: "#DC2626", fontSize: 14, padding: "2px 4px" }}>
+                                    <i className="ti ti-x" />
+                                  </button>
+                                </div>
+                              );
+                            }
+
+                            // Interconnection
+                            const fromM = editing.members[c.from_member_idx];
+                            if (!fromM) return null;
+                            const fromLabel = `${fromM.cm_type_name} · ${c.from_var_name}`;
                             return (
                               <div key={ci} style={{ display: "flex", alignItems: "center", gap: 6,
-                                  padding: "5px 10px", background: "#FEFCE8",
-                                  border: "0.5px solid #FDE68A", borderRadius: "var(--border-radius-md)" }}>
-                                <TagVAL />
-                                <span style={{ fontSize: 11, fontFamily: "var(--font-mono)", fontWeight: 600, color: "#854D0E" }}>
-                                  {c.static_value}
-                                </span>
+                                  padding: "5px 10px", background: "var(--color-background-secondary)",
+                                  border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-md)" }}>
+                                <TagOUT />
+                                <span style={{ fontSize: 11, fontFamily: "var(--font-mono)" }}>{fromLabel}</span>
                                 <i className="ti ti-arrow-right" style={{ color: "var(--color-text-secondary)", fontSize: 13 }} />
                                 <TagIN />
                                 <span style={{ fontSize: 11, fontFamily: "var(--font-mono)" }}>{toLabel}</span>
@@ -2376,53 +2833,30 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                                 </button>
                               </div>
                             );
-                          }
+                          })}
+                        </div>
+                      )}
 
-                          // interconnection
-                          const fromM = editing.members[c.from_member_idx];
-                          if (!fromM) return null;
-                          const fromLabel = `${fromM.cm_type_name} · ${c.from_var_name}`;
-                          return (
-                            <div key={ci} style={{ display: "flex", alignItems: "center", gap: 6,
-                                padding: "5px 10px", background: "var(--color-background-secondary)",
-                                border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-md)" }}>
-                              <TagOUT />
-                              <span style={{ fontSize: 11, fontFamily: "var(--font-mono)" }}>{fromLabel}</span>
-                              <i className="ti ti-arrow-right" style={{ color: "var(--color-text-secondary)", fontSize: 13 }} />
-                              <TagIN />
-                              <span style={{ fontSize: 11, fontFamily: "var(--font-mono)" }}>{toLabel}</span>
-                              <div style={{ flex: 1 }} />
-                              <button onClick={() => removeConnection(ci)}
-                                style={{ border: "none", background: "transparent", cursor: "pointer",
-                                  color: "#DC2626", fontSize: 14, padding: "2px 4px" }}>
-                                <i className="ti ti-x" />
-                              </button>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    )}
-
-                    {/* Add-connection row */}
-                    {hasAnyValid && (
+                      {/* Add-connection row */}
                       <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-md)",
                           padding: "10px 12px", background: "var(--color-background-secondary)" }}>
 
                         {/* Type toggle */}
-                        <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+                        <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
                           <div style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase",
                               letterSpacing: "0.04em", color: "var(--color-text-secondary)",
                               alignSelf: "center", marginRight: 4 }}>Type:</div>
                           {[
-                            { val: "interconnection", icon: "ti-arrows-exchange", label: "Interconnection", desc: "Output → Input" },
-                            { val: "value",           icon: "ti-letter-v",        label: "Value",           desc: "Static → Input" },
+                            { val: "interconnection", icon: "ti-arrows-exchange", label: "Interconnection", desc: "Output → Input", on: "#6366F1", bg: "#EEF2FF", fg: "#4338CA" },
+                            { val: "value",           icon: "ti-letter-v",        label: "Value",           desc: "Static → Input", on: "#D97706", bg: "#FEF3C7", fg: "#92400E" },
+                            { val: "io",              icon: "ti-plug-connected",   label: "IO Connection",   desc: "Signal → Pin",   on: "#0D9488", bg: "#CCFBF1", fg: "#0F766E" },
                           ].map(opt => (
-                            <button key={opt.val} onClick={() => setWire(w => ({ ...w, type: opt.val, fromIdx: "", fromVar: "", toIdx: "", toVar: "", staticValue: "" }))}
+                            <button key={opt.val} onClick={() => setWire(w => ({ ...w, type: opt.val, fromIdx: "", fromVar: "", toIdx: "", toVar: "", staticValue: "", valueMode: "static", column: "", prefix: "", suffix: "" }))}
                               style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 10px",
-                                border: `1.5px solid ${wire.type === opt.val ? (opt.val === "interconnection" ? "#6366F1" : "#D97706") : "var(--color-border-secondary)"}`,
+                                border: `1.5px solid ${wire.type === opt.val ? opt.on : "var(--color-border-secondary)"}`,
                                 borderRadius: "var(--border-radius-md)", cursor: "pointer", fontSize: 11, fontWeight: 600,
-                                background: wire.type === opt.val ? (opt.val === "interconnection" ? "#EEF2FF" : "#FEF3C7") : "var(--color-background-primary)",
-                                color: wire.type === opt.val ? (opt.val === "interconnection" ? "#4338CA" : "#92400E") : "var(--color-text-secondary)",
+                                background: wire.type === opt.val ? opt.bg : "var(--color-background-primary)",
+                                color: wire.type === opt.val ? opt.fg : "var(--color-text-secondary)",
                               }}>
                               <i className={`ti ${opt.icon}`} />
                               {opt.label}
@@ -2431,113 +2865,263 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                           ))}
                         </div>
 
-                        {/* Fields row */}
-                        <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+                        {/* IO Connection fields */}
+                        {isIo ? (
+                          <>
+                            <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+                              {/* Member */}
+                              <div style={{ flex: "0 0 180px" }}>
+                                <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                                    letterSpacing: "0.04em", color: "#0F766E", marginBottom: 3 }}>Member</div>
+                                <select value={ioWire.memberIdx}
+                                  onChange={e => setIoWire(w => ({ ...w, memberIdx: e.target.value, paramKey: "" }))}
+                                  style={selStyle("#5EEAD4")}>
+                                  <option value="">— member —</option>
+                                  {editing.members.map((m, mi) => m.cm_type_name ? (
+                                    <option key={mi} value={mi}>[{mi}] {m.cm_type_name}</option>
+                                  ) : null)}
+                                </select>
+                              </div>
 
-                          {/* Source — only for Interconnection */}
-                          {isInterconn && (
-                            <>
+                              {/* Parameter (block derived automatically) */}
                               <div style={{ flex: 1 }}>
                                 <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
-                                    letterSpacing: "0.04em", color: "#166534", marginBottom: 3 }}>Output from member</div>
-                                <div style={{ display: "flex", gap: 4 }}>
-                                  <select value={wire.fromIdx}
-                                    onChange={e => setWire(w => ({ ...w, fromIdx: e.target.value, fromVar: "" }))}
-                                    style={{ ...selStyle("#86EFAC"), flex: "0 0 52%" }}>
-                                    <option value="">— member —</option>
-                                    {editing.members.map((m, mi) => !m.cm_type_name ? null : (
-                                      <option key={mi} value={mi}
-                                        disabled={(validVarsCache[m.cm_type_name]?.outputs || []).length === 0}>
-                                        [{mi}] {m.cm_type_name}{(validVarsCache[m.cm_type_name]?.outputs || []).length === 0 ? " (no valid outputs)" : ""}
+                                    letterSpacing: "0.04em", color: "#0F766E", marginBottom: 3 }}>Parameter</div>
+                                <select value={ioWire.paramKey}
+                                  onChange={e => setIoWire(w => ({ ...w, paramKey: e.target.value }))}
+                                  disabled={!ioParams.length}
+                                  style={selStyle("#5EEAD4")}>
+                                  <option value="">— parameter (input/output) —</option>
+                                  {ioParams.map(v => {
+                                    const dir = /output/i.test(v.dir || "") ? "OUT" : /input/i.test(v.dir || "") ? "IN" : "";
+                                    return (
+                                      <option key={`${v.block_name}>>${v.name}`} value={`${v.block_name}>>${v.name}`}>
+                                        {v.block_name}·{v.name}{v.dtype ? ` (${v.dtype})` : ""}{dir ? ` [${dir}]` : ""}
                                       </option>
-                                    ))}
-                                  </select>
-                                  <select value={wire.fromVar}
-                                    onChange={e => setWire(w => ({ ...w, fromVar: e.target.value }))}
-                                    disabled={!fromOutputs.length}
-                                    style={{ ...selStyle("#86EFAC"), flex: 1 }}>
-                                    <option value="">— output var —</option>
-                                    {fromOutputs.map(v => <option key={v.name} value={v.name}>{v.name}</option>)}
-                                  </select>
+                                    );
+                                  })}
+                                </select>
+                              </div>
+
+                              {/* Data type — derived (read-only) */}
+                              <div style={{ flex: "0 0 80px" }}>
+                                <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                                    letterSpacing: "0.04em", color: "var(--color-text-secondary)", marginBottom: 3 }}>Data type</div>
+                                <div style={{ padding: "5px 6px", border: "0.5px solid var(--color-border-tertiary)",
+                                    borderRadius: "var(--border-radius-md)", fontSize: 11, fontFamily: "var(--font-mono)",
+                                    background: "var(--color-background-secondary)",
+                                    color: ioDtype ? "var(--color-text-primary)" : "var(--color-text-secondary)",
+                                    textAlign: "center", boxSizing: "border-box" }}>
+                                  {ioDtype || "—"}
                                 </div>
                               </div>
-                              <div style={{ fontSize: 18, color: "var(--color-text-secondary)", paddingBottom: 4, flexShrink: 0 }}>→</div>
-                            </>
-                          )}
 
-                          {/* Static value — only for Value */}
-                          {!isInterconn && (
-                            <>
-                              <div style={{ flex: "0 0 160px" }}>
+                              {/* Prefix */}
+                              <div style={{ flex: "0 0 90px" }}>
                                 <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
-                                    letterSpacing: "0.04em", color: "#854D0E", marginBottom: 3 }}>Static value</div>
-                                <input value={wire.staticValue}
-                                  onChange={e => setWire(w => ({ ...w, staticValue: e.target.value }))}
-                                  placeholder='e.g. 1, true, "text"'
-                                  style={{ width: "100%", padding: "5px 6px", border: "0.5px solid #FCD34D",
-                                    borderRadius: "var(--border-radius-md)", fontSize: 11, boxSizing: "border-box",
-                                    background: "var(--color-background-primary)", color: "var(--color-text-primary)",
-                                    fontFamily: "var(--font-mono)" }} />
+                                    letterSpacing: "0.04em", color: "var(--color-text-secondary)", marginBottom: 3 }}>Prefix</div>
+                                <input value={ioWire.prefix}
+                                  onChange={e => setIoWire(w => ({ ...w, prefix: e.target.value }))}
+                                  placeholder="" style={selStyle("var(--color-border-secondary)")} />
                               </div>
-                              <div style={{ fontSize: 18, color: "var(--color-text-secondary)", paddingBottom: 4, flexShrink: 0 }}>→</div>
-                            </>
-                          )}
 
-                          {/* Destination — always shown */}
-                          <div style={{ flex: 1 }}>
-                            <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
-                                letterSpacing: "0.04em", color: "#1D4ED8", marginBottom: 3 }}>Input to member</div>
-                            <div style={{ display: "flex", gap: 4 }}>
-                              <select value={wire.toIdx}
-                                onChange={e => setWire(w => ({ ...w, toIdx: e.target.value, toVar: "" }))}
-                                style={{ ...selStyle("#93C5FD"), flex: "0 0 52%" }}>
-                                <option value="">— member —</option>
-                                {editing.members.map((m, mi) => !m.cm_type_name ? null : (
-                                  <option key={mi} value={mi}
-                                    disabled={(validVarsCache[m.cm_type_name]?.inputs || []).length === 0}>
-                                    [{mi}] {m.cm_type_name}{(validVarsCache[m.cm_type_name]?.inputs || []).length === 0 ? " (no valid inputs)" : ""}
-                                  </option>
-                                ))}
-                              </select>
-                              <select value={wire.toVar}
-                                onChange={e => setWire(w => ({ ...w, toVar: e.target.value }))}
-                                disabled={!toInputs.length}
-                                style={{ ...selStyle("#93C5FD"), flex: 1 }}>
-                                <option value="">— input var —</option>
-                                {toInputs.map(v => <option key={v.name} value={v.name}>{v.name}</option>)}
-                              </select>
+                              {/* Suffix */}
+                              <div style={{ flex: "0 0 90px" }}>
+                                <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                                    letterSpacing: "0.04em", color: "var(--color-text-secondary)", marginBottom: 3 }}>Suffix</div>
+                                <input value={ioWire.suffix}
+                                  onChange={e => setIoWire(w => ({ ...w, suffix: e.target.value }))}
+                                  placeholder="_GSH" style={selStyle("var(--color-border-secondary)")} />
+                              </div>
+
+                              {/* Required */}
+                              <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11,
+                                  paddingBottom: 6, flexShrink: 0, cursor: "pointer" }}
+                                title="If unmatched by hardware, this pin's block is omitted from CM export">
+                                <input type="checkbox" checked={ioWire.required}
+                                  onChange={e => setIoWire(w => ({ ...w, required: e.target.checked }))} />
+                                Req
+                              </label>
+
+                              <Btn primary onClick={handleAddIoRule} disabled={!canAddIo}
+                                style={{ whiteSpace: "nowrap", flexShrink: 0 }}>
+                                <i className="ti ti-plus" /> Add
+                              </Btn>
                             </div>
+
+                            {/* Signal-name preview */}
+                            {ioSelParam && (
+                              <div style={{ marginTop: 8, fontSize: 11, fontFamily: "var(--font-mono)",
+                                  color: "var(--color-text-secondary)" }}>
+                                Signal name: <span style={{ fontWeight: 600, color: "#0F766E" }}>
+                                  {ioWire.prefix || ""}<span style={{ color: "#9CA3AF" }}>XV001</span>{ioWire.suffix || ""}
+                                </span> → {ioSelParam.block_name}·{ioSelParam.name}
+                              </div>
+                            )}
+                          </>
+                        ) : (!hasAnyValid) ? (
+                          <div style={{ fontSize: 12, color: "var(--color-text-secondary)", padding: "4px 2px" }}>
+                            No valid variables marked yet. Go to Library → Type Configuration → Inputs or Outputs tab
+                            and click the plug icon to expose variables for wiring.
                           </div>
+                        ) : (
+                          /* Interconnection / Value fields row */
+                          <div>
+                            {/* Static / Derived slider — only for Value */}
+                            {isValue && (
+                              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                                <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                                    letterSpacing: "0.04em", color: "var(--color-text-secondary)" }}>Value source:</div>
+                                <div style={{ display: "flex", border: "1px solid var(--color-border-secondary)",
+                                    borderRadius: 999, padding: 2, background: "var(--color-background-primary)" }}>
+                                  {[
+                                    { val: "static",  label: "Static" },
+                                    { val: "derived", label: "Derived from IO list" },
+                                  ].map(opt => (
+                                    <button key={opt.val}
+                                      onClick={() => setWire(w => ({ ...w, valueMode: opt.val }))}
+                                      style={{ padding: "3px 12px", borderRadius: 999, border: "none", cursor: "pointer",
+                                        fontSize: 11, fontWeight: 600,
+                                        background: wire.valueMode === opt.val ? "#D97706" : "transparent",
+                                        color: wire.valueMode === opt.val ? "#fff" : "var(--color-text-secondary)" }}>
+                                      {opt.label}
+                                    </button>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
 
-                          <Btn primary onClick={addConnection} disabled={!canAdd}
-                            style={{ whiteSpace: "nowrap", flexShrink: 0 }}>
-                            <i className="ti ti-plus" /> Add
-                          </Btn>
-                        </div>
+                          <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+
+                            {/* Source — only for Interconnection */}
+                            {isInterconn && (
+                              <>
+                                <div style={{ flex: 1 }}>
+                                  <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                                      letterSpacing: "0.04em", color: "#166534", marginBottom: 3 }}>Output from member</div>
+                                  <div style={{ display: "flex", gap: 4 }}>
+                                    <select value={wire.fromIdx}
+                                      onChange={e => setWire(w => ({ ...w, fromIdx: e.target.value, fromVar: "" }))}
+                                      style={{ ...selStyle("#86EFAC"), flex: "0 0 52%" }}>
+                                      <option value="">— member —</option>
+                                      {editing.members.map((m, mi) => !m.cm_type_name ? null : (
+                                        <option key={mi} value={mi}
+                                          disabled={(validVarsCache[m.cm_type_name]?.outputs || []).length === 0}>
+                                          [{mi}] {m.cm_type_name}{(validVarsCache[m.cm_type_name]?.outputs || []).length === 0 ? " (no valid outputs)" : ""}
+                                        </option>
+                                      ))}
+                                    </select>
+                                    <select value={wire.fromVar}
+                                      onChange={e => setWire(w => ({ ...w, fromVar: e.target.value }))}
+                                      disabled={!fromOutputs.length}
+                                      style={{ ...selStyle("#86EFAC"), flex: 1 }}>
+                                      <option value="">— output var —</option>
+                                      {fromOutputs.map(v => <option key={v.name} value={v.name}>{v.name}</option>)}
+                                    </select>
+                                  </div>
+                                </div>
+                                <div style={{ fontSize: 18, color: "var(--color-text-secondary)", paddingBottom: 4, flexShrink: 0 }}>→</div>
+                              </>
+                            )}
+
+                            {/* Static value — only for Value + static mode */}
+                            {isValue && !isDerived && (
+                              <>
+                                <div style={{ flex: "0 0 160px" }}>
+                                  <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                                      letterSpacing: "0.04em", color: "#854D0E", marginBottom: 3 }}>Static value</div>
+                                  <input value={wire.staticValue}
+                                    onChange={e => setWire(w => ({ ...w, staticValue: e.target.value }))}
+                                    placeholder='e.g. 1, true, "text"'
+                                    style={{ width: "100%", padding: "5px 6px", border: "0.5px solid #FCD34D",
+                                      borderRadius: "var(--border-radius-md)", fontSize: 11, boxSizing: "border-box",
+                                      background: "var(--color-background-primary)", color: "var(--color-text-primary)",
+                                      fontFamily: "var(--font-mono)" }} />
+                                </div>
+                                <div style={{ fontSize: 18, color: "var(--color-text-secondary)", paddingBottom: 4, flexShrink: 0 }}>→</div>
+                              </>
+                            )}
+
+                            {/* Derived fields — only for Value + derived mode */}
+                            {isDerived && (
+                              <>
+                                <div style={{ flex: "0 0 90px" }}>
+                                  <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                                      letterSpacing: "0.04em", color: "#854D0E", marginBottom: 3 }}>Prefix</div>
+                                  <input value={wire.prefix}
+                                    onChange={e => setWire(w => ({ ...w, prefix: e.target.value }))}
+                                    placeholder="" style={selStyle("#FCD34D")} />
+                                </div>
+                                <div style={{ flex: "0 0 90px" }}>
+                                  <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                                      letterSpacing: "0.04em", color: "#854D0E", marginBottom: 3 }}>Suffix</div>
+                                  <input value={wire.suffix}
+                                    onChange={e => setWire(w => ({ ...w, suffix: e.target.value }))}
+                                    placeholder="_PV" style={selStyle("#FCD34D")} />
+                                </div>
+                                <div style={{ flex: 1 }}>
+                                  <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                                      letterSpacing: "0.04em", color: "#854D0E", marginBottom: 3 }}>Column</div>
+                                  <select value={wire.column}
+                                    onChange={e => setWire(w => ({ ...w, column: e.target.value }))}
+                                    disabled={!ioColumns.length}
+                                    style={selStyle("#FCD34D")}>
+                                    <option value="">— IO list column —</option>
+                                    {ioColumns.map(h => <option key={h} value={h}>{h}</option>)}
+                                  </select>
+                                </div>
+                                <div style={{ fontSize: 18, color: "var(--color-text-secondary)", paddingBottom: 4, flexShrink: 0 }}>→</div>
+                              </>
+                            )}
+
+                            {/* Destination — always shown for interconnection/value */}
+                            <div style={{ flex: 1 }}>
+                              <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                                  letterSpacing: "0.04em", color: "#1D4ED8", marginBottom: 3 }}>Input to member</div>
+                              <div style={{ display: "flex", gap: 4 }}>
+                                <select value={wire.toIdx}
+                                  onChange={e => setWire(w => ({ ...w, toIdx: e.target.value, toVar: "" }))}
+                                  style={{ ...selStyle("#93C5FD"), flex: "0 0 52%" }}>
+                                  <option value="">— member —</option>
+                                  {editing.members.map((m, mi) => !m.cm_type_name ? null : (
+                                    <option key={mi} value={mi}
+                                      disabled={(validVarsCache[m.cm_type_name]?.inputs || []).length === 0}>
+                                      [{mi}] {m.cm_type_name}{(validVarsCache[m.cm_type_name]?.inputs || []).length === 0 ? " (no valid inputs)" : ""}
+                                    </option>
+                                  ))}
+                                </select>
+                                <select value={wire.toVar}
+                                  onChange={e => setWire(w => ({ ...w, toVar: e.target.value }))}
+                                  disabled={!toInputs.length}
+                                  style={{ ...selStyle("#93C5FD"), flex: 1 }}>
+                                  <option value="">— input var —</option>
+                                  {toInputs.map(v => <option key={v.name} value={v.name}>{v.name}</option>)}
+                                </select>
+                              </div>
+                            </div>
+
+                            <Btn primary onClick={addConnection} disabled={!canAdd}
+                              style={{ whiteSpace: "nowrap", flexShrink: 0 }}>
+                              <i className="ti ti-plus" /> Add
+                            </Btn>
+                          </div>
+                          </div>
+                        )}
                       </div>
-                    )}
+                    </div>
+                  );
+                })()}
 
-                    {conns.length === 0 && !hasAnyValid && (
-                      <div style={{ border: "1.5px dashed var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)",
-                          padding: "1rem", textAlign: "center", fontSize: 12, color: "var(--color-text-secondary)" }}>
-                        No valid variables marked yet. Go to Library → Type Configuration → Inputs or Outputs tab
-                        and click the plug icon to expose variables for wiring.
-                      </div>
-                    )}
-                  </div>
-                );
-              })()}
-
-              {/* Save button */}
-              <div style={{ display: "flex", justifyContent: "flex-end", paddingTop: 12 }}>
-                <Btn primary onClick={handleSave} disabled={busy}>
-                  {busy ? "Saving…" : selectedId ? "Save changes" : "Create composite"}
-                </Btn>
-              </div>
-            </>
-          )}
+                {/* Save button */}
+                <div style={{ display: "flex", justifyContent: "flex-end", paddingTop: 12 }}>
+                  <Btn primary onClick={handleSave} disabled={busy}>
+                    {busy ? "Saving…" : selectedId ? "Save changes" : "Create composite"}
+                  </Btn>
+                </div>
+              </>
+            )}
+          </div>
         </div>
-      </div>
     </div>
   );
 }
@@ -2591,11 +3175,11 @@ function StepHierarchy({ hierarchy, setHierarchy, instances, setInstances, saved
   function addFolder(parentId = null) {
     const sibs = hierarchy.filter(f => (f.parentId ?? null) === parentId);
     setHierarchy([...hierarchy, {
-      id:        newFolderClientId(),
-      parentId,
-      name:      parentId ? "" : "ProcessCell",
-      s88Type:   parentId ? "" : "ProcessCell",
-      sortOrder: sibs.length,
+        id:        newFolderClientId(),
+        parentId,
+        name:      parentId ? "" : "ProcessCell",
+        s88Type:   parentId ? "" : "ProcessCell",
+        sortOrder: sibs.length,
     }]);
   }
   function updateFolder(id, key, value) {
@@ -2606,10 +3190,10 @@ function StepHierarchy({ hierarchy, setHierarchy, instances, setInstances, saved
     const drop = new Set([id]);
     let changed = true;
     while (changed) {
-      changed = false;
-      for (const f of hierarchy) {
-        if (f.parentId && drop.has(f.parentId) && !drop.has(f.id)) { drop.add(f.id); changed = true; }
-      }
+        changed = false;
+        for (const f of hierarchy) {
+          if (f.parentId && drop.has(f.parentId) && !drop.has(f.id)) { drop.add(f.id); changed = true; }
+        }
     }
     const affected = instances.filter(i => drop.has(i.folderId));
     if (affected.length && !window.confirm(`${affected.length} instance(s) are assigned to this folder or its descendants. Removing will clear their folder assignment. Continue?`)) return;
@@ -2621,34 +3205,34 @@ function StepHierarchy({ hierarchy, setHierarchy, instances, setInstances, saved
 
   return (
     <div>
-      <div style={{ marginBottom: "1rem" }}>
-        <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 4 }}>
-          Plant hierarchy {savedProjectName && <span style={{ color: "var(--color-text-secondary)", fontWeight: 400 }}>· {savedProjectName}</span>}
+        <div style={{ marginBottom: "1rem" }}>
+          <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 4 }}>
+            Plant hierarchy {savedProjectName && <span style={{ color: "var(--color-text-secondary)", fontWeight: 400 }}>· {savedProjectName}</span>}
+          </div>
+          <div style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>
+            Build the ISA S88 tree. CM instances are assigned to leaf folders on the next step.
+            Leave empty to fall back to a single auto-created Process cell.
+          </div>
         </div>
-        <div style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>
-          Build the ISA S88 tree. CM instances are assigned to leaf folders on the next step.
-          Leave empty to fall back to a single auto-created Process cell.
-        </div>
-      </div>
 
-      {hierarchy.length === 0 ? (
-        <div style={{ border: "1.5px dashed var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)",
-            padding: "2rem", textAlign: "center", color: "var(--color-text-secondary)", fontSize: 13, marginBottom: "1rem" }}>
-          No hierarchy yet — leave empty for default, or click "Add root folder" below
-        </div>
-      ) : (
-        <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)",
-            padding: "0.5rem 0.75rem", marginBottom: "1rem" }}>
-          {roots.map(r => (
-            <FolderRow key={r.id} folder={r} all={hierarchy} depth={0}
-              onAdd={addFolder} onUpdate={updateFolder} onDelete={deleteFolder} />
-          ))}
-        </div>
-      )}
+        {hierarchy.length === 0 ? (
+          <div style={{ border: "1.5px dashed var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)",
+              padding: "2rem", textAlign: "center", color: "var(--color-text-secondary)", fontSize: 13, marginBottom: "1rem" }}>
+            No hierarchy yet — leave empty for default, or click "Add root folder" below
+          </div>
+        ) : (
+          <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)",
+              padding: "0.5rem 0.75rem", marginBottom: "1rem" }}>
+            {roots.map(r => (
+              <FolderRow key={r.id} folder={r} all={hierarchy} depth={0}
+                onAdd={addFolder} onUpdate={updateFolder} onDelete={deleteFolder} />
+            ))}
+          </div>
+        )}
 
-      <div style={{ display: "flex", justifyContent: "flex-start" }}>
-        <Btn onClick={() => addFolder(null)}><i className="ti ti-plus" /> Add root folder</Btn>
-      </div>
+        <div style={{ display: "flex", justifyContent: "flex-start" }}>
+          <Btn onClick={() => addFolder(null)}><i className="ti ti-plus" /> Add root folder</Btn>
+        </div>
     </div>
   );
 }
@@ -2657,35 +3241,35 @@ function FolderRow({ folder, all, depth, onAdd, onUpdate, onDelete }) {
   const children = all.filter(f => f.parentId === folder.id);
   return (
     <div>
-      <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "4px 0",
-          paddingLeft: depth * 18 }}>
-        <i className="ti ti-folder" style={{ fontSize: 14, color: "var(--color-text-secondary)" }} />
-        <input value={folder.name} onChange={e => onUpdate(folder.id, "name", e.target.value)}
-          placeholder="folder name"
-          style={{ flex: 1, padding: "3px 8px", border: "0.5px solid var(--color-border-secondary)",
-            borderRadius: "var(--border-radius-md)", fontSize: 12, fontFamily: "var(--font-mono)",
-            background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
-        <select value={folder.s88Type || ""} onChange={e => onUpdate(folder.id, "s88Type", e.target.value)}
-          style={{ width: 110, padding: "3px 6px", border: "0.5px solid var(--color-border-secondary)",
-            borderRadius: "var(--border-radius-md)", fontSize: 12,
-            background: "var(--color-background-primary)", color: "var(--color-text-primary)" }}>
-          {S88_TYPES.map(t => <option key={t} value={t}>{t || "— plain —"}</option>)}
-        </select>
-        <button onClick={() => onAdd(folder.id)} title="Add subfolder"
-          style={{ background: "transparent", border: "0.5px solid var(--color-border-secondary)", cursor: "pointer",
-            color: "var(--color-text-secondary)", fontSize: 12, padding: "2px 6px", borderRadius: "var(--border-radius-md)" }}>
-          <i className="ti ti-plus" />
-        </button>
-        <button onClick={() => onDelete(folder.id)} title="Delete folder"
-          style={{ background: "transparent", border: "none", cursor: "pointer",
-            color: "var(--color-text-secondary)", fontSize: 14, padding: 0 }}>
-          <i className="ti ti-trash" />
-        </button>
-      </div>
-      {children.map(c => (
-        <FolderRow key={c.id} folder={c} all={all} depth={depth + 1}
-          onAdd={onAdd} onUpdate={onUpdate} onDelete={onDelete} />
-      ))}
+        <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "4px 0",
+            paddingLeft: depth * 18 }}>
+          <i className="ti ti-folder" style={{ fontSize: 14, color: "var(--color-text-secondary)" }} />
+          <input value={folder.name} onChange={e => onUpdate(folder.id, "name", e.target.value)}
+            placeholder="folder name"
+            style={{ flex: 1, padding: "3px 8px", border: "0.5px solid var(--color-border-secondary)",
+              borderRadius: "var(--border-radius-md)", fontSize: 12, fontFamily: "var(--font-mono)",
+              background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
+          <select value={folder.s88Type || ""} onChange={e => onUpdate(folder.id, "s88Type", e.target.value)}
+            style={{ width: 110, padding: "3px 6px", border: "0.5px solid var(--color-border-secondary)",
+              borderRadius: "var(--border-radius-md)", fontSize: 12,
+              background: "var(--color-background-primary)", color: "var(--color-text-primary)" }}>
+            {S88_TYPES.map(t => <option key={t} value={t}>{t || "— plain —"}</option>)}
+          </select>
+          <button onClick={() => onAdd(folder.id)} title="Add subfolder"
+            style={{ background: "transparent", border: "0.5px solid var(--color-border-secondary)", cursor: "pointer",
+              color: "var(--color-text-secondary)", fontSize: 12, padding: "2px 6px", borderRadius: "var(--border-radius-md)" }}>
+            <i className="ti ti-plus" />
+          </button>
+          <button onClick={() => onDelete(folder.id)} title="Delete folder"
+            style={{ background: "transparent", border: "none", cursor: "pointer",
+              color: "var(--color-text-secondary)", fontSize: 14, padding: 0 }}>
+            <i className="ti ti-trash" />
+          </button>
+        </div>
+        {children.map(c => (
+          <FolderRow key={c.id} folder={c} all={all} depth={depth + 1}
+            onAdd={onAdd} onUpdate={onUpdate} onDelete={onDelete} />
+        ))}
     </div>
   );
 }
@@ -2698,6 +3282,7 @@ function CompositeInstanceModal({ compositeCmTypes, folderOptions, userProjects,
   const [rootFolderId, setRootFolderId] = useState(folderOptions[0]?.id || "");
   const [userProject, setUserProject] = useState(userProjects[0] || "");
   const [compDetail,  setCompDetail]  = useState(null); // full detail with members[]
+  const [memberFolders, setMemberFolders] = useState({}); // memberIdx -> folderId
 
   const inputSx = { padding: "4px 8px", border: "0.5px solid var(--color-border-secondary)",
     borderRadius: "var(--border-radius-md)", fontSize: 12, fontFamily: "var(--font-mono)",
@@ -2705,112 +3290,113 @@ function CompositeInstanceModal({ compositeCmTypes, folderOptions, userProjects,
 
   // Load full detail (with members) whenever the selected composite changes
   useEffect(() => {
-    if (!compositeId) { setCompDetail(null); return; }
-    getCompositeCmType(parseInt(compositeId)).then(setCompDetail).catch(() => setCompDetail(null));
+    if (!compositeId) { setCompDetail(null); setMemberFolders({}); return; }
+    getCompositeCmType(parseInt(compositeId)).then(d => {
+      setCompDetail(d);
+      // Initialize each member with the root folder
+      const folders = {};
+      (d.members || []).forEach((_, i) => {
+        folders[i] = rootFolderId;
+      });
+      setMemberFolders(folders);
+    }).catch(() => { setCompDetail(null); setMemberFolders({}); });
   }, [compositeId]);
+
+  // Update member folders when root folder changes
+  useEffect(() => {
+    setMemberFolders(prev => {
+      const updated = { ...prev };
+      (compDetail?.members || []).forEach((_, i) => {
+        updated[i] = rootFolderId;
+      });
+      return updated;
+    });
+  }, [rootFolderId, compDetail?.members.length]);
+
+  const handleMemberFolderChange = (memberIdx, folderId) => {
+    setMemberFolders(prev => ({ ...prev, [memberIdx]: folderId }));
+  };
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", display: "flex",
-        alignItems: "center", justifyContent: "center", zIndex: 999 }}>
-      <div style={{ background: "var(--color-background-primary)", borderRadius: "var(--border-radius-lg)",
-          padding: 20, width: 460, display: "flex", flexDirection: "column", gap: 12,
-          boxShadow: "0 8px 32px rgba(0,0,0,0.18)" }}>
-        <div style={{ fontWeight: 600, fontSize: 14 }}>Add Composite CM Instances</div>
+          alignItems: "center", justifyContent: "center", zIndex: 999 }}>
+        <div style={{ background: "var(--color-background-primary)", borderRadius: "var(--border-radius-lg)",
+            padding: 20, width: 560, display: "flex", flexDirection: "column", gap: 12,
+            boxShadow: "0 8px 32px rgba(0,0,0,0.18)", maxHeight: "90vh", overflowY: "auto" }}>
+          <div style={{ fontWeight: 600, fontSize: 14 }}>Add Composite CM Instances</div>
 
-        <div>
-          <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 3 }}>Composite Type</div>
-          <select value={compositeId} onChange={e => setCompositeId(e.target.value)} style={inputSx}>
-            {compositeCmTypes.map(c => (
-              <option key={c.id} value={c.id}>{c.name}</option>
-            ))}
-          </select>
-        </div>
-
-        <div>
-          <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 3 }}>
-            Base name (instrument / tag name)
+          <div>
+            <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 3 }}>Composite Type</div>
+            <select value={compositeId} onChange={e => setCompositeId(e.target.value)} style={inputSx}>
+              {compositeCmTypes.map(c => (
+                <option key={c.id} value={c.id}>{c.name}</option>
+              ))}
+            </select>
           </div>
-          <input value={baseName} onChange={e => setBaseName(e.target.value)}
-            placeholder="e.g. TAG_001" autoFocus style={inputSx} />
-        </div>
 
-        <div>
-          <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 3 }}>
-            Root hierarchy folder — sub-types will be placed below this
+          <div>
+            <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 3 }}>
+              Base name (instrument / tag name)
+            </div>
+            <input value={baseName} onChange={e => setBaseName(e.target.value)}
+              placeholder="e.g. TAG_001" autoFocus style={inputSx} />
           </div>
-          <select value={rootFolderId} onChange={e => setRootFolderId(e.target.value)} style={inputSx}>
-            <option value="">(none — top level)</option>
-            {folderOptions.map(f => <option key={f.id} value={f.id}>{f.label}</option>)}
-          </select>
-        </div>
 
-        <div>
-          <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 3 }}>User Project</div>
-          <select value={userProject} onChange={e => setUserProject(e.target.value)} style={inputSx}>
-            <option value="">— none —</option>
-            {userProjects.map(up => <option key={up} value={up}>{up}</option>)}
-          </select>
-        </div>
+          <div>
+            <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 3 }}>User Project</div>
+            <select value={userProject} onChange={e => setUserProject(e.target.value)} style={inputSx}>
+              <option value="">— none —</option>
+              {userProjects.map(up => <option key={up} value={up}>{up}</option>)}
+            </select>
+          </div>
 
-        {/* Preview */}
-        {baseName && compDetail && (
-          <div style={{ background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)",
-              padding: "8px 10px", fontSize: 11 }}>
-            <div style={{ fontWeight: 600, color: "var(--color-text-secondary)", marginBottom: 5,
-                textTransform: "uppercase", letterSpacing: "0.04em" }}>Instance preview</div>
-            <table style={{ borderCollapse: "collapse", width: "100%" }}>
-              <thead>
-                <tr>
-                  {["CM Type", "Instance Name", "Folder"].map(h => (
-                    <th key={h} style={{ textAlign: "left", paddingBottom: 3, fontWeight: 500,
-                        color: "var(--color-text-secondary)", fontSize: 10 }}>{h}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
+          {/* Member folder assignments */}
+          {baseName && compDetail && (compDetail.members || []).length > 0 && (
+            <div style={{ background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)",
+                padding: "12px 14px", fontSize: 11 }}>
+              <div style={{ fontWeight: 600, color: "var(--color-text-secondary)", marginBottom: 10,
+                  textTransform: "uppercase", letterSpacing: "0.04em" }}>Member Placement</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                 {(compDetail.members || []).map((m, i) => {
                   const name = m.is_primary
                     ? baseName
                     : `${m.name_prefix || ""}${baseName}${m.name_suffix || ""}`;
-                  const rootLabel = rootFolderId
-                    ? (folderOptions.find(f => f.id === rootFolderId)?.label || "(top)")
-                    : "(top)";
-                  const folder = m.hierarchy_folder
-                    ? `${rootLabel} / ${m.hierarchy_folder}`
-                    : rootLabel;
                   return (
-                    <tr key={i}>
-                      <td style={{ padding: "1px 6px 1px 0", fontFamily: "var(--font-mono)", color: "var(--color-text-secondary)" }}>
+                    <div key={i}>
+                      <div style={{ fontSize: 10, fontWeight: 600, marginBottom: 4, fontFamily: "var(--font-mono)" }}>
                         {m.cm_type_name || "—"}
-                        {!!compDetail.is_matrix && i === 0 && (
-                          <span style={{ marginLeft: 4, fontSize: 9, padding: "0 4px", borderRadius: 3,
-                              background: "#DCFCE7", color: "#166534", fontWeight: 700 }}>MTX</span>
-                        )}
-                      </td>
-                      <td style={{ padding: "1px 6px 1px 0", fontFamily: "var(--font-mono)", fontWeight: 600 }}>
-                        {name}
-                        {!!m.is_primary && (
-                          <span style={{ marginLeft: 4, fontSize: 9, padding: "0 4px", borderRadius: 4,
-                              background: "#7F77DD", color: "#fff", fontWeight: 600 }}>primary</span>
-                        )}
-                      </td>
-                      <td style={{ padding: "1px 0", color: "var(--color-text-secondary)" }}>{folder}</td>
-                    </tr>
+                        <span style={{ marginLeft: 6, color: "var(--color-text-secondary)", fontWeight: 400 }}>
+                          {name}
+                          {m.is_primary && <span style={{ marginLeft: 4 }}>(primary)</span>}
+                        </span>
+                      </div>
+                      <select
+                        value={memberFolders[i] || ""}
+                        onChange={e => handleMemberFolderChange(i, e.target.value)}
+                        style={{ ...inputSx, fontSize: 11 }}>
+                        <option value="">(none — top level)</option>
+                        {folderOptions.map(f => <option key={f.id} value={f.id}>{f.label}</option>)}
+                      </select>
+                    </div>
                   );
                 })}
-              </tbody>
-            </table>
-          </div>
-        )}
+              </div>
+            </div>
+          )}
 
-        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
-          <Btn onClick={onCancel}>Cancel</Btn>
-          <Btn primary disabled={!baseName.trim() || !compositeId}
-            onClick={() => onConfirm({ compositeId: parseInt(compositeId), baseName: baseName.trim(), rootFolderId, userProject })}>
-            <i className="ti ti-plus" /> Add Instances
-          </Btn>
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+            <Btn onClick={onCancel}>Cancel</Btn>
+            <Btn primary disabled={!baseName.trim() || !compositeId}
+              onClick={() => onConfirm({
+                compositeId: parseInt(compositeId),
+                baseName: baseName.trim(),
+                memberFolders,
+                userProject
+              })}>
+              <i className="ti ti-plus" /> Add Instances
+            </Btn>
+          </div>
         </div>
-      </div>
     </div>
   );
 }
@@ -2823,78 +3409,78 @@ function InstanceRow({
   const isEM = profile?.libType === "EquipmentModule" || profile?.libType === "EquipmentPhase";
   return (
     <div
-      onClick={() => isEM && onSelect(inst.id)}
-      style={{
-        display: "grid", gridTemplateColumns: cols,
-        padding: "5px 10px", alignItems: "center", gap: 4,
-        borderBottom: idx < total - 1 ? "0.5px solid var(--color-border-tertiary)" : "none",
-        cursor: isEM ? "pointer" : "default",
-        background: isSelected ? "#EEEDFE" : "transparent",
-      }}>
-      {/* # */}
-      <div style={{ fontSize: 11, color: "var(--color-text-secondary)", textAlign: "right", paddingRight: 4, fontFamily: "var(--font-mono)" }}>
-        {idx + 1}
-      </div>
-      {/* row selector indicator for EM/EPH */}
-      <div style={{ display: "flex", justifyContent: "center" }}>
-        {isEM && (
-          <div style={{ width: 6, height: 6, borderRadius: "50%",
-            background: isSelected ? "var(--color-text-primary)" : "var(--color-border-secondary)" }} />
-        )}
-      </div>
-      {/* Type dropdown */}
-      <select value={inst.profileId} onClick={e => e.stopPropagation()}
-        onChange={e => updateInstance(inst.id, "profileId", e.target.value)}
-        style={{ width: "100%", padding: "3px 5px", border: "0.5px solid var(--color-border-secondary)",
-          borderRadius: "var(--border-radius-md)", fontSize: 11, fontFamily: "var(--font-mono)",
-          background: "var(--color-background-primary)", color: "var(--color-text-primary)" }}>
-        {cmtProfiles
-          .filter(p => !profile?.libType || p.libType === profile.libType)
-          .map(p => <option key={p.id} value={p.id}>{p.cmType}</option>)}
-      </select>
-      {/* Instance name */}
-      <input value={inst.instanceName} onClick={e => e.stopPropagation()}
-        onChange={e => updateInstance(inst.id, "instanceName", e.target.value)}
-        title={isDuplicateName ? "Duplicate name — must be unique" : undefined}
-        style={{ width: "100%", padding: "3px 7px",
-          border: `0.5px solid ${isDuplicateName ? "#DC2626" : "var(--color-border-secondary)"}`,
-          borderRadius: "var(--border-radius-md)", fontSize: 11, fontFamily: "var(--font-mono)",
-          background: isDuplicateName ? "#FEF2F2" : "var(--color-background-primary)",
-          color: "var(--color-text-primary)" }} />
-      {/* Sampling time */}
-      <input value={inst.samplingTime} onClick={e => e.stopPropagation()}
-        onChange={e => updateInstance(inst.id, "samplingTime", e.target.value)}
-        style={{ width: "100%", padding: "3px 5px", border: "0.5px solid var(--color-border-secondary)",
-          borderRadius: "var(--border-radius-md)", fontSize: 11,
-          background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
-      {/* User project */}
-      <select value={inst.userProject || ""} onClick={e => e.stopPropagation()}
-        onChange={e => updateInstance(inst.id, "userProject", e.target.value)}
-        style={{ width: "100%", padding: "3px 5px", border: "0.5px solid var(--color-border-secondary)",
-          borderRadius: "var(--border-radius-md)", fontSize: 11, fontFamily: "var(--font-mono)",
-          background: inst.userProject ? "var(--color-background-primary)" : "#FEF3C7",
-          color: "var(--color-text-primary)" }}>
-        <option value="">— pick —</option>
-        {userProjects.map(n => <option key={n} value={n}>{n}</option>)}
-      </select>
-      {/* Folder — any hierarchy level, not just leaves */}
-      <select value={inst.folderId || ""} onClick={e => e.stopPropagation()}
-        onChange={e => updateInstance(inst.id, "folderId", e.target.value)}
-        disabled={!hasHierarchy}
-        style={{ width: "100%", padding: "3px 5px", border: "0.5px solid var(--color-border-secondary)",
-          borderRadius: "var(--border-radius-md)", fontSize: 11, fontFamily: "var(--font-mono)",
-          background: !hasHierarchy ? "var(--color-background-secondary)"
-            : (inst.folderId ? "var(--color-background-primary)" : "#FEF3C7"),
-          color: "var(--color-text-primary)" }}>
-        <option value="">{hasHierarchy ? "— pick —" : "(default)"}</option>
-        {folderOptions.map(l => <option key={l.id} value={l.id}>{l.label}</option>)}
-      </select>
-      {/* Delete */}
-      <button onClick={e => { e.stopPropagation(); removeInstance(inst.id); }}
-        style={{ background: "transparent", border: "none", cursor: "pointer",
-          color: "var(--color-text-secondary)", fontSize: 14, padding: 0, justifySelf: "center" }}>
-        <i className="ti ti-trash" />
-      </button>
+        onClick={() => isEM && onSelect(inst.id)}
+        style={{
+          display: "grid", gridTemplateColumns: cols,
+          padding: "5px 10px", alignItems: "center", gap: 4,
+          borderBottom: idx < total - 1 ? "0.5px solid var(--color-border-tertiary)" : "none",
+          cursor: isEM ? "pointer" : "default",
+          background: isSelected ? "#EEEDFE" : "transparent",
+        }}>
+        {/* # */}
+        <div style={{ fontSize: 11, color: "var(--color-text-secondary)", textAlign: "right", paddingRight: 4, fontFamily: "var(--font-mono)" }}>
+          {idx + 1}
+        </div>
+        {/* row selector indicator for EM/EPH */}
+        <div style={{ display: "flex", justifyContent: "center" }}>
+          {isEM && (
+            <div style={{ width: 6, height: 6, borderRadius: "50%",
+              background: isSelected ? "var(--color-text-primary)" : "var(--color-border-secondary)" }} />
+          )}
+        </div>
+        {/* Type dropdown */}
+        <select value={inst.profileId} onClick={e => e.stopPropagation()}
+          onChange={e => updateInstance(inst.id, "profileId", e.target.value)}
+          style={{ width: "100%", padding: "3px 5px", border: "0.5px solid var(--color-border-secondary)",
+            borderRadius: "var(--border-radius-md)", fontSize: 11, fontFamily: "var(--font-mono)",
+            background: "var(--color-background-primary)", color: "var(--color-text-primary)" }}>
+          {cmtProfiles
+            .filter(p => !profile?.libType || p.libType === profile.libType)
+            .map(p => <option key={p.id} value={p.id}>{p.cmType}</option>)}
+        </select>
+        {/* Instance name */}
+        <input value={inst.instanceName} onClick={e => e.stopPropagation()}
+          onChange={e => updateInstance(inst.id, "instanceName", e.target.value)}
+          title={isDuplicateName ? "Duplicate name — must be unique" : undefined}
+          style={{ width: "100%", padding: "3px 7px",
+            border: `0.5px solid ${isDuplicateName ? "#DC2626" : "var(--color-border-secondary)"}`,
+            borderRadius: "var(--border-radius-md)", fontSize: 11, fontFamily: "var(--font-mono)",
+            background: isDuplicateName ? "#FEF2F2" : "var(--color-background-primary)",
+            color: "var(--color-text-primary)" }} />
+        {/* Sampling time */}
+        <input value={inst.samplingTime} onClick={e => e.stopPropagation()}
+          onChange={e => updateInstance(inst.id, "samplingTime", e.target.value)}
+          style={{ width: "100%", padding: "3px 5px", border: "0.5px solid var(--color-border-secondary)",
+            borderRadius: "var(--border-radius-md)", fontSize: 11,
+            background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
+        {/* User project */}
+        <select value={inst.userProject || ""} onClick={e => e.stopPropagation()}
+          onChange={e => updateInstance(inst.id, "userProject", e.target.value)}
+          style={{ width: "100%", padding: "3px 5px", border: "0.5px solid var(--color-border-secondary)",
+            borderRadius: "var(--border-radius-md)", fontSize: 11, fontFamily: "var(--font-mono)",
+            background: inst.userProject ? "var(--color-background-primary)" : "#FEF3C7",
+            color: "var(--color-text-primary)" }}>
+          <option value="">— pick —</option>
+          {userProjects.map(n => <option key={n} value={n}>{n}</option>)}
+        </select>
+        {/* Folder — any hierarchy level, not just leaves */}
+        <select value={inst.folderId || ""} onClick={e => e.stopPropagation()}
+          onChange={e => updateInstance(inst.id, "folderId", e.target.value)}
+          disabled={!hasHierarchy}
+          style={{ width: "100%", padding: "3px 5px", border: "0.5px solid var(--color-border-secondary)",
+            borderRadius: "var(--border-radius-md)", fontSize: 11, fontFamily: "var(--font-mono)",
+            background: !hasHierarchy ? "var(--color-background-secondary)"
+              : (inst.folderId ? "var(--color-background-primary)" : "#FEF3C7"),
+            color: "var(--color-text-primary)" }}>
+          <option value="">{hasHierarchy ? "— pick —" : "(default)"}</option>
+          {folderOptions.map(l => <option key={l.id} value={l.id}>{l.label}</option>)}
+        </select>
+        {/* Delete */}
+        <button onClick={e => { e.stopPropagation(); removeInstance(inst.id); }}
+          style={{ background: "transparent", border: "none", cursor: "pointer",
+            color: "var(--color-text-secondary)", fontSize: 14, padding: 0, justifySelf: "center" }}>
+          <i className="ti ti-trash" />
+        </button>
     </div>
   );
 }
@@ -2903,10 +3489,10 @@ function InstanceRow({
 function RolePanel({ inst, profile, instances, cmtProfiles, updateInstanceRole }) {
   if (!inst) {
     return (
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%",
-          color: "var(--color-text-secondary)", fontSize: 12 }}>
-        Select an instance to view role assignments
-      </div>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%",
+            color: "var(--color-text-secondary)", fontSize: 12 }}>
+          Select an instance to view role assignments
+        </div>
     );
   }
   const rolesLoaded = profile?.roles !== null && profile?.roles !== undefined;
@@ -2915,63 +3501,82 @@ function RolePanel({ inst, profile, instances, cmtProfiles, updateInstanceRole }
 
   return (
     <div style={{ padding: "12px 14px", display: "flex", flexDirection: "column", gap: 10, height: "100%", overflowY: "auto" }}>
-      <div>
-        <div style={{ fontSize: 13, fontWeight: 600, fontFamily: "var(--font-mono)" }}>{inst.instanceName}</div>
-        <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 1 }}>
-          {profile?.cmType} · {isEPH ? "Equipment Phase" : "Equipment Module"}
+        <div>
+          <div style={{ fontSize: 13, fontWeight: 600, fontFamily: "var(--font-mono)" }}>{inst.instanceName}</div>
+          <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 1 }}>
+            {profile?.cmType} · {isEPH ? "Equipment Phase" : "Equipment Module"}
+          </div>
         </div>
-      </div>
-      <div style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em",
-          color: "var(--color-text-secondary)", borderBottom: "0.5px solid var(--color-border-tertiary)", paddingBottom: 4 }}>
-        Role Assignments
-      </div>
-      {!rolesLoaded ? (
-        <div style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>Loading roles…</div>
-      ) : roles.length === 0 ? (
-        <div style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>No roles defined in library for this type.</div>
-      ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {roles.map(role => {
-            const roleKind = profile?.roleKindMap?.[role] || 'cm';
-            const expectedLibType = roleKind === 'em' ? 'EquipmentModule' : 'ControlModule';
-            const assigned = inst.roleAssignments?.[role] || "";
-            const options = instances.filter(i => {
-              if (i.id === inst.id) return false;
-              const p = cmtProfiles.find(x => x.id === i.profileId);
-              return p?.libType === expectedLibType || (!p?.libType && roleKind === 'cm');
-            });
-            return (
-              <div key={role}>
-                <div style={{ fontSize: 11, fontFamily: "var(--font-mono)", color: "var(--color-text-secondary)", marginBottom: 3 }}>
-                  {role}
-                  <span style={{ marginLeft: 6, fontSize: 10, padding: "1px 5px", borderRadius: 6,
-                    background: roleKind === 'em' ? "#E6F1FB" : "var(--color-background-secondary)",
-                    color: roleKind === 'em' ? "#0C447C" : "var(--color-text-secondary)" }}>
-                    {roleKind === 'em' ? 'EM' : 'CM'}
-                  </span>
+        <div style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em",
+            color: "var(--color-text-secondary)", borderBottom: "0.5px solid var(--color-border-tertiary)", paddingBottom: 4 }}>
+          Role Assignments
+        </div>
+        {!rolesLoaded ? (
+          <div style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>Loading roles…</div>
+        ) : roles.length === 0 ? (
+          <div style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>No roles defined in library for this type.</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {roles.map(role => {
+              const roleKind = profile?.roleKindMap?.[role] || 'cm';
+              const expectedLibType = roleKind === 'em' ? 'EquipmentModule' : 'ControlModule';
+              const assigned = inst.roleAssignments?.[role] || "";
+              const options = instances.filter(i => {
+                if (i.id === inst.id) return false;
+                const p = cmtProfiles.find(x => x.id === i.profileId);
+                return p?.libType === expectedLibType || (!p?.libType && roleKind === 'cm');
+              });
+              return (
+                <div key={role}>
+                  <div style={{ fontSize: 11, fontFamily: "var(--font-mono)", color: "var(--color-text-secondary)", marginBottom: 3 }}>
+                    {role}
+                    <span style={{ marginLeft: 6, fontSize: 10, padding: "1px 5px", borderRadius: 6,
+                      background: roleKind === 'em' ? "#E6F1FB" : "var(--color-background-secondary)",
+                      color: roleKind === 'em' ? "#0C447C" : "var(--color-text-secondary)" }}>
+                      {roleKind === 'em' ? 'EM' : 'CM'}
+                    </span>
+                  </div>
+                  <select value={assigned}
+                    onChange={e => updateInstanceRole(inst.id, role, e.target.value)}
+                    style={{ width: "100%", padding: "4px 7px", border: "0.5px solid var(--color-border-secondary)",
+                      borderRadius: "var(--border-radius-md)", fontSize: 12, fontFamily: "var(--font-mono)",
+                      background: assigned ? "var(--color-background-primary)" : "#FEF3C7",
+                      color: "var(--color-text-primary)" }}>
+                    <option value="">— unassigned —</option>
+                    {options.map(i => <option key={i.id} value={i.instanceName}>{i.instanceName} ({i.profileId})</option>)}
+                  </select>
                 </div>
-                <select value={assigned}
-                  onChange={e => updateInstanceRole(inst.id, role, e.target.value)}
-                  style={{ width: "100%", padding: "4px 7px", border: "0.5px solid var(--color-border-secondary)",
-                    borderRadius: "var(--border-radius-md)", fontSize: 12, fontFamily: "var(--font-mono)",
-                    background: assigned ? "var(--color-background-primary)" : "#FEF3C7",
-                    color: "var(--color-text-primary)" }}>
-                  <option value="">— unassigned —</option>
-                  {options.map(i => <option key={i.id} value={i.instanceName}>{i.instanceName} ({i.profileId})</option>)}
-                </select>
-              </div>
-            );
-          })}
-        </div>
-      )}
+              );
+            })}
+          </div>
+        )}
     </div>
   );
 }
 
 // ── Instance sub-tab (list + optional role panel) ─────────────────────────────
 function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, folderOptions, hasHierarchy,
-    addInstance, removeInstance, updateInstance, updateInstanceRole, ensureLoaded }) {
+    addInstance, removeInstance, updateInstance, updateInstanceRole, ensureLoaded, savedProjectId, saveProjectNow, setError = () => {}, getCompositeCmType, extractMemberConnections, setInstances, compositeCmTypes, valveCommands }) {
   const [selectedId, setSelectedId] = useState(null);
+  const [mapInst, setMapInst] = useState(null);   // instance whose signal-mapping modal is open
+  const [connResult, setConnResult] = useState(null); // last "Generate Connections" outcome
+  const [connStatus, setConnStatus] = useState({});   // instanceName → { real, dummy, total }
+
+  // Load per-instance reconciliation counts for the grid's Connections column.
+  async function loadConnStatus() {
+    if (!savedProjectId) { setConnStatus({}); return; }
+    try {
+        const r = await getConnectionIOs(savedProjectId);
+        const byInst = {};
+        for (const io of (r.ios || [])) {
+          const s = (byInst[io.instance_name] ||= { real: 0, dummy: 0, total: 0 });
+          s.total++;
+          if (io.status === "real") s.real++; else s.dummy++;
+        }
+        setConnStatus(byInst);
+    } catch { setConnStatus({}); }
+  }
+  useEffect(() => { loadConnStatus(); }, [savedProjectId]); // eslint-disable-line react-hooks/exhaustive-deps
   const tabInstances = instances.filter(i => {
     const p = cmtProfiles.find(x => x.id === i.profileId);
     return p?.libType === libType;
@@ -2984,57 +3589,147 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
   // Auto-select first row when list changes and nothing is selected
   useEffect(() => {
     if (showRolePane && !selectedId && tabInstances.length > 0) {
-      setSelectedId(tabInstances[0].id);
+        setSelectedId(tabInstances[0].id);
     }
     if (selectedId && !tabInstances.find(i => i.id === selectedId)) {
-      setSelectedId(tabInstances[0]?.id || null);
+        setSelectedId(tabInstances[0]?.id || null);
     }
   }, [tabInstances.length]);
 
   // Eagerly load roles for EM/EPH instances
   useEffect(() => {
     for (const inst of tabInstances) {
-      const p = cmtProfiles.find(x => x.id === inst.profileId);
-      if (p && (p.libType === "EquipmentModule" || p.libType === "EquipmentPhase") && p.roles === null) {
-        ensureLoaded(inst.profileId);
-      }
+        const p = cmtProfiles.find(x => x.id === inst.profileId);
+        if (p && (p.libType === "EquipmentModule" || p.libType === "EquipmentPhase") && p.roles === null) {
+          ensureLoaded(inst.profileId);
+        }
     }
   }, [tabInstances.length]);
 
   return (
     <div style={{ display: "flex", flex: 1, overflow: "hidden", minHeight: 0 }}>
-      {/* List pane — AG Grid */}
-      <div style={{ flex: showRolePane ? "0 0 62%" : 1, display: "flex", flexDirection: "column",
-          borderRight: showRolePane ? "0.5px solid var(--color-border-tertiary)" : "none", overflow: "hidden" }}>
-        <InstancesGrid
-          libType={libType}
-          rowData={tabInstances}
-          cmtProfiles={cmtProfiles}
-          userProjects={userProjects}
-          folderOptions={folderOptions}
-          onRowUpdate={(id, field, value) => updateInstance(id, field, value)}
-          onRowDelete={(id) => removeInstance(id)}
-          onRowAdd={() => addInstance(libType)}
-          onRowSelect={showRolePane ? (id) => setSelectedId(id === selectedId ? null : id) : undefined}
-          selectedId={selectedId}
-        />
-      </div>
-
-      {/* Role panel — only for EM / EPH */}
-      {showRolePane && (
-        <div style={{ flex: "0 0 38%", overflow: "hidden", background: "var(--color-background-secondary)" }}>
-          <RolePanel inst={selectedInst} profile={selectedProfile}
-            instances={instances} cmtProfiles={cmtProfiles}
-            updateInstanceRole={updateInstanceRole} />
+        {/* List pane — AG Grid */}
+        <div style={{ flex: showRolePane ? "0 0 62%" : 1, display: "flex", flexDirection: "column",
+            borderRight: showRolePane ? "0.5px solid var(--color-border-tertiary)" : "none", overflow: "hidden" }}>
+          {connResult && (
+            <div style={{
+              margin: "8px 12px 0", padding: "8px 12px", borderRadius: 6, fontSize: 13,
+              display: "flex", alignItems: "center", gap: 8,
+              background: connResult.ok ? "#eef9f0" : "#ffeaea",
+              border: `1px solid ${connResult.ok ? "#9bd5a8" : "#e88"}`,
+              color: connResult.ok ? "#1c6b2e" : "#b00",
+            }}>
+              <span style={{ flex: 1 }}>
+                {connResult.ok ? (
+                  <>
+                    <b>{connResult.real}</b> connected to hardware,{" "}
+                    <b>{connResult.dummy}</b> unmatched (stay dummy)
+                    {connResult.conflicts?.length > 0 &&
+                      ` · ${connResult.conflicts.length} duplicate symbol${connResult.conflicts.length !== 1 ? "s" : ""} (bound first)`}
+                    {connResult.warnings?.length > 0 &&
+                      ` · ${connResult.warnings.length} type warning${connResult.warnings.length !== 1 ? "s" : ""}`}
+                    {connResult.importId == null && " · no hardware import found"}
+                  </>
+                ) : (
+                  <>Connection generation failed: {connResult.message}</>
+                )}
+              </span>
+              <button onClick={() => setConnResult(null)}
+                style={{ background: "none", border: "none", cursor: "pointer", fontSize: 16, color: "inherit", lineHeight: 1 }}
+                title="Dismiss">×</button>
+            </div>
+          )}
+          <InstancesGrid
+            libType={libType}
+            rowData={tabInstances}
+            cmtProfiles={cmtProfiles}
+            userProjects={userProjects}
+            folderOptions={folderOptions}
+            onRowUpdate={(id, field, value) => updateInstance(id, field, value)}
+            onRowDelete={(id) => removeInstance(id)}
+            onRowAdd={() => addInstance(libType)}
+            onRowSelect={showRolePane ? (id) => setSelectedId(id === selectedId ? null : id) : undefined}
+            selectedId={selectedId}
+            onMapSignals={savedProjectId ? async (id) => {
+              const inst = tabInstances.find(i => i.id === id);
+              if (!inst) return;
+              await ensureLoaded(inst.profileId);
+              // Hydrate connections if marked for lazy loading (composite member with
+              // empty connections — manually created or from a pre-fix save). We must
+              // resolve the hydrated instance BEFORE opening the modal, otherwise the
+              // modal receives the stale object with no connections and the DUMMY
+              // badge / derived signal name never appear.
+              let openInst = inst;
+              if (inst._needsConnections && inst.compositeId != null && inst.memberIdx != null) {
+                try {
+                  const detail = await getCompositeCmType(inst.compositeId);
+                  const connections = extractMemberConnections(detail, inst.memberIdx);
+                  openInst = { ...inst, connections, _needsConnections: false };
+                  setInstances(prev => prev.map(i => (i.id === inst.id ? openInst : i)));
+                } catch (e) {
+                  setError(e.message);
+                }
+              }
+              setMapInst(openInst);
+            } : undefined}
+            onGenerateConnections={savedProjectId ? async () => {
+              setConnResult(null);
+              try {
+                // Persist pending instance edits first so reconciliation reads the
+                // latest connections from the DB (the normal save is debounced).
+                if (saveProjectNow) await saveProjectNow();
+                const r = await generateConnections(savedProjectId);
+                setConnResult({ ok: true, ...r });
+                await loadConnStatus();
+              } catch (e) {
+                setConnResult({ ok: false, message: e.message });
+              }
+            } : undefined}
+            connStatusByInstance={savedProjectId ? connStatus : undefined}
+          />
         </div>
-      )}
-    </div>
+
+        {mapInst && (
+          <SignalMappingModal
+            projectId={savedProjectId}
+            instance={mapInst}
+            profile={cmtProfiles.find(p => p.id === mapInst.profileId)}
+            compositeCmTypes={compositeCmTypes}
+            getCompositeCmType={getCompositeCmType}
+            valveCommands={valveCommands}
+            onClose={(success, data) => {
+              if (success && data?.values) {
+                const updatedConnections = (mapInst.connections || []).map(conn => {
+                  if (conn.conn_type === 'value' && conn.target_pin && data.values[conn.target_pin] !== undefined) {
+                    return { ...conn, static_value: data.values[conn.target_pin] };
+                  }
+                  return conn;
+                });
+                setInstances(prev => prev.map(i =>
+                  i.id === mapInst.id ? { ...mapInst, connections: updatedConnections } : i
+                ));
+              }
+              setMapInst(null);
+            }}
+          />
+        )}
+
+        {/* Role panel — only for EM / EPH */}
+        {showRolePane && (
+          <div style={{ flex: "0 0 38%", overflow: "hidden", background: "var(--color-background-secondary)" }}>
+            <RolePanel inst={selectedInst} profile={selectedProfile}
+              instances={instances} cmtProfiles={cmtProfiles}
+              updateInstanceRole={updateInstanceRole} />
+          </div>
+        )}
+      </div>
   );
 }
 
-function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName,
+function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName, savedProjectId,
     hierarchy, compositeCmTypes, addInstance, removeInstance, updateInstance,
-    updateInstanceRole, addCompositeInstances, ensureLoaded, loading, onGenerate }) {
+    updateInstanceRole, addCompositeInstances, ensureLoaded, loading, generating, saveProjectNow, onGenerate, setError,
+    getCompositeCmType, extractMemberConnections, valveCommands, setInstances }) {
   const noUserProjects = !userProjects?.length;
   const folderOptions  = allFolderOptions(hierarchy || []);
   const hasHierarchy   = (hierarchy?.length || 0) > 0;
@@ -3052,7 +3747,8 @@ function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName,
   const countOf = libType => instances.filter(i => cmtProfiles.find(p => p.id === i.profileId)?.libType === libType).length;
 
   const commonTabProps = { instances, cmtProfiles, userProjects, folderOptions, hasHierarchy,
-    addInstance, removeInstance, updateInstance, updateInstanceRole, ensureLoaded };
+    addInstance, removeInstance, updateInstance, updateInstanceRole, ensureLoaded, savedProjectId,
+    saveProjectNow, setError, getCompositeCmType, extractMemberConnections, setInstances, compositeCmTypes, valveCommands };
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
@@ -3072,9 +3768,9 @@ function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName,
           </Btn>
         )}
         <Btn primary onClick={onGenerate}
-            disabled={!instances.length || !!loading || noUserProjects
+            disabled={!instances.length || !!loading || generating || noUserProjects
               || instances.some(i => !i.userProject) || folderMissing}>
-          <i className="ti ti-code" /> {loading || "Generate XML"}
+          <i className="ti ti-code" /> {generating ? "Generating…" : (loading || "Generate XML")}
         </Btn>
       </div>
 
@@ -3269,11 +3965,18 @@ function MemberRolePreview({ m, members, compDetails, cmtProfiles }) {
 }
 
 // ── Step 2: Unit Types ────────────────────────────────────────────────────────
+const UNIT_TABS = [
+  { key: "config",    label: "Unit Configuration" },
+  { key: "instances", label: "Unit Instances" },
+];
+
 function StepUnitTypes({
   unitTypes, unitInstances, cmtProfiles, compositeCmTypes, userProjects,
   savedProjectId, ensureLoaded, loading, setError,
   onUnitTypesChange, onUnitInstancesChange, onExpand,
+  unitConnections, cmTypeVarCache, onSaveConnections, onLoadConnections,
 }) {
+  const [unitTab, setUnitTab]               = useState("config");
   const [selectedTypeId, setSelectedTypeId] = useState(null);
   const [editDraft, setEditDraft]           = useState(null);   // { name, description, members[] }
   const [addModal, setAddModal]             = useState(false);  // show add-unit-instance modal
@@ -3285,6 +3988,14 @@ function StepUnitTypes({
   const [toast, setToast]                   = useState("");     // success message
   const [compDetails, setCompDetails]       = useState({});     // compositeId -> { members: [...] }
   const [openMembers, setOpenMembers]       = useState({});     // member idx -> expanded bool
+  const [importModalOpen, setImportModalOpen] = useState(false); // show import unit type modal
+
+  // Local editable copy of unit instances so typing in the grid is instant.
+  // The prop is the source of truth (server state); we mirror it locally and
+  // debounce persistence so each keystroke doesn't fire two network round-trips.
+  const [localUnitInstances, setLocalUnitInstances] = useState(unitInstances);
+  const uiSaveTimers = useRef({});   // instanceId -> debounce timeout
+  useEffect(() => { setLocalUnitInstances(unitInstances); }, [unitInstances]);
 
   // When the global composite list changes (e.g. a composite was deleted), clear any
   // stale compositeCmId values from the open draft so the dropdown shows "— pick composite —"
@@ -3303,6 +4014,13 @@ function StepUnitTypes({
       ),
     }));
   }, [compositeCmTypes]);
+
+  // Auto-select first unit type when unitTypes changes
+  useEffect(() => {
+    if (unitTypes.length > 0 && !selectedTypeId) {
+      selectType(unitTypes[0].id);
+    }
+  }, [unitTypes]);
 
   // Load a composite's sub-members into compDetails, and ensure roles are loaded
   // for any EM/EPH sub-members so the role-assignment editor can render them.
@@ -3329,6 +4047,7 @@ function StepUnitTypes({
         description: detail.description || "",
         members:     detail.members.map(m => ({
           alias:           m.alias,
+          cmTypeName:      m.cmTypeName || '',
           compositeCmId:   m.compositeCmId || null,
           roleAssignments: (m.roleAssignments || []).map(r => ({
             sourceMemberIdx: r.sourceMemberIdx ?? 0,
@@ -3338,6 +4057,9 @@ function StepUnitTypes({
           })),
         })),
       });
+      // Load connections and variables for the unit type
+      // This ensures connections are always fresh when selecting a unit type
+      await onLoadConnections(id);
       // Preload composite metadata for all members so role editors render immediately.
       const ids = [...new Set(detail.members.map(m => m.compositeCmId).filter(Boolean))];
       for (const cid of ids) loadCompositeMeta(cid);
@@ -3444,17 +4166,32 @@ function StepUnitTypes({
     finally { setBusy(false); }
   }
 
-  async function handleUpdateUnitInstance(id, field, value) {
-    const ui = unitInstances.find(u => u.id === id);
-    if (!ui) return;
-    try {
-      await updateUnitInstance(savedProjectId, id, {
-        unit_name:    field === 'unit_name'    ? value : ui.unit_name,
-        user_project: field === 'user_project' ? value : (ui.user_project || ''),
-        parent_path:  field === 'parent_path'  ? value : (ui.parent_path  || ''),
+  function handleUpdateUnitInstance(id, field, value) {
+    // 1. Update local state immediately so the input reflects the keystroke
+    //    with zero latency (no waiting on the network).
+    setLocalUnitInstances(prev => prev.map(u => u.id === id ? { ...u, [field]: value } : u));
+
+    // 2. Debounce the server write. Only the latest value per instance is sent,
+    //    ~500ms after the user stops typing — avoiding a round-trip per keystroke.
+    if (uiSaveTimers.current[id]) clearTimeout(uiSaveTimers.current[id]);
+    uiSaveTimers.current[id] = setTimeout(() => {
+      delete uiSaveTimers.current[id];
+      // Read the freshest local row (covers the case where several fields were
+      // edited during the debounce window) so no field is reverted to a stale value.
+      setLocalUnitInstances(cur => {
+        const ui = cur.find(u => u.id === id);
+        if (ui) {
+          updateUnitInstance(savedProjectId, id, {
+            unit_name:    ui.unit_name,
+            user_project: ui.user_project || '',
+            parent_path:  ui.parent_path  || '',
+          })
+            .then(() => onUnitInstancesChange())
+            .catch(e => setError(e.message));
+        }
+        return cur;   // no state change — we only read the latest snapshot
       });
-      await onUnitInstancesChange();
-    } catch (e) { setError(e.message); }
+    }, 500);
   }
 
   async function handleDeleteUnitInstance(id) {
@@ -3471,21 +4208,55 @@ function StepUnitTypes({
     setTimeout(() => setToast(""), 3000);
   }
 
+  // Ensure connections are loaded when a unit type is selected
+  // Use a ref to track which type's connections we've loaded to avoid redundant calls
+  const loadedConnectionsRef = useRef(new Set());
+  useEffect(() => {
+    if (selectedTypeId && !loadedConnectionsRef.current.has(selectedTypeId)) {
+      loadedConnectionsRef.current.add(selectedTypeId);
+      onLoadConnections(selectedTypeId).catch(() => {
+        // If loading fails, remove from cache so we can retry next time
+        loadedConnectionsRef.current.delete(selectedTypeId);
+      });
+    }
+  }, [selectedTypeId]);
+
   const colLeft  = { width: 220, minWidth: 180, borderRight: "0.5px solid var(--color-border-tertiary)", display: "flex", flexDirection: "column" };
   const colRight = { flex: 1, overflowY: "auto", padding: "12px 16px", display: "flex", flexDirection: "column", gap: 12 };
   const inputSx  = { padding: "4px 8px", border: "0.5px solid var(--color-border-secondary)", borderRadius: "var(--border-radius-md)", fontSize: 12, fontFamily: "var(--font-mono)", background: "var(--color-background-primary)", color: "var(--color-text-primary)", width: "100%" };
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 0, height: "100%" }}>
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
 
-      {/* ── Top half: Unit Type Library ── */}
-      <div style={{ display: "flex", borderBottom: "1px solid var(--color-border-secondary)", height: 360, overflow: "hidden" }}>
+      {/* ── Tab bar ── */}
+      <div style={{ display: "flex", borderBottom: "0.5px solid var(--color-border-tertiary)", marginBottom: 0 }}>
+        {UNIT_TABS.map(t => {
+          const active = unitTab === t.key;
+          return (
+            <button key={t.key} onClick={() => setUnitTab(t.key)}
+              style={{ padding: "7px 18px", border: "none", background: "transparent",
+                cursor: "pointer", fontSize: 13, fontWeight: active ? 500 : 400,
+                color: active ? "var(--color-text-primary)" : "var(--color-text-secondary)",
+                borderBottom: active ? "2px solid var(--color-text-primary)" : "2px solid transparent",
+                marginBottom: -1 }}>
+              {t.label}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* ── Unit Configuration Tab ── */}
+      {unitTab === "config" && (
+      <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
 
         {/* Left: type list */}
         <div style={colLeft}>
           <div style={{ padding: "8px 10px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
             <span style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em", color: "var(--color-text-secondary)" }}>Unit Types</span>
-            <Btn onClick={handleCreateType} disabled={busy}><i className="ti ti-plus" /></Btn>
+            <div style={{ display: "flex", gap: 4 }}>
+              <Btn onClick={() => setImportModalOpen(true)} disabled={busy} title="Import from PCS7"><i className="ti ti-upload" /></Btn>
+              <Btn onClick={handleCreateType} disabled={busy}><i className="ti ti-plus" /></Btn>
+            </div>
           </div>
           <div style={{ overflowY: "auto", flex: 1 }}>
             {unitTypes.length === 0 && (
@@ -3607,7 +4378,19 @@ function StepUnitTypes({
                 <Btn onClick={addMember} style={{ marginTop: 6 }}><i className="ti ti-plus" /> Add Member</Btn>
               </div>
 
-              <div style={{ display: "flex", justifyContent: "flex-end" }}>
+              <div style={{ marginTop: '1.5rem', borderTop: '1px solid var(--color-border-secondary)', paddingTop: '1.5rem' }}>
+                <UnitConnectionsEditor
+                  unitType={{ name: editDraft.name, members: editDraft.members }}
+                  compositeCmTypes={compositeCmTypes}
+                  connections={unitConnections[selectedTypeId] || []}
+                  cmTypeVars={cmTypeVarCache}
+                  onSave={(connections) => onSaveConnections(selectedTypeId, connections)}
+                  onCancel={() => {}}
+                  loading={loading}
+                />
+              </div>
+
+              <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", marginTop: '1.5rem', gap: '0.75rem' }}>
                 <Btn primary onClick={handleSaveType} disabled={busy || !editDraft.name.trim()}>
                   <i className="ti ti-device-floppy" /> Save Unit Type
                 </Btn>
@@ -3616,8 +4399,10 @@ function StepUnitTypes({
           )}
         </div>
       </div>
+      )}
 
-      {/* ── Bottom half: Unit Instances (per project) ── */}
+      {/* ── Unit Instances Tab ── */}
+      {unitTab === "instances" && (
       <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
         <div style={{ padding: "8px 12px", borderBottom: "0.5px solid var(--color-border-tertiary)", display: "flex", alignItems: "center", gap: 8 }}>
           <span style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em", color: "var(--color-text-secondary)", flex: 1 }}>
@@ -3634,7 +4419,7 @@ function StepUnitTypes({
         </div>
 
         <div style={{ overflowY: "auto", flex: 1 }}>
-          {unitInstances.length === 0 ? (
+          {localUnitInstances.length === 0 ? (
             <div style={{ padding: "12px", fontSize: 12, color: "var(--color-text-secondary)" }}>
               No unit instances yet. Add instances then click Generate Instances.
             </div>
@@ -3648,7 +4433,7 @@ function StepUnitTypes({
                 </tr>
               </thead>
               <tbody>
-                {unitInstances.map(ui => (
+                {localUnitInstances.map(ui => (
                   <tr key={ui.id} style={{ borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
                     <td style={{ padding: "4px 6px" }}>
                       <input value={ui.unit_name} onChange={e => handleUpdateUnitInstance(ui.id, 'unit_name', e.target.value)}
@@ -3679,6 +4464,7 @@ function StepUnitTypes({
           )}
         </div>
       </div>
+      )}
 
       {/* Toast notification */}
       {toast && (
@@ -3723,6 +4509,18 @@ function StepUnitTypes({
           </div>
         </div>
       )}
+
+      {/* Import Unit Type Modal */}
+      <UnitTypeImportModal
+        isOpen={importModalOpen}
+        onClose={() => setImportModalOpen(false)}
+        compositeCmTypes={compositeCmTypes}
+        onImportSuccess={(result) => {
+          setImportModalOpen(false);
+          setToast(`Unit type "${result.unitName}" imported successfully!`);
+          onUnitTypesChange();
+        }}
+      />
     </div>
   );
 }
@@ -3850,86 +4648,3 @@ function Btn({ onClick, primary, disabled, children }) {
   );
 }
 
-// ── Import selection modal ────────────────────────────────────────────────────
-function ImportModal({ preview, onImport, onCancel }) {
-  const [selected, setSelected] = useState(preview.selectedNames);
-
-  const total    = preview.items.length;
-  const selCount = selected.size;
-
-  function toggle(name) {
-    setSelected(prev => {
-      const next = new Set(prev);
-      next.has(name) ? next.delete(name) : next.add(name);
-      return next;
-    });
-  }
-
-  function selectAll()   { setSelected(new Set(preview.items.map(p => p.name))); }
-  function deselectAll() { setSelected(new Set()); }
-
-  return (
-    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", zIndex: 1000,
-        display: "flex", alignItems: "center", justifyContent: "center" }}>
-      <div style={{ background: "var(--color-background-primary)", borderRadius: "var(--border-radius-lg)",
-          boxShadow: "0 8px 32px rgba(0,0,0,0.18)", width: 540, maxHeight: "80vh",
-          display: "flex", flexDirection: "column", overflow: "hidden" }}>
-
-        {/* Header */}
-        <div style={{ padding: "16px 20px", borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
-          <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 4 }}>
-            Select types to import
-          </div>
-          <div style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>
-            {selCount} of {total} selected — only checked items will be saved to the database.
-          </div>
-          <div style={{ marginTop: 8, display: "flex", gap: 8 }}>
-            <button onClick={selectAll}
-              style={{ fontSize: 12, border: "0.5px solid var(--color-border-secondary)", borderRadius: "var(--border-radius-md)",
-                padding: "3px 10px", cursor: "pointer", background: "transparent", color: "var(--color-text-primary)" }}>
-              Select all
-            </button>
-            <button onClick={deselectAll}
-              style={{ fontSize: 12, border: "0.5px solid var(--color-border-secondary)", borderRadius: "var(--border-radius-md)",
-                padding: "3px 10px", cursor: "pointer", background: "transparent", color: "var(--color-text-primary)" }}>
-              Deselect all
-            </button>
-          </div>
-        </div>
-
-        {/* List */}
-        <div style={{ overflowY: "auto", flex: 1 }}>
-          {preview.items.map(item => (
-            <label key={item.name}
-              style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 20px",
-                borderBottom: "0.5px solid var(--color-border-tertiary)", cursor: "pointer" }}>
-              <input type="checkbox" checked={selected.has(item.name)} onChange={() => toggle(item.name)}
-                style={{ width: 14, height: 14, flexShrink: 0 }} />
-              <span style={{ fontFamily: "var(--font-mono)", fontSize: 12, fontWeight: 500, minWidth: 120 }}>
-                {item.name}
-              </span>
-              {item.cm_type && item.cm_type !== item.name && (
-                <span style={{ fontSize: 11, color: "var(--color-text-secondary)", background: "var(--color-background-secondary)",
-                    padding: "1px 6px", borderRadius: "var(--border-radius-md)" }}>
-                  {item.cm_type}
-                </span>
-              )}
-              <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--color-text-secondary)", whiteSpace: "nowrap" }}>
-                {item.blockCount} blk · {item.varCount} var
-              </span>
-            </label>
-          ))}
-        </div>
-
-        {/* Footer */}
-        <div style={{ padding: "12px 20px", borderTop: "0.5px solid var(--color-border-tertiary)",
-            display: "flex", justifyContent: "flex-end", gap: 8 }}>
-          <Btn onClick={onCancel}>Cancel</Btn>
-          <Btn primary disabled={selCount === 0} onClick={() => onImport(selected)}>
-            Import selected ({selCount})
-          </Btn>
-        </div>
-      </div>
-    </div>
-  );
-}
