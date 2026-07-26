@@ -62,9 +62,18 @@ app.get('/api/health', (_req, res) => res.json({ ok: true, time: new Date().toIS
 
 async function start() {
   try {
+    console.log('[Server] Starting backend server...');
+    console.log(`[Server] Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`[Server] Database host: ${process.env.PGHOST || 'localhost'}`);
+
     // sql.js needs async init (loads WebAssembly)
+    console.log('[Server] Initializing database...');
     await initDb();
+    console.log('[Server] Database initialized');
+
+    console.log('[Server] Ensuring schema...');
     await ensureSchema();
+    console.log('[Server] Schema ready');
 
     const server = app.listen(PORT, () => {
       console.log(`[Server] PCS7 Generator backend → http://localhost:${PORT}`);
