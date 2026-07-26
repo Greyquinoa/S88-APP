@@ -11,12 +11,14 @@ const _txStorage = new AsyncLocalStorage();
 
 async function initDb() {
   if (_pool) return _pool;
+  const isProduction = process.env.NODE_ENV === 'production';
   _pool = new Pool({
     host:     process.env.PGHOST || 'localhost',
     port:     Number(process.env.PGPORT) || 5432,
     user:     process.env.PGUSER || 'postgres',
     password: process.env.PGPASSWORD || '',
     database: process.env.PGDATABASE || 's88_app',
+    ssl:      isProduction ? { rejectUnauthorized: false } : false,
   });
   await _pool.query('SELECT 1');
   console.log(`[DB] Connected — postgres://${process.env.PGHOST || 'localhost'}:${process.env.PGPORT || 5432}/${process.env.PGDATABASE || 's88_app'}`);
