@@ -11,6 +11,9 @@
  *   NEON_HOST, NEON_PORT, NEON_USER, NEON_PASSWORD, NEON_DATABASE
  */
 
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
+
 const { Pool } = require('pg');
 const fs = require('fs');
 
@@ -70,9 +73,14 @@ async function migrate() {
     const tables = tableResult.rows.map(r => r.table_name);
     console.log(`[Migration] Found ${tables.length} tables\n`);
 
-    // Disable foreign keys on target (for clean insert)
-    await targetPool.query('SET session_replication_role = REPLICA');
-    console.log('[Migration] Disabled foreign key checks on target\n');
+    // Try to disable foreign keys on target (for clean insert)
+    // Neon may not allow this, so catch and continue
+    try {
+      await targetPool.query('SET session_replication_role = REPLICA');
+      console.log('[Migration] Disabled foreign key checks on target\n');
+    } catch (e) {
+      console.log('[Migration] (FK checks not available on this database, continuing)\n');
+    }
 
     // Copy each table
     let totalRows = 0;
@@ -113,9 +121,13 @@ async function migrate() {
       }
     }
 
-    // Re-enable foreign keys
-    await targetPool.query('SET session_replication_role = DEFAULT');
-    console.log('\n[Migration] Re-enabled foreign key checks\n');
+    // Re-enable foreign keys (if it was disabled)
+    try {
+      await targetPool.query('SET session_replication_role = DEFAULT');
+      console.log('\n[Migration] Re-enabled foreign key checks\n');
+    } catch (e) {
+      console.log('\n[Migration] (Skipping FK re-enable)\n');
+    }
 
     console.log(`[Migration] ✓ Migration complete!`);
     console.log(`[Migration] Total rows migrated: ${totalRows}\n`);
