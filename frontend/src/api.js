@@ -1,7 +1,7 @@
 // src/api.js — All REST calls in one place
 // When migrating to SQL Server, only the backend changes — this file stays the same.
 
-const BASE = '/api';
+const BASE = `${import.meta.env.VITE_API_BASE_URL || ''}/api`;
 
 async function request(method, path, body, isFile = false) {
   const opts = { method, headers: {} };
