@@ -319,6 +319,19 @@ input, select, button, pre { font-family: inherit; }
   font-weight: 400;
 }
 
+/* ── IO Import Icon Buttons ────────────────────────────────── */
+.io-import-icon-btn {
+  transition: color 0.2s ease !important;
+}
+
+.io-import-icon-refresh:hover {
+  color: #4F46E5 !important;
+}
+
+.io-import-icon-delete:hover {
+  color: #EF4444 !important;
+}
+
 /* ── Cards & Containers ────────────────────────────────── */
 .card {
   background: var(--color-background-primary);

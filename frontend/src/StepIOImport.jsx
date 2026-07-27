@@ -252,6 +252,7 @@ function TabUpload({ projectId, imports, onImported, onSelectImport, onDeleteImp
                     reimportRef.current.click();
                   }}
                   title="Reimport — replace with new file"
+                  className="io-import-icon-btn io-import-icon-refresh"
                   style={{
                     background: 'transparent',
                     border: 'none',
@@ -262,14 +263,13 @@ function TabUpload({ projectId, imports, onImported, onSelectImport, onDeleteImp
                     lineHeight: 1,
                     transition: 'color 0.2s ease',
                     fontSize: '1rem'
-                  }}
-                  onMouseEnter={(e) => e.target.style.color = '#4F46E5'}
-                  onMouseLeave={(e) => e.target.style.color = '#9CA3AF'}>
+                  }}>
                   <i className="ti ti-refresh" />
                 </button>
                 <button
                   onClick={e => { e.stopPropagation(); onDeleteImport(imp.id, imp.file_name); }}
                   title="Delete import"
+                  className="io-import-icon-btn io-import-icon-delete"
                   style={{
                     background: 'transparent',
                     border: 'none',
@@ -280,9 +280,7 @@ function TabUpload({ projectId, imports, onImported, onSelectImport, onDeleteImp
                     lineHeight: 1,
                     transition: 'color 0.2s ease',
                     fontSize: '1rem'
-                  }}
-                  onMouseEnter={(e) => e.target.style.color = '#EF4444'}
-                  onMouseLeave={(e) => e.target.style.color = '#9CA3AF'}>
+                  }}>
                   <i className="ti ti-trash" />
                 </button>
               </div>
