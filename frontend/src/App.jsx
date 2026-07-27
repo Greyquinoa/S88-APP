@@ -27,8 +27,10 @@ import SignalMappingModal from "./SignalMappingModal.jsx";
 import UnitConnectionsEditor from "./UnitConnectionsEditor.jsx";
 import LibraryImportReview from "./LibraryImportReview.jsx";
 import UnitTypeImportModal from "./UnitTypeImportModal.jsx";
+import UnitTypeSpirograph from "./UnitTypeSpirograph.jsx";
 import Spinner from "./Spinner.jsx";
 import ProgressBar from "./ProgressBar.jsx";
+import Sidebar from "./Sidebar.jsx";
 import { GlobalLoadingProvider } from "./LoadingContext.jsx";
 
 const STEPS = ["Projects", "IO Import", "Library", "Unit Types", "Hierarchy", "Instances", "HW Config", "Generate"];
@@ -609,57 +611,53 @@ export default function App() {
 
   return (
     <GlobalLoadingProvider uiLoading={uiLoading} setUiLoading={setUiLoading}>
-      <div style={{ padding: "1rem 0", fontFamily: "var(--font-sans)", fontSize: 14, color: "var(--color-text-primary)" }}>
-        {/* Non-blocking XML-generation progress bar, pinned to the top */}
-        <ProgressBar progress={genProgress} />
-        {/* Step tabs */}
-        <div style={{ display: "flex", borderBottom: "0.5px solid var(--color-border-tertiary)", marginBottom: "1.5rem" }}>
-          {STEPS.map((s, i) => (
-            <button key={i} onClick={() => goTo(i)}
-              style={{ padding: "8px 16px", border: "none", background: "transparent",
-                cursor: "pointer",
-                fontWeight: i === step ? 500 : 400, fontSize: 13,
-                color: i === step ? "var(--color-text-primary)" : "var(--color-text-secondary)",
-                borderBottom: i === step ? "2px solid var(--color-text-primary)" : "2px solid transparent",
-                marginBottom: -1 }}>
-              {i + 1}. {s}
-            </button>
-          ))}
-        </div>
+      <div className="app-main" style={{ fontFamily: "var(--font-sans)", fontSize: 14, color: "var(--color-text-primary)" }}>
+        {/* Sidebar Navigation */}
+        <Sidebar
+          activeStep={step}
+          onStepChange={goTo}
+          libStatus={libStatus}
+          projectName={savedProjectName}
+        />
 
-        {error && (
-          <div style={{ background: "#FEE2E2", border: "1px solid #FCA5A5", borderRadius: "var(--border-radius-md)",
-              padding: "8px 12px", marginBottom: "1rem", fontSize: 13, color: "#991B1B" }}>
-            <div>{error}</div>
-            {errorConflictRows && errorConflictRows.length > 0 && (
-              <table style={{ marginTop: 8, borderCollapse: "collapse", fontSize: 12, width: "100%" }}>
-                <thead>
-                  <tr style={{ borderBottom: "1px solid #FCA5A5" }}>
-                    <th style={{ textAlign: "left", padding: "4px 8px" }}>Address</th>
-                    <th style={{ textAlign: "left", padding: "4px 8px" }}>Name</th>
-                    <th style={{ textAlign: "left", padding: "4px 8px" }}>IP</th>
-                    <th style={{ textAlign: "left", padding: "4px 8px" }}>Conflict</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {errorConflictRows.map((r, i) => (
-                    <tr key={i} style={{ borderBottom: "1px solid #FEE2E2" }}>
-                      <td style={{ padding: "4px 8px", fontFamily: "monospace" }}>{r.address}</td>
-                      <td style={{ padding: "4px 8px", fontFamily: "monospace" }}>{r.name || "—"}</td>
-                      <td style={{ padding: "4px 8px", fontFamily: "monospace" }}>{r.ip || "—"}</td>
-                      <td style={{ padding: "4px 8px" }}>{r.reasons.join(", ")}</td>
+        {/* Main Content Area */}
+        <div className="app-content">
+          {/* Non-blocking XML-generation progress bar, pinned to the top */}
+          <ProgressBar progress={genProgress} />
+
+          {error && (
+            <div style={{ background: "#FEE2E2", border: "1px solid #FCA5A5", borderRadius: "var(--border-radius-md)",
+                padding: "8px 12px", marginBottom: "1rem", fontSize: 13, color: "#991B1B" }}>
+              <div>{error}</div>
+              {errorConflictRows && errorConflictRows.length > 0 && (
+                <table style={{ marginTop: 8, borderCollapse: "collapse", fontSize: 12, width: "100%" }}>
+                  <thead>
+                    <tr style={{ borderBottom: "1px solid #FCA5A5" }}>
+                      <th style={{ textAlign: "left", padding: "4px 8px" }}>Address</th>
+                      <th style={{ textAlign: "left", padding: "4px 8px" }}>Name</th>
+                      <th style={{ textAlign: "left", padding: "4px 8px" }}>IP</th>
+                      <th style={{ textAlign: "left", padding: "4px 8px" }}>Conflict</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-          </div>
-        )}
+                  </thead>
+                  <tbody>
+                    {errorConflictRows.map((r, i) => (
+                      <tr key={i} style={{ borderBottom: "1px solid #FEE2E2" }}>
+                        <td style={{ padding: "4px 8px", fontFamily: "monospace" }}>{r.address}</td>
+                        <td style={{ padding: "4px 8px", fontFamily: "monospace" }}>{r.name || "—"}</td>
+                        <td style={{ padding: "4px 8px", fontFamily: "monospace" }}>{r.ip || "—"}</td>
+                        <td style={{ padding: "4px 8px" }}>{r.reasons.join(", ")}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          )}
 
-        {uiLoading && <Spinner message={uiLoading} />}
+          {uiLoading && <Spinner message={uiLoading} />}
 
-        {step === 0 && (
-        <StepProjects libStatus={libStatus} loading={loading}
+          {step === 0 && (
+            <StepProjects libStatus={libStatus} loading={loading}
           savedProjectName={savedProjectName}
           savedProjectId={savedProjectId}
           userProjects={userProjects} setUserProjects={setUserProjects}
@@ -678,134 +676,132 @@ export default function App() {
           onLoadProject={loadProjectIntoState}
           setError={setError} />
       )}
-        {step === 1 && (
-          <StepIOImport
-            savedProjectId={savedProjectId}
-            cmtProfiles={cmtProfiles}
-            compositeCmTypes={compositeCmTypes}
-            onPromoted={() => savedProjectId && loadProjectIntoState(savedProjectId)}
-            onImportHardware={async (ioImportId, hardwareMappings) => {
-              // Consume the same sheet in the Hardware system: find the project's
-              // HW import (created from a baseline CFG), copy the IO rows into it,
-              // then hand the mapping to the HW screen and navigate there.
-              try {
-                const hwImports = await listHwImports(savedProjectId);
-                const hwImport = Array.isArray(hwImports) && hwImports.length > 0 ? hwImports[0] : null;
-                if (!hwImport) {
-                  setError('No Hardware import found. Upload a baseline CFG on the HW Config step first, then retry Import Hardware.');
-                  return;
+          {step === 1 && (
+            <StepIOImport
+              savedProjectId={savedProjectId}
+              cmtProfiles={cmtProfiles}
+              compositeCmTypes={compositeCmTypes}
+              onPromoted={() => savedProjectId && loadProjectIntoState(savedProjectId)}
+              onImportHardware={async (ioImportId, hardwareMappings) => {
+                try {
+                  const hwImports = await listHwImports(savedProjectId);
+                  const hwImport = Array.isArray(hwImports) && hwImports.length > 0 ? hwImports[0] : null;
+                  if (!hwImport) {
+                    setError('No Hardware import found. Upload a baseline CFG on the HW Config step first, then retry Import Hardware.');
+                    return;
+                  }
+                  await ingestIoRowsIntoHw(hwImport.id, ioImportId);
+                  setPendingHwMapping({ hwImportId: hwImport.id, ioImportId, hardwareMappings });
+                  setStep(6);
+                } catch (e) {
+                  setError(e.message);
                 }
-                await ingestIoRowsIntoHw(hwImport.id, ioImportId);
-                setPendingHwMapping({ hwImportId: hwImport.id, ioImportId, hardwareMappings });
-                setStep(6);
-              } catch (e) {
-                setError(e.message);
-              }
-            }}
-            setError={setError} />
-        )}
-        {step === 2 && (
-          <StepLibrary libStatus={libStatus} loading={loading}
-            onUpload={handleUpload}
-            cmtProfiles={cmtProfiles} ensureLoaded={ensureBlocksLoaded} toggleBlock={toggleBlock}
-            onDelete={handleDeleteCmType}
-            onCompositesChange={loadCompositeCmTypesList}
-            onVarDefaultChange={(cmTypeName, varId, newVal) => {
-              setProfiles(prev => prev.map(p => {
-                if (p.id !== cmTypeName || !p.subBlocks) return p;
-                return { ...p, subBlocks: p.subBlocks.map(b => ({
-                  ...b,
-                  vars: b.vars.map(v => v.id === varId ? { ...v, val: newVal } : v),
-                }))};
-              }));
-            }}
-            onVarValidChange={(cmTypeName, varId, isValid) => {
-              setProfiles(prev => prev.map(p => {
-                if (p.id !== cmTypeName || !p.subBlocks) return p;
-                return { ...p, subBlocks: p.subBlocks.map(b => ({
-                  ...b,
-                  vars: b.vars.map(v => v.id === varId ? { ...v, isValid } : v),
-                }))};
-              }));
-            }}
-            valveCommands={valveCommands}
-            onValveCommandsChange={loadValveCommands} />
-        )}
-        {importDiff && (
-          <LibraryImportReview
-            diffResult={importDiff}
-            onImport={handleImportConfirm}
-            onCancel={() => { setImportPreview(null); setImportDiff(null); }} />
-        )}
-        {step === 3 && (
-          <StepUnitTypes
-            unitTypes={unitTypes}
-            unitInstances={unitInstances}
-            cmtProfiles={cmtProfiles}
-            compositeCmTypes={compositeCmTypes}
-            userProjects={userProjects}
-            savedProjectId={savedProjectId}
-            ensureLoaded={ensureBlocksLoaded}
-            loading={loading}
-            setError={setError}
-            onUnitTypesChange={loadUnitTypes}
-            onExpand={async () => {
-              if (!savedProjectId) return;
-              setLoading("Generating instances…");
-              try {
-                await expandUnitInstances(savedProjectId);
-                await loadProjectIntoState(savedProjectId);
-                loadUnitInstances(savedProjectId);
-              } catch (e) { setError(e.message); }
-              finally { setLoading(""); }
-            }}
-            onUnitInstancesChange={() => loadUnitInstances(savedProjectId)}
-            unitConnections={unitConnections}
-            cmTypeVarCache={cmTypeVarCache}
-            onLoadConnections={loadUnitTypeConnections}
-            onSaveConnections={saveUnitConnectionsEditor}
-          />
-        )}
-        {step === 4 && (
-          <StepHierarchy hierarchy={hierarchy} setHierarchy={setHierarchy}
-            instances={instances} setInstances={setInstances}
-            savedProjectName={savedProjectName} />
-        )}
-        {step === 5 && !uiLoading && (
-          <StepInstances instances={instances} cmtProfiles={cmtProfiles}
-            userProjects={userProjects} savedProjectName={savedProjectName}
-            savedProjectId={savedProjectId}
-            hierarchy={hierarchy}
-            compositeCmTypes={compositeCmTypes}
-            addInstance={addInstance} removeInstance={removeInstance}
-            updateInstance={updateInstance} updateInstanceRole={updateInstanceRole}
-            addCompositeInstances={addCompositeInstances}
-            ensureLoaded={ensureBlocksLoaded} loading={loading}
-            generating={!!genProgress}
-            saveProjectNow={saveProjectNow}
-            onGenerate={handleGenerate}
-            setError={setError}
-            getCompositeCmType={getCompositeCmType}
-            extractMemberConnections={extractMemberConnections}
-            valveCommands={valveCommands}
-            setInstances={setInstances} />
-        )}
-        {step === 6 && (
-          <StepHWConfig
-            projectId={savedProjectId}
-            pendingHwMapping={pendingHwMapping}
-            onPendingHwMappingConsumed={() => setPendingHwMapping(null)}
-          />
-        )}
-        {step === 7 && (
-          result ? (
-            <StepOutput result={result} onBack={() => setStep(5)} />
-          ) : (
-            <div style={{ padding: "2rem", textAlign: "center", color: "var(--color-text-secondary)" }}>
-              No XML generated yet. Go to the <b>Instances</b> step and click <b>Generate XML</b>.
-            </div>
-          )
-        )}
+              }}
+              setError={setError} />
+          )}
+          {step === 2 && (
+            <StepLibrary libStatus={libStatus} loading={loading}
+              onUpload={handleUpload}
+              cmtProfiles={cmtProfiles} ensureLoaded={ensureBlocksLoaded} toggleBlock={toggleBlock}
+              onDelete={handleDeleteCmType}
+              onCompositesChange={loadCompositeCmTypesList}
+              onVarDefaultChange={(cmTypeName, varId, newVal) => {
+                setProfiles(prev => prev.map(p => {
+                  if (p.id !== cmTypeName || !p.subBlocks) return p;
+                  return { ...p, subBlocks: p.subBlocks.map(b => ({
+                    ...b,
+                    vars: b.vars.map(v => v.id === varId ? { ...v, val: newVal } : v),
+                  }))};
+                }));
+              }}
+              onVarValidChange={(cmTypeName, varId, isValid) => {
+                setProfiles(prev => prev.map(p => {
+                  if (p.id !== cmTypeName || !p.subBlocks) return p;
+                  return { ...p, subBlocks: p.subBlocks.map(b => ({
+                    ...b,
+                    vars: b.vars.map(v => v.id === varId ? { ...v, isValid } : v),
+                  }))};
+                }));
+              }}
+              valveCommands={valveCommands}
+              onValveCommandsChange={loadValveCommands} />
+          )}
+          {importDiff && (
+            <LibraryImportReview
+              diffResult={importDiff}
+              onImport={handleImportConfirm}
+              onCancel={() => { setImportPreview(null); setImportDiff(null); }} />
+          )}
+          {step === 3 && (
+            <StepUnitTypes
+              unitTypes={unitTypes}
+              unitInstances={unitInstances}
+              cmtProfiles={cmtProfiles}
+              compositeCmTypes={compositeCmTypes}
+              userProjects={userProjects}
+              savedProjectId={savedProjectId}
+              ensureLoaded={ensureBlocksLoaded}
+              loading={loading}
+              setError={setError}
+              onUnitTypesChange={loadUnitTypes}
+              onExpand={async () => {
+                if (!savedProjectId) return;
+                setLoading("Generating instances…");
+                try {
+                  await expandUnitInstances(savedProjectId);
+                  await loadProjectIntoState(savedProjectId);
+                  loadUnitInstances(savedProjectId);
+                } catch (e) { setError(e.message); }
+                finally { setLoading(""); }
+              }}
+              onUnitInstancesChange={() => loadUnitInstances(savedProjectId)}
+              unitConnections={unitConnections}
+              cmTypeVarCache={cmTypeVarCache}
+              onLoadConnections={loadUnitTypeConnections}
+              onSaveConnections={saveUnitConnectionsEditor}
+            />
+          )}
+          {step === 4 && (
+            <StepHierarchy hierarchy={hierarchy} setHierarchy={setHierarchy}
+              instances={instances} setInstances={setInstances}
+              savedProjectName={savedProjectName} />
+          )}
+          {step === 5 && !uiLoading && (
+            <StepInstances instances={instances} cmtProfiles={cmtProfiles}
+              userProjects={userProjects} savedProjectName={savedProjectName}
+              savedProjectId={savedProjectId}
+              hierarchy={hierarchy}
+              compositeCmTypes={compositeCmTypes}
+              addInstance={addInstance} removeInstance={removeInstance}
+              updateInstance={updateInstance} updateInstanceRole={updateInstanceRole}
+              addCompositeInstances={addCompositeInstances}
+              ensureLoaded={ensureBlocksLoaded} loading={loading}
+              generating={!!genProgress}
+              saveProjectNow={saveProjectNow}
+              onGenerate={handleGenerate}
+              setError={setError}
+              getCompositeCmType={getCompositeCmType}
+              extractMemberConnections={extractMemberConnections}
+              valveCommands={valveCommands}
+              setInstances={setInstances} />
+          )}
+          {step === 6 && (
+            <StepHWConfig
+              projectId={savedProjectId}
+              pendingHwMapping={pendingHwMapping}
+              onPendingHwMappingConsumed={() => setPendingHwMapping(null)}
+            />
+          )}
+          {step === 7 && (
+            result ? (
+              <StepOutput result={result} onBack={() => setStep(5)} />
+            ) : (
+              <div style={{ padding: "2rem", textAlign: "center", color: "var(--color-text-secondary)" }}>
+                No XML generated yet. Go to the <b>Instances</b> step and click <b>Generate XML</b>.
+              </div>
+            )
+          )}
+        </div>
       </div>
     </GlobalLoadingProvider>
   );
@@ -879,38 +875,39 @@ function StepProjects({ loading, savedProjectName, savedProjectId,
   }
 
   return (
-    <div>
-        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: "1rem" }}>
-          <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 4 }}>Projects</div>
-            <div style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>
-              Resume a saved project or create a new one. Changes save automatically.
+    <div style={{ maxWidth: '1200px', margin: '0 auto' }}>
+        <div className="card">
+          <div className="card-header">
+            <div>
+              <h2 className="card-title">Projects</h2>
+              <p className="card-subtitle">Resume a saved project or create a new one. Changes save automatically.</p>
             </div>
+            {!creating && (
+              <Btn primary onClick={() => setCreating(true)} disabled={busy}>
+                <i className="ti ti-plus" /> New project
+              </Btn>
+            )}
           </div>
-          {!creating && (
-            <Btn primary onClick={() => setCreating(true)} disabled={busy}>
-              <i className="ti ti-plus" /> New project
-            </Btn>
-          )}
         </div>
 
-        {creating && (
-          <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: "1rem",
-              padding: "10px 12px", border: "0.5px solid var(--color-border-secondary)",
-              borderRadius: "var(--border-radius-lg)", background: "var(--color-background-secondary)" }}>
-            <label style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>Project name:</label>
-            <input value={newName} onChange={e => setNewName(e.target.value)} autoFocus
-              placeholder="e.g. Plant_A"
-              onKeyDown={e => { if (e.key === "Enter") submitNew(); if (e.key === "Escape") { setCreating(false); setNewName(""); } }}
-              style={{ flex: 1, padding: "5px 10px", border: "0.5px solid var(--color-border-secondary)",
-                borderRadius: "var(--border-radius-md)", fontSize: 13,
-                background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
-            <Btn primary onClick={submitNew}>Create</Btn>
-            <Btn onClick={() => { setCreating(false); setNewName(""); }}>Cancel</Btn>
-          </div>
-        )}
+        <div className="card">
+          {creating && (
+            <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: "1rem",
+                padding: "10px 12px", border: "0.5px solid var(--color-border-secondary)",
+                borderRadius: "var(--border-radius-lg)", background: "var(--color-background-secondary)" }}>
+              <label style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>Project name:</label>
+              <input value={newName} onChange={e => setNewName(e.target.value)} autoFocus
+                placeholder="e.g. Plant_A"
+                onKeyDown={e => { if (e.key === "Enter") submitNew(); if (e.key === "Escape") { setCreating(false); setNewName(""); } }}
+                style={{ flex: 1, padding: "5px 10px", border: "0.5px solid var(--color-border-secondary)",
+                  borderRadius: "var(--border-radius-md)", fontSize: 13,
+                  background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
+              <Btn primary onClick={submitNew}>Create</Btn>
+              <Btn onClick={() => { setCreating(false); setNewName(""); }}>Cancel</Btn>
+            </div>
+          )}
 
-        <SLabel text="Saved projects" />
+          <SLabel text="Saved projects" />
         {projects.length === 0 ? (
           <div style={{ border: "1.5px dashed var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)",
               padding: "1.5rem", textAlign: "center", color: "var(--color-text-secondary)", fontSize: 13, marginBottom: "1.5rem" }}>
@@ -1011,13 +1008,14 @@ function StepProjects({ loading, savedProjectName, savedProjectId,
               onConfigChange={onProjectConfigChange}
               setError={setError} />
           </>
-        )}
+          )}
 
-        {loading && (
-          <div style={{ textAlign: "center", marginTop: 12, fontSize: 13, color: "var(--color-text-secondary)" }}>
-            {loading}
-          </div>
-        )}
+          {loading && (
+            <div style={{ textAlign: "center", marginTop: 12, fontSize: 13, color: "var(--color-text-secondary)" }}>
+              {loading}
+            </div>
+          )}
+        </div>
     </div>
   );
 }
@@ -1434,19 +1432,19 @@ function CmtPanel({ cmtProfiles, ensureLoaded, toggleBlock, onDelete, onVarDefau
                 );
               })}
             </div>
-            <div style={{ flex: 1, overflowY: "auto", padding: "1rem 1.25rem" }}>
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", overflowY: "auto", padding: detailTab === "blocks" ? "1rem 1.25rem" : 0 }}>
               {loadingBlocks ? (
-                <div style={{ color: "var(--color-text-secondary)", fontSize: 13 }}>Loading…</div>
+                <div style={{ color: "var(--color-text-secondary)", fontSize: 13, padding: "1rem 1.25rem" }}>Loading…</div>
               ) : !profile?.subBlocks ? (
-                <div style={{ color: "var(--color-text-secondary)", fontSize: 13 }}>Select a CM type</div>
+                <div style={{ color: "var(--color-text-secondary)", fontSize: 13, padding: "1rem 1.25rem" }}>Select a CM type</div>
               ) : (
                 <>
-                  <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 2 }}>{profile.cmType}</div>
-                  <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: "1rem" }}>
-                    {profile.comment}{profile.samplingTime ? ` · ${profile.samplingTime} ms` : ""}
-                  </div>
                   {detailTab === "blocks" && (
                     <>
+                      <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 2 }}>{profile.cmType}</div>
+                      <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: "1rem" }}>
+                        {profile.comment}{profile.samplingTime ? ` · ${profile.samplingTime} ms` : ""}
+                      </div>
                       <SLabel text={`Required (${reqBlocks.length})`} />
                       {reqBlocks.map(b => <BlockRow key={b.name} block={b} on={true} required={true} onToggle={() => {}} />)}
                       <SLabel text={`Optional (${optBlocks.length})`} top />
@@ -1457,13 +1455,22 @@ function CmtPanel({ cmtProfiles, ensureLoaded, toggleBlock, onDelete, onVarDefau
                     </>
                   )}
                   {(detailTab === "inputs" || detailTab === "outputs") && (
-                    <VarTable
-                      vars={detailTab === "inputs" ? inputVars : outputVars}
-                      cmTypeName={profile.id}
-                      editable={detailTab === "inputs"}
-                      showValid={true}
-                      onVarDefaultChange={(varId, newVal) => onVarDefaultChange?.(profile.id, varId, newVal)}
-                      onVarValidChange={(varId, isValid) => onVarValidChange?.(profile.id, varId, isValid)} />
+                    <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
+                      <div style={{ padding: "0.75rem 1.25rem", borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 12, fontWeight: 500, flexShrink: 0, color: "var(--color-text-secondary)" }}>
+                        {detailTab === "inputs" ? "Input Parameters" : "Output Parameters"}
+                      </div>
+                      <div style={{ flex: 1, minHeight: 0 }}>
+                        <VarTableErrorBoundary key={`${profile.id}-${detailTab}`}>
+                          <VarTable
+                            vars={detailTab === "inputs" ? inputVars : outputVars}
+                            cmTypeName={profile.id}
+                            editable={detailTab === "inputs"}
+                            showValid={true}
+                            onVarDefaultChange={(varId, newVal) => onVarDefaultChange?.(profile.id, varId, newVal)}
+                            onVarValidChange={(varId, isValid) => onVarValidChange?.(profile.id, varId, isValid)} />
+                        </VarTableErrorBoundary>
+                      </div>
+                    </div>
                   )}
                 </>
               )}
@@ -1474,14 +1481,34 @@ function CmtPanel({ cmtProfiles, ensureLoaded, toggleBlock, onDelete, onVarDefau
   );
 }
 
+class VarTableErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { error: null }; }
+  static getDerivedStateFromError(error) { return { error }; }
+  componentDidCatch(error, info) { console.error("VarTable crashed:", error, info); }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{ padding: "1rem 1.25rem", color: "#DC2626", fontSize: 12, fontFamily: "var(--font-mono)", whiteSpace: "pre-wrap" }}>
+          Error rendering parameters:{"\n"}{String(this.state.error?.message || this.state.error)}
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 function VarTable({ vars, cmTypeName, editable, showValid, onVarDefaultChange, onVarValidChange }) {
   const gridRef = useRef(null);
   const [drafts, setDrafts] = useState({});
   const [saving, setSaving] = useState({});
   const [validSaving, setValidSaving] = useState({});
 
-  if (!vars.length) {
-    return <div style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>No parameters found.</div>;
+  if (!vars || !vars.length) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", fontSize: 13, color: "var(--color-text-secondary)" }}>
+        No parameters found.
+      </div>
+    );
   }
 
   async function commitVal(v, newVal) {
@@ -1630,18 +1657,17 @@ function VarTable({ vars, cmTypeName, editable, showValid, onVarDefaultChange, o
   const getRowId = useCallback(p => String(p.data.id || p.data.name), []);
 
   return (
-    <div className="ig-root" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-      <div className="ig-grid-wrap" style={{ flex: 1, minHeight: 0 }}>
-        <AgGridReact
-          ref={gridRef}
-          theme={theme}
-          rowData={vars}
-          columnDefs={columnDefs}
-          defaultColDef={defaultColDef}
-          getRowId={getRowId}
-          animateRows={false}
-        />
-      </div>
+    <div className="ig-root" style={{ width: '100%', height: '100%', overflowY: 'auto' }}>
+      <AgGridReact
+        ref={gridRef}
+        theme={theme}
+        domLayout="autoHeight"
+        rowData={vars}
+        columnDefs={columnDefs}
+        defaultColDef={defaultColDef}
+        getRowId={getRowId}
+        animateRows={false}
+      />
     </div>
   );
 }
@@ -3989,6 +4015,7 @@ function StepUnitTypes({
   const [compDetails, setCompDetails]       = useState({});     // compositeId -> { members: [...] }
   const [openMembers, setOpenMembers]       = useState({});     // member idx -> expanded bool
   const [importModalOpen, setImportModalOpen] = useState(false); // show import unit type modal
+  const [spirographOpen, setSpirogramOpen]  = useState(false);   // show spirograph modal
 
   // Local editable copy of unit instances so typing in the grid is instant.
   // The prop is the source of truth (server state); we mirror it locally and
@@ -4390,7 +4417,10 @@ function StepUnitTypes({
                 />
               </div>
 
-              <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", marginTop: '1.5rem', gap: '0.75rem' }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: '1.5rem', gap: '0.75rem' }}>
+                <Btn onClick={() => setSpirogramOpen(true)} disabled={busy || editDraft.members.length === 0}>
+                  <i className="ti ti-geometry" /> View Spirograph
+                </Btn>
                 <Btn primary onClick={handleSaveType} disabled={busy || !editDraft.name.trim()}>
                   <i className="ti ti-device-floppy" /> Save Unit Type
                 </Btn>
@@ -4521,6 +4551,20 @@ function StepUnitTypes({
           onUnitTypesChange();
         }}
       />
+
+      {/* Spirograph Modal — full screen */}
+      {spirographOpen && (
+        <div style={{ position: "fixed", inset: 0, background: "var(--color-background-primary)", display: "flex", flexDirection: "column", zIndex: 1000 }}>
+          <UnitTypeSpirograph
+            unitTypeName={editDraft?.name || "Unit Type"}
+            members={editDraft?.members || []}
+            compositeCmTypes={compositeCmTypes}
+            compDetails={compDetails}
+            cmtProfiles={cmtProfiles}
+            onClose={() => setSpirogramOpen(false)}
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -4634,15 +4678,17 @@ function BlockRow({ block, on, required, onToggle }) {
   );
 }
 
-function Btn({ onClick, primary, disabled, children }) {
+function Btn({ onClick, primary, disabled, children, style }) {
   return (
     <button onClick={onClick} disabled={disabled}
       style={{ padding: "7px 18px", borderRadius: "var(--border-radius-md)",
         border: primary ? "none" : "0.5px solid var(--color-border-secondary)",
         cursor: disabled ? "not-allowed" : "pointer", fontSize: 13, fontWeight: primary ? 500 : 400,
-        background: primary ? "var(--color-text-primary)" : "transparent",
-        color: primary ? "var(--color-background-primary)" : "var(--color-text-primary)",
-        opacity: disabled ? 0.4 : 1, display: "flex", alignItems: "center", gap: 6 }}>
+        background: primary ? "var(--color-accent)" : "transparent",
+        color: primary ? "white" : "var(--color-text-primary)",
+        opacity: disabled ? 0.5 : 1, display: "flex", alignItems: "center", gap: 6,
+        transition: "all 0.2s ease",
+        ...style }}>
       {children}
     </button>
   );
