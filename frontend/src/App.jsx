@@ -875,7 +875,7 @@ function StepProjects({ loading, savedProjectName, savedProjectId,
   }
 
   return (
-    <div style={{ maxWidth: '1200px', margin: '0 auto' }}>
+    <div>
         <div className="card">
           <div className="card-header">
             <div>
