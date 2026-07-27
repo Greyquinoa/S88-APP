@@ -95,8 +95,8 @@ const IO_TABS = [
 
 function SubTabs({ tab, setTab, importReady }) {
   return (
-    <div style={{ display: 'flex', borderBottom: '0.5px solid var(--color-border-tertiary)',
-        marginBottom: 0, background: 'var(--color-background-secondary)' }}>
+    <div style={{ display: 'flex', gap: '1.5rem', paddingBottom: '1.25rem', paddingX: '1.5rem',
+        borderBottom: '1px solid #E5E7EB', background: '#FAFAFA', paddingTop: '1.25rem' }}>
       {IO_TABS.map((t, i) => {
         // Upload (index 1) and Function Mapping (index 0) are always enabled
         // Other tabs require an import to be ready
@@ -104,15 +104,25 @@ function SubTabs({ tab, setTab, importReady }) {
         const active   = tab === t.key;
         return (
           <button key={t.key} onClick={() => !disabled && setTab(t.key)} disabled={disabled}
-            style={{ padding: '8px 16px', border: 'none', background: 'transparent',
-              cursor: disabled ? 'not-allowed' : 'pointer', fontSize: 12,
-              fontWeight: active ? 600 : 400,
-              color: disabled ? 'var(--color-border-secondary)'
-                   : active   ? 'var(--color-text-primary)'
-                              : 'var(--color-text-secondary)',
-              borderBottom: active ? '2px solid var(--color-text-primary)' : '2px solid transparent',
-              marginBottom: -1, display: 'flex', alignItems: 'center', gap: 5 }}>
-            <i className={`ti ${t.icon}`} style={{ fontSize: 13 }} />
+            style={{
+              padding: 0,
+              border: 'none',
+              background: 'transparent',
+              cursor: disabled ? 'not-allowed' : 'pointer',
+              fontSize: '0.875rem',
+              fontWeight: active ? 600 : 500,
+              color: disabled ? '#D1D5DB'
+                   : active   ? '#4F46E5'
+                              : '#6B7280',
+              borderBottom: active ? '2px solid #4F46E5' : '2px solid transparent',
+              paddingBottom: '0.5rem',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.5rem',
+              transition: 'all 0.2s ease',
+              fontFamily: 'Inter, system-ui, -apple-system, sans-serif'
+            }}>
+            <i className={`ti ${t.icon}`} style={{ fontSize: '1rem' }} />
             {t.label}
           </button>
         );
@@ -197,76 +207,143 @@ function TabUpload({ projectId, imports, onImported, onSelectImport, onDeleteImp
   }
 
   return (
-    <div style={{ display: 'flex', gap: 16, height: '100%' }}>
+    <div style={{ display: 'flex', gap: '1.5rem', height: '100%', padding: '1.5rem' }}>
       {/* Left: existing imports list */}
-      <div style={{ width: 260, flexShrink: 0, borderRight: '0.5px solid var(--color-border-tertiary)',
-          display: 'flex', flexDirection: 'column' }}>
-        <div style={{ padding: '8px 10px', fontSize: 11, fontWeight: 600, textTransform: 'uppercase',
-            letterSpacing: '0.05em', color: 'var(--color-text-secondary)',
-            borderBottom: '0.5px solid var(--color-border-tertiary)' }}>
-          Imports
+      <div style={{ width: 280, flexShrink: 0, display: 'flex', flexDirection: 'column' }}>
+        <div style={{ padding: '0 0 1rem 0', fontSize: '0.75rem', fontWeight: 600, textTransform: 'uppercase',
+            letterSpacing: '0.08em', color: '#6B7280', marginBottom: '0.5rem' }}>
+          Recent Imports
         </div>
-        <div style={{ overflowY: 'auto', flex: 1 }}>
+        <div style={{ overflowY: 'auto', flex: 1, display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
           {imports.length === 0 && (
-            <div style={{ padding: 12, fontSize: 12, color: 'var(--color-text-secondary)' }}>
+            <div style={{ padding: '1rem', fontSize: '0.875rem', color: '#9CA3AF', textAlign: 'center', backgroundColor: '#F9FAFB', borderRadius: '0.75rem', border: '1px solid #E5E7EB' }}>
               No imports yet.
             </div>
           )}
           {imports.map(imp => (
             <div key={imp.id} onClick={() => onSelectImport(imp.id)}
-              style={{ padding: '8px 10px', cursor: 'pointer', borderBottom: '0.5px solid var(--color-border-tertiary)',
-                background: imp.id === selectedImportId ? '#EEEDFE' : 'transparent',
-                display: 'flex', alignItems: 'flex-start', gap: 6 }}>
+              style={{
+                padding: '1rem',
+                cursor: 'pointer',
+                background: imp.id === selectedImportId ? '#EEF2FF' : '#FFFFFF',
+                border: imp.id === selectedImportId ? '1px solid #4F46E5' : '1px solid #E5E7EB',
+                borderRadius: '0.75rem',
+                display: 'flex',
+                alignItems: 'flex-start',
+                gap: '0.75rem',
+                transition: 'all 0.2s ease',
+                boxShadow: imp.id === selectedImportId ? '0 1px 3px rgba(0,0,0,0.1)' : '0 1px 2px rgba(0,0,0,0.05)'
+              }}>
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontSize: 12, fontWeight: 500, fontFamily: 'var(--font-mono)',
-                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                <div style={{ fontSize: '0.875rem', fontWeight: 500, fontFamily: 'Inter, system-ui, -apple-system, sans-serif',
+                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: '#111827' }}>
                   {imp.file_name}
                 </div>
-                <div style={{ fontSize: 10, color: 'var(--color-text-secondary)', marginTop: 2, display: 'flex', gap: 8 }}>
+                <div style={{ fontSize: '0.75rem', color: '#6B7280', marginTop: '0.375rem', display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
                   <span>{imp.total_tags ?? imp.total_rows ?? '?'} tags</span>
                   <Tag text={imp.status} color={imp.status === 'promoted' ? 'green' : 'gray'} />
                 </div>
               </div>
-              <button
-                onClick={e => {
-                  e.stopPropagation();
-                  setReimportId(imp.id);
-                  onSelectImport(imp.id);
-                  reimportRef.current.value = '';
-                  reimportRef.current.click();
-                }}
-                title="Reimport — replace with new file"
-                style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '2px 3px',
-                  color: 'var(--color-text-secondary)', flexShrink: 0, lineHeight: 1 }}>
-                <i className="ti ti-refresh" style={{ fontSize: 13 }} />
-              </button>
-              <button
-                onClick={e => { e.stopPropagation(); onDeleteImport(imp.id, imp.file_name); }}
-                title="Delete import"
-                style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '2px 3px',
-                  color: 'var(--color-text-secondary)', flexShrink: 0, lineHeight: 1 }}>
-                <i className="ti ti-trash" style={{ fontSize: 13 }} />
-              </button>
+              <div style={{ display: 'flex', gap: '0.5rem', flexShrink: 0 }}>
+                <button
+                  onClick={e => {
+                    e.stopPropagation();
+                    setReimportId(imp.id);
+                    onSelectImport(imp.id);
+                    reimportRef.current.value = '';
+                    reimportRef.current.click();
+                  }}
+                  title="Reimport — replace with new file"
+                  style={{
+                    background: 'transparent',
+                    border: 'none',
+                    cursor: 'pointer',
+                    padding: '0.375rem',
+                    color: '#9CA3AF',
+                    flexShrink: 0,
+                    lineHeight: 1,
+                    transition: 'color 0.2s ease',
+                    fontSize: '1rem'
+                  }}
+                  onMouseEnter={(e) => e.target.style.color = '#4F46E5'}
+                  onMouseLeave={(e) => e.target.style.color = '#9CA3AF'}>
+                  <i className="ti ti-refresh" />
+                </button>
+                <button
+                  onClick={e => { e.stopPropagation(); onDeleteImport(imp.id, imp.file_name); }}
+                  title="Delete import"
+                  style={{
+                    background: 'transparent',
+                    border: 'none',
+                    cursor: 'pointer',
+                    padding: '0.375rem',
+                    color: '#9CA3AF',
+                    flexShrink: 0,
+                    lineHeight: 1,
+                    transition: 'color 0.2s ease',
+                    fontSize: '1rem'
+                  }}
+                  onMouseEnter={(e) => e.target.style.color = '#EF4444'}
+                  onMouseLeave={(e) => e.target.style.color = '#9CA3AF'}>
+                  <i className="ti ti-trash" />
+                </button>
+              </div>
             </div>
           ))}
         </div>
       </div>
 
       {/* Right: upload form + preview */}
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 12, overflowY: 'auto' }}>
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '1.5rem', overflowY: 'auto' }}>
         {/* Options row */}
-        <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', gap: '1rem', alignItems: 'flex-end', flexWrap: 'wrap' }}>
           <div>
-            <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', marginBottom: 3 }}>Column mapping config</div>
-            <select value={selColMap} onChange={e => setSelColMap(e.target.value)} style={{ ...inputSx, width: 200 }}>
+            <label style={{ fontSize: '0.75rem', fontWeight: 500, textTransform: 'uppercase', letterSpacing: '0.05em', color: '#6B7280', display: 'block', marginBottom: '0.5rem' }}>Column mapping config</label>
+            <select value={selColMap} onChange={e => setSelColMap(e.target.value)} style={{
+              padding: '0.625rem 0.75rem',
+              borderRadius: '0.5rem',
+              fontSize: '0.875rem',
+              fontFamily: 'Inter, system-ui, -apple-system, sans-serif',
+              background: '#FFFFFF',
+              color: '#111827',
+              border: '1px solid #D1D5DB',
+              width: '200px',
+              cursor: 'pointer',
+              appearance: 'none',
+              backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%236B7280' d='M2 4l4 4 4-4'/%3E%3C/svg%3E")`,
+              backgroundRepeat: 'no-repeat',
+              backgroundPosition: 'right 0.75rem center',
+              paddingRight: '2rem',
+              transition: 'border-color 0.2s ease'
+            }}
+            onFocus={(e) => e.target.style.borderColor = '#4F46E5'}
+            onBlur={(e) => e.target.style.borderColor = '#D1D5DB'}>
               <option value="">(auto-detect)</option>
               {columnMaps.map(cm => <option key={cm.id} value={cm.id}>{cm.name}</option>)}
             </select>
           </div>
           {availSheets.length > 1 && (
             <div>
-              <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', marginBottom: 3 }}>Sheet to import</div>
-              <select value={selSheet} onChange={e => setSelSheet(e.target.value)} style={{ ...inputSx, width: 200 }}>
+              <label style={{ fontSize: '0.75rem', fontWeight: 500, textTransform: 'uppercase', letterSpacing: '0.05em', color: '#6B7280', display: 'block', marginBottom: '0.5rem' }}>Sheet to import</label>
+              <select value={selSheet} onChange={e => setSelSheet(e.target.value)} style={{
+                padding: '0.625rem 0.75rem',
+                borderRadius: '0.5rem',
+                fontSize: '0.875rem',
+                fontFamily: 'Inter, system-ui, -apple-system, sans-serif',
+                background: '#FFFFFF',
+                color: '#111827',
+                border: '1px solid #D1D5DB',
+                width: '200px',
+                cursor: 'pointer',
+                appearance: 'none',
+                backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%236B7280' d='M2 4l4 4 4-4'/%3E%3C/svg%3E")`,
+                backgroundRepeat: 'no-repeat',
+                backgroundPosition: 'right 0.75rem center',
+                paddingRight: '2rem',
+                transition: 'border-color 0.2s ease'
+              }}
+              onFocus={(e) => e.target.style.borderColor = '#4F46E5'}
+              onBlur={(e) => e.target.style.borderColor = '#D1D5DB'}>
                 <option value="">(first sheet)</option>
                 {availSheets.map(sheet => (
                   <option key={sheet} value={sheet}>{sheet}</option>
@@ -278,17 +355,47 @@ function TabUpload({ projectId, imports, onImported, onSelectImport, onDeleteImp
 
         {/* Drop zone */}
         <div
-          style={{ border: '1.5px dashed var(--color-border-secondary)', borderRadius: 8,
-            padding: '2rem', textAlign: 'center', cursor: 'pointer',
-            background: busy ? 'var(--color-background-secondary)' : 'transparent' }}
+          style={{
+            border: '2px dashed #C7D2FE',
+            borderRadius: '1rem',
+            padding: '3rem 2rem',
+            textAlign: 'center',
+            cursor: 'pointer',
+            background: busy ? '#F0F4FF' : '#FAFAFA',
+            transition: 'all 0.2s ease'
+          }}
           onClick={() => fileRef.current?.click()}
-          onDragOver={e => e.preventDefault()}
-          onDrop={e => { e.preventDefault(); handleFile(e.dataTransfer.files[0]); }}>
-          <i className="ti ti-file-spreadsheet" style={{ fontSize: 32, color: 'var(--color-text-secondary)', display: 'block', marginBottom: 10 }} />
-          <div style={{ fontSize: 14, fontWeight: 500 }}>
-            {busy ? 'Parsing…' : 'Drop IO List Excel here (.xlsx / .xls)'}
+          onDragOver={(e) => {
+            e.preventDefault();
+            e.currentTarget.style.background = '#EEF2FF';
+            e.currentTarget.style.borderColor = '#4F46E5';
+          }}
+          onDragLeave={(e) => {
+            e.currentTarget.style.background = busy ? '#F0F4FF' : '#FAFAFA';
+            e.currentTarget.style.borderColor = '#C7D2FE';
+          }}
+          onDrop={(e) => {
+            e.preventDefault();
+            e.currentTarget.style.background = busy ? '#F0F4FF' : '#FAFAFA';
+            e.currentTarget.style.borderColor = '#C7D2FE';
+            handleFile(e.dataTransfer.files[0]);
+          }}>
+          <div style={{
+            width: '3.5rem',
+            height: '3.5rem',
+            background: '#EEF2FF',
+            borderRadius: '0.75rem',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            margin: '0 auto 1rem auto'
+          }}>
+            <i className="ti ti-file-spreadsheet" style={{ fontSize: '1.75rem', color: '#4F46E5' }} />
           </div>
-          <div style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginTop: 4 }}>
+          <div style={{ fontSize: '1.125rem', fontWeight: 600, color: '#111827' }}>
+            {busy ? 'Parsing…' : 'Drop IO List Excel here'}
+          </div>
+          <div style={{ fontSize: '0.875rem', color: '#6B7280', marginTop: '0.5rem' }}>
             or click to browse · All customer columns are preserved
           </div>
         </div>
