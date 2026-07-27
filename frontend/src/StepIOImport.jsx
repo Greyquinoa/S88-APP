@@ -118,11 +118,9 @@ function SubTabs({ tab, setTab, importReady }) {
               paddingBottom: '0.5rem',
               display: 'flex',
               alignItems: 'center',
-              gap: '0.5rem',
               transition: 'all 0.2s ease',
               fontFamily: 'Inter, system-ui, -apple-system, sans-serif'
             }}>
-            <i className={`ti ${t.icon}`} style={{ fontSize: '1rem' }} />
             {t.label}
           </button>
         );
