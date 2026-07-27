@@ -47,8 +47,8 @@ export default function Sidebar({ activeStep, onStepChange, libStatus, projectNa
           {/* Footer stats */}
           <div className="sidebar-footer">
             {projectName && (
-              <div style={{ fontSize: 12, color: 'var(--color-text-secondary)', fontWeight: 500 }}>
-                Project: <strong style={{ wordBreak: 'break-word' }}>{projectName}</strong>
+              <div style={{ fontSize: '0.875rem', color: '#6B7280', fontWeight: 400 }}>
+                Project: <strong style={{ wordBreak: 'break-word', color: '#111827' }}>{projectName}</strong>
               </div>
             )}
             {libStatus?.cm_count > 0 && (
@@ -64,7 +64,7 @@ export default function Sidebar({ activeStep, onStepChange, libStatus, projectNa
       {/* Icon Rail - shown only when collapsed */}
       {!expanded && (
         <div className="sidebar-rail">
-          <div style={{ marginBottom: 16, fontSize: 18, fontWeight: 700, color: '#34D399' }}>
+          <div style={{ marginBottom: '1rem', fontSize: '1.5rem', fontWeight: 700, color: '#34D399' }}>
             ⚙️
           </div>
 
@@ -86,17 +86,17 @@ export default function Sidebar({ activeStep, onStepChange, libStatus, projectNa
           {libStatus?.cm_count > 0 && (
             <div
               style={{
-                width: 44,
-                height: 44,
+                width: '2.75rem',
+                height: '2.75rem',
                 borderRadius: '50%',
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
-                fontSize: 11,
-                fontWeight: 700,
+                fontSize: '0.75rem',
+                fontWeight: 600,
                 color: '#34D399',
                 background: 'var(--color-background-secondary)',
-                marginBottom: 16,
+                marginBottom: '1rem',
                 cursor: 'default',
               }}
               title={`${libStatus.cm_count} types loaded`}
