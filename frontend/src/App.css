@@ -234,28 +234,6 @@ input, select, button, pre { font-family: inherit; }
   color: var(--color-text-primary);
 }
 
-.sidebar-action-btn {
-  width: 100%;
-  padding: 10px 12px;
-  border: 2px solid var(--color-accent);
-  background: transparent;
-  color: var(--color-accent);
-  border-radius: 20px;
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  margin-bottom: 16px;
-  transition: all 0.2s ease;
-}
-
-.sidebar-action-btn:hover {
-  background: var(--color-accent-light);
-}
-
 .sidebar-nav {
   flex: 1;
   display: flex;

@@ -30,12 +30,6 @@ export default function Sidebar({ activeStep, onStepChange, libStatus, projectNa
             </button>
           </div>
 
-          {/* Primary action */}
-          <button className="sidebar-action-btn">
-            <i className="ti ti-plus" />
-            Add New
-          </button>
-
           {/* Navigation list */}
           <nav className="sidebar-nav">
             {STEPS_CONFIG.map(step => (
