@@ -15,60 +15,16 @@ export default function Sidebar({ activeStep, onStepChange, libStatus, projectNa
   const [expanded, setExpanded] = useState(true);
 
   return (
-    <div className="sidebar">
-      {/* Icon Rail */}
-      <div className="sidebar-rail">
-        <div style={{ marginBottom: 16, fontSize: 18, fontWeight: 700, color: '#34D399' }}>
-          ⚙️
-        </div>
-
-        {STEPS_CONFIG.map(step => (
-          <button
-            key={step.id}
-            onClick={() => onStepChange(step.id)}
-            className={`sidebar-rail-item ${activeStep === step.id ? 'active' : ''}`}
-            title={step.label}
-          >
-            <i className={`ti ${step.icon}`} />
-          </button>
-        ))}
-
-        <div style={{ flex: 1 }} />
-
-        {/* Progress indicator */}
-        {libStatus?.cm_count > 0 && (
-          <div style={{
-            width: 44,
-            height: 44,
-            borderRadius: '50%',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            fontSize: 11,
-            fontWeight: 700,
-            color: '#34D399',
-            background: 'var(--color-background-secondary)',
-            marginBottom: 16,
-          }}>
-            {libStatus.cm_count}
-          </div>
-        )}
-
-        {/* Utility icons */}
-        <button className="sidebar-rail-item" style={{ marginTop: 'auto' }} title="Help">
-          <i className="ti ti-help" />
-        </button>
-      </div>
-
-      {/* Expandable Panel */}
+    <>
+      {/* Sidebar Container - only takes space when expanded */}
       {expanded && (
-        <div className="sidebar-panel">
+        <div className="sidebar-panel-expanded">
           <div className="sidebar-header">
             <h1>PCS7 App</h1>
             <button
               className="sidebar-collapse-btn"
               onClick={() => setExpanded(false)}
-              title="Collapse"
+              title="Collapse sidebar"
             >
               <i className="ti ti-chevron-left" />
             </button>
@@ -98,7 +54,7 @@ export default function Sidebar({ activeStep, onStepChange, libStatus, projectNa
           <div className="sidebar-footer">
             {projectName && (
               <div style={{ fontSize: 12, color: 'var(--color-text-secondary)', fontWeight: 500 }}>
-                Project: <strong>{projectName}</strong>
+                Project: <strong style={{ wordBreak: 'break-word' }}>{projectName}</strong>
               </div>
             )}
             {libStatus?.cm_count > 0 && (
@@ -111,17 +67,59 @@ export default function Sidebar({ activeStep, onStepChange, libStatus, projectNa
         </div>
       )}
 
-      {/* Collapsed state - show expand chevron */}
-      {!expanded && (
+      {/* Icon Rail - always visible */}
+      <div className="sidebar-rail">
+        <div style={{ marginBottom: 16, fontSize: 18, fontWeight: 700, color: '#34D399' }}>
+          ⚙️
+        </div>
+
+        {STEPS_CONFIG.map(step => (
+          <button
+            key={step.id}
+            onClick={() => onStepChange(step.id)}
+            className={`sidebar-rail-item ${activeStep === step.id ? 'active' : ''}`}
+            title={step.label}
+            aria-label={step.label}
+          >
+            <i className={`ti ${step.icon}`} />
+          </button>
+        ))}
+
+        <div style={{ flex: 1 }} />
+
+        {/* Progress indicator */}
+        {libStatus?.cm_count > 0 && (
+          <div
+            style={{
+              width: 44,
+              height: 44,
+              borderRadius: '50%',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              fontSize: 11,
+              fontWeight: 700,
+              color: '#34D399',
+              background: 'var(--color-background-secondary)',
+              marginBottom: 16,
+              cursor: 'default',
+            }}
+            title={`${libStatus.cm_count} types loaded`}
+          >
+            {libStatus.cm_count}
+          </div>
+        )}
+
+        {/* Toggle button */}
         <button
-          className="sidebar-collapse-btn"
-          onClick={() => setExpanded(true)}
-          style={{ margin: '16px auto', position: 'absolute', bottom: 16 }}
-          title="Expand"
+          className="sidebar-toggle-btn"
+          onClick={() => setExpanded(!expanded)}
+          title={expanded ? 'Collapse sidebar' : 'Expand sidebar'}
+          aria-label={expanded ? 'Collapse sidebar' : 'Expand sidebar'}
         >
-          <i className="ti ti-chevron-right" />
+          <i className={`ti ti-chevron-${expanded ? 'left' : 'right'}`} />
         </button>
-      )}
-    </div>
+      </div>
+    </>
   );
 }
