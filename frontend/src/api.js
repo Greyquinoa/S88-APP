@@ -706,3 +706,57 @@ export async function getMatrixOverrides(projectId) {
 export async function setMatrixOverride(projectId, instanceName, enabled, cells) {
   return request('PUT', `/connections/matrix-override/${projectId}/instance/${encodeURIComponent(instanceName)}`, { enabled, cells });
 }
+
+// ── EPH/EM Import System ──────────────────────────────────────────────────────
+export async function uploadEphEmList(projectId, file, sheetName, columnMapId) {
+  const fd = new FormData();
+  fd.append('ephemlist', file);
+  let path = `/eph-em/project/${projectId}/upload`;
+  const qs = [];
+  if (sheetName)   qs.push(`sheet=${encodeURIComponent(sheetName)}`);
+  if (columnMapId) qs.push(`column_map_id=${columnMapId}`);
+  if (qs.length)   path += '?' + qs.join('&');
+  return request('POST', path, fd, true);
+}
+
+export async function listEphEmImports(projectId) { return request('GET', `/eph-em/project/${projectId}/imports`); }
+export async function getEphEmImport(id) { return request('GET', `/eph-em/imports/${id}`); }
+export async function deleteEphEmImport(id) { return request('DELETE', `/eph-em/imports/${id}`); }
+
+export async function getEphEmRows(importId, params = {}) {
+  const qs = new URLSearchParams(params).toString();
+  return request('GET', `/eph-em/imports/${importId}/rows${qs ? '?' + qs : ''}`);
+}
+
+export async function patchEphEmRow(importId, rowId, body) {
+  return request('PATCH', `/eph-em/imports/${importId}/rows/${rowId}`, body);
+}
+
+export async function rejectEphEmRow(importId, rowId) {
+  return request('DELETE', `/eph-em/imports/${importId}/rows/${rowId}`);
+}
+
+export async function getEphEmColumnMaps() { return request('GET', '/eph-em/column-maps'); }
+export async function createEphEmColumnMap(data) { return request('POST', '/eph-em/column-maps', data); }
+export async function updateEphEmColumnMap(id, data) { return request('PUT', `/eph-em/column-maps/${id}`, data); }
+export async function deleteEphEmColumnMap(id) { return request('DELETE', `/eph-em/column-maps/${id}`); }
+
+export async function applyEphEmColumnMap(importId, mappings, headers) {
+  return request('POST', `/eph-em/imports/${importId}/apply-column-map`, { mappings, headers });
+}
+
+export async function getEphEmFunctionMapConfigs() { return request('GET', '/eph-em/function-map-configs'); }
+export async function createEphEmFunctionMapConfig(data) { return request('POST', '/eph-em/function-map-configs', data); }
+
+export async function getEphEmTypeMappingConfigs() { return request('GET', '/eph-em/type-mapping-configs'); }
+export async function createEphEmTypeMappingConfig(data) { return request('POST', '/eph-em/type-mapping-configs', data); }
+export async function updateEphEmTypeMappingConfig(id, data) { return request('PATCH', `/eph-em/type-mapping-configs/${id}`, data); }
+export async function deleteEphEmTypeMappingConfig(id) { return request('DELETE', `/eph-em/type-mapping-configs/${id}`); }
+
+export async function runEphEmAssignment(importId, type_column_mappings) {
+  return request('POST', `/eph-em/imports/${importId}/assign`, { type_column_mappings });
+}
+
+export async function promoteEphEmImport(importId, projectId) {
+  return request('POST', `/eph-em/imports/${importId}/promote`, { projectId });
+}

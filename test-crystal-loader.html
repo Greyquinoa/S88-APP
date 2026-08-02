@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Crystal Loader Test</title>
+  <style>
+    body { margin: 0; padding: 20px; background: #f5f5f5; font-family: Inter, sans-serif; }
+    .test-container { background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); max-width: 600px; margin: 0 auto; }
+    h1 { margin-top: 0; }
+  </style>
+</head>
+<body>
+  <div class="test-container">
+    <h1>Crystal Loader Web Component Test</h1>
+    <p>The crystal loader should appear below:</p>
+    <crystal-loader style="--crystal-loader-size: 160px; --crystal-loader-bg: transparent;"></crystal-loader>
+    <p style="margin-top: 40px; text-align: center; font-size: 16px; font-weight: 500; color: #666;">Parsing...</p>
+  </div>
+
+  <script>
+    // Register crystal-loader web component
+    if (typeof customElements !== 'undefined' && !customElements.get('crystal-loader')) {
+      const CrystalLoaderTemplate = document.createElement('template');
+      CrystalLoaderTemplate.innerHTML = `
+        <style>
+          :host {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: var(--crystal-loader-size, 200px);
+            height: var(--crystal-loader-size, 200px);
+            background: var(--crystal-loader-bg, #17afbd);
+            border-radius: var(--crystal-loader-radius, 16px);
+          }
+          svg { width: 100%; height: 100%; }
+
+          @keyframes bounce { 0%, 100% { translate: 0px 36px; } 50% { translate: 0px 46px; } }
+          @keyframes bounce2 { 0%, 100% { translate: 0px 46px; } 50% { translate: 0px 56px; } }
+          @keyframes umbral {
+            0% { stop-color: #10bcd32e; }
+            50% { stop-color: #2fcad8; }
+            100% { stop-color: #10d3982e; }
+          }
+          @keyframes partciles { 0%, 100% { translate: 0px 16px; } 50% { translate: 0px 6px; } }
+
+          #particles { animation: partciles 4s ease-in-out infinite; }
+          #animatedStop { animation: umbral 4s infinite; }
+          #bounce { animation: bounce 4s ease-in-out infinite; translate: 0px 36px; }
+          #bounce2 {
+            animation: bounce2 4s ease-in-out infinite;
+            translate: 0px 46px;
+            animation-delay: 0.5s;
+          }
+        </style>
+
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+          <g>
+            <polygon transform="rotate(45 100 100)" stroke-width="1" stroke="#17afbd" fill="none" points="70,70 148,50 130,130 50,150" id="bounce"></polygon>
+            <polygon transform="rotate(45 100 100)" stroke-width="1" stroke="#07e7fca4" fill="none" points="70,70 148,50 130,130 50,150" id="bounce2"></polygon>
+            <polygon transform="rotate(45 100 100)" stroke-width="2" fill="#414750" points="70,70 150,50 130,130 50,150"></polygon>
+            <polygon stroke-width="2" fill="url(#gradiente)" points="100,70 150,100 100,130 50,100"></polygon>
+            <defs>
+              <linearGradient y2="100%" x2="10%" y1="0%" x1="0%" id="gradiente">
+                <stop style="stop-color:#1e2026;stop-opacity:1" offset="20%"></stop>
+                <stop style="stop-color:#414750;stop-opacity:1" offset="60%"></stop>
+              </linearGradient>
+            </defs>
+            <polygon transform="translate(20, 31)" stroke-width="2" fill="#227f8b" points="80,50 80,75 80,99 40,75"></polygon>
+            <polygon transform="translate(20, 31)" stroke-width="2" fill="url(#gradiente2)" points="40,-40 80,-40 80,99 40,75"></polygon>
+            <defs>
+              <linearGradient y2="100%" x2="0%" y1="-17%" x1="10%" id="gradiente2">
+                <stop style="stop-color:#1f474400;stop-opacity:1" offset="20%"></stop>
+                <stop style="stop-color:#10c6d354;stop-opacity:1" offset="100%" id="animatedStop"></stop>
+              </linearGradient>
+            </defs>
+            <polygon transform="rotate(180 100 100) translate(20, 20)" stroke-width="2" fill="#17afbd" points="80,50 80,75 80,99 40,75"></polygon>
+            <polygon transform="rotate(0 100 100) translate(60, 20)" stroke-width="2" fill="url(#gradiente3)" points="40,-40 80,-40 80,85 40,110.2"></polygon>
+            <defs>
+              <linearGradient y2="100%" x2="10%" y1="0%" x1="0%" id="gradiente3">
+                <stop style="stop-color:#10ccd300;stop-opacity:1" offset="20%"></stop>
+                <stop style="stop-color:#d3a51054;stop-opacity:1" offset="100%" id="animatedStop"></stop>
+              </linearGradient>
+            </defs>
+            <polygon transform="rotate(45 100 100) translate(80, 95)" stroke-width="2" fill="#ffffff" points="5,0 5,5 0,5 0,0" id="particles"></polygon>
+            <polygon transform="rotate(45 100 100) translate(80, 55)" stroke-width="2" fill="#17afbd" points="6,0 6,6 0,6 0,0" id="particles"></polygon>
+            <polygon transform="rotate(45 100 100) translate(70, 80)" stroke-width="2" fill="#17afbd" points="2,0 2,2 0,2 0,0" id="particles"></polygon>
+            <polygon stroke-width="2" fill="#292d34" points="29.5,99.8 100,142 100,172 29.5,130"></polygon>
+            <polygon transform="translate(50, 92)" stroke-width="2" fill="#1f2127" points="50,50 120.5,8 120.5,35 50,80"></polygon>
+          </g>
+        </svg>
+      `;
+
+      class CrystalLoader extends HTMLElement {
+        connectedCallback() {
+          if (!this.shadowRoot) {
+            this.attachShadow({ mode: 'open' });
+            this.shadowRoot.appendChild(CrystalLoaderTemplate.content.cloneNode(true));
+          }
+        }
+      }
+
+      customElements.define('crystal-loader', CrystalLoader);
+      console.log('✓ crystal-loader web component registered');
+    }
+  </script>
+</body>
+</html>

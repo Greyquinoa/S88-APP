@@ -1,0 +1,56 @@
+{
+  "exported_at": "2026-07-27T09:53:25.461Z",
+  "controllers": [
+    {
+      "id": 3,
+      "project_id": 1,
+      "t16_controller_tagname": "AS01",
+      "t16_station_type": "S7400",
+      "t24_program_container": null,
+      "int_controller_no": null,
+      "t8_version": null,
+      "t15_ip_address": null,
+      "t50_rack_order_no": "6ES7 400-1JA11-0AA0",
+      "t50_rack_name": "UR2ALU",
+      "t50_ps_order_no": "6ES7 407-0KR02-0AA0",
+      "t50_ps_name": "PS 407 10A",
+      "yn_redundant": false,
+      "yn_slave": false,
+      "mem_doc_change": null,
+      "created_at": "2026-06-18T19:29:47.000Z",
+      "updated_at": "2026-06-19T09:38:34.000Z",
+      "project_name": "rIX"
+    }
+  ],
+  "fieldbuses": [
+    {
+      "id": 7,
+      "hw_controller_id": 3,
+      "int_dp_subsystem": 100,
+      "int_bus_dp_address": null,
+      "t50_fieldbus_name": "PlantBus",
+      "lint_t_driver": null,
+      "t15_ip_address": null,
+      "created_at": "2026-06-19T09:38:34.000Z",
+      "updated_at": "2026-06-19T09:38:34.000Z"
+    },
+    {
+      "id": 8,
+      "hw_controller_id": 3,
+      "int_dp_subsystem": 101,
+      "int_bus_dp_address": null,
+      "t50_fieldbus_name": "Fieldbus",
+      "lint_t_driver": null,
+      "t15_ip_address": null,
+      "created_at": "2026-06-19T09:38:34.000Z",
+      "updated_at": "2026-06-19T09:38:34.000Z"
+    }
+  ],
+  "summary": {
+    "controller_count": 1,
+    "fieldbus_count": 2,
+    "projects": [
+      "rIX"
+    ]
+  }
+}

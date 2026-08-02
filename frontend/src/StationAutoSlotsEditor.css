@@ -3,7 +3,7 @@
   flex-direction: column;
   height: 100vh;
   background: var(--bg-primary, #f5f5f5);
-  font-family: var(--font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif);
+  font-family: var(--font-sans);
   color: var(--text-primary, #333);
 }
 
@@ -170,7 +170,7 @@
 
 .subslot-indent {
   color: var(--text-secondary, #999);
-  font-family: monospace;
+  font-family: var(--font-mono);
 }
 
 .slot-icon {
@@ -193,7 +193,7 @@
 
 .col-order {
   font-size: 13px;
-  font-family: monospace;
+  font-family: var(--font-mono);
   color: var(--text-secondary, #666);
 }
 
@@ -307,7 +307,7 @@
 }
 
 .value {
-  font-family: monospace;
+  font-family: var(--font-mono);
   font-size: 13px;
   color: var(--text-secondary, #666);
 }
@@ -433,7 +433,7 @@
   background: var(--bg-secondary, #fff);
   border: 1px solid var(--border-color, #ddd);
   border-radius: 4px;
-  font-family: 'Monaco', 'Courier New', monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.5;
   color: var(--text-primary, #333);
@@ -490,7 +490,7 @@
 /* ── Catalogue-matching config table (AG Grid Quartz look) ───────────────────── */
 
 .ig-cfg-editor {
-  font-family: system-ui, -apple-system, sans-serif;
+  font-family: var(--font-sans);
 }
 
 .ig-cfg-table {
@@ -546,7 +546,7 @@
 }
 
 .ig-cfg-mono {
-  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 11.5px;
   color: var(--color-text-secondary, #4b5563);
   white-space: nowrap;

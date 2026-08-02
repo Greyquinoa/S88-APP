@@ -151,7 +151,7 @@ function ImportedCheckboxRenderer(props: { data: InstanceRow }) {
       }}
     >
       <i
-        className={isImported ? "ti ti-checkbox" : "ti ti-checkbox-off"}
+        className={isImported ? "ti ti-checkbox" : "ti ti-square"}
         style={{
           fontSize: 18,
           color: isImported ? "#16A34A" : "#D1D5DB",

@@ -376,6 +376,7 @@ async function ensureSchema() {
   await addColumnIfMissing('project_instances', 'member_idx', 'member_idx INTEGER');
   await rawRun(`ALTER TABLE project_instances ALTER COLUMN composite_group_id TYPE BIGINT`).catch(() => {});
 
+
   // Migration: add conn_type + static_value to composite_cm_connections
   await addColumnIfMissing('composite_cm_connections', 'conn_type', `conn_type TEXT NOT NULL DEFAULT 'interconnection'`);
   await addColumnIfMissing('composite_cm_connections', 'static_value', `static_value TEXT`);
@@ -549,6 +550,97 @@ async function ensureSchema() {
 
   // Migration: add included column to io_column_mappings
   await addColumnIfMissing('io_column_mappings', 'included', `included TEXT`);
+
+  // ── EPH/EM Import System ──────────────────────────────────────────────────────
+  const ephEmStmts = [
+    `CREATE TABLE IF NOT EXISTS eph_em_type_mapping_configs (
+      id          SERIAL PRIMARY KEY,
+      name        TEXT NOT NULL UNIQUE,
+      mappings    TEXT NOT NULL DEFAULT '{}',
+      created_at  TIMESTAMPTZ DEFAULT NOW(),
+      updated_at  TIMESTAMPTZ DEFAULT NOW()
+    )`,
+    `CREATE TABLE IF NOT EXISTS eph_em_column_mappings (
+      id          SERIAL PRIMARY KEY,
+      name        TEXT NOT NULL UNIQUE,
+      description TEXT,
+      mappings    TEXT NOT NULL DEFAULT '{}',
+      created_at  TIMESTAMPTZ DEFAULT NOW(),
+      updated_at  TIMESTAMPTZ DEFAULT NOW()
+    )`,
+    `CREATE TABLE IF NOT EXISTS eph_em_function_map_configs (
+      id          SERIAL PRIMARY KEY,
+      name        TEXT NOT NULL UNIQUE,
+      description TEXT,
+      created_at  TIMESTAMPTZ DEFAULT NOW(),
+      updated_at  TIMESTAMPTZ DEFAULT NOW()
+    )`,
+    `CREATE TABLE IF NOT EXISTS eph_em_function_mappings (
+      id              SERIAL PRIMARY KEY,
+      config_id       INTEGER NOT NULL REFERENCES eph_em_function_map_configs(id),
+      eph_em_type     TEXT NOT NULL,
+      cm_type_name    TEXT NOT NULL,
+      naming_template TEXT DEFAULT '{eph_em_type}',
+      priority        INTEGER DEFAULT 0,
+      match_mode      TEXT DEFAULT 'exact',
+      match_pattern   TEXT,
+      notes           TEXT
+    )`,
+    `CREATE TABLE IF NOT EXISTS eph_em_imports (
+      id              SERIAL PRIMARY KEY,
+      project_id      INTEGER NOT NULL REFERENCES projects(id),
+      file_name       TEXT NOT NULL,
+      file_size_bytes INTEGER,
+      sheet_name      TEXT,
+      total_rows      INTEGER,
+      valid_rows      INTEGER DEFAULT 0,
+      invalid_rows    INTEGER DEFAULT 0,
+      status          TEXT NOT NULL DEFAULT 'pending',
+      imported_by     TEXT,
+      imported_at     TIMESTAMPTZ DEFAULT NOW(),
+      column_map_id   INTEGER REFERENCES eph_em_column_mappings(id),
+      function_map_id INTEGER REFERENCES eph_em_function_map_configs(id),
+      notes           TEXT
+    )`,
+    `CREATE TABLE IF NOT EXISTS eph_em_import_rows (
+      id               SERIAL PRIMARY KEY,
+      import_id        INTEGER NOT NULL REFERENCES eph_em_imports(id),
+      row_number       INTEGER NOT NULL,
+      raw_data         TEXT NOT NULL,
+      unit_name        TEXT,
+      eph_em_types     TEXT DEFAULT '{}',
+      assignment       TEXT,
+      assigned_cm_types TEXT DEFAULT '{}',
+      assignment_status TEXT DEFAULT 'pending',
+      validation_status TEXT DEFAULT 'unchecked',
+      created_at       TIMESTAMPTZ DEFAULT NOW(),
+      updated_at       TIMESTAMPTZ DEFAULT NOW()
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_ephemfm_config ON eph_em_function_mappings(config_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_ephemrows_import ON eph_em_import_rows(import_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_ephemrows_unit ON eph_em_import_rows(unit_name)`,
+    `CREATE INDEX IF NOT EXISTS idx_ephemrows_status ON eph_em_import_rows(assignment_status)`,
+    `CREATE INDEX IF NOT EXISTS idx_ephemimports_proj ON eph_em_imports(project_id)`,
+  ];
+  for (const s of ephEmStmts) await rawRun(s);
+
+  // Migration: add columns metadata to eph_em_imports for persistent storage
+  await addColumnIfMissing('eph_em_imports', 'columns', `columns TEXT DEFAULT '[]'`);
+
+  // Migration: add AS assignment column to eph_em_import_rows
+  await addColumnIfMissing('eph_em_import_rows', 'assignment', 'assignment TEXT');
+
+  // Migration: eph_em_import_rows moved from one-type-per-row (eph_em_type /
+  // assigned_cm_type) to many-types-per-row JSON maps. CREATE TABLE IF NOT EXISTS
+  // skips tables built by earlier versions, so add the new columns explicitly.
+  await addColumnIfMissing('eph_em_import_rows', 'eph_em_types', `eph_em_types TEXT DEFAULT '{}'`);
+  await addColumnIfMissing('eph_em_import_rows', 'assigned_cm_types', `assigned_cm_types TEXT DEFAULT '{}'`);
+  // Drop the superseded singular columns and the index that referenced one of them.
+  await rawRun('DROP INDEX IF EXISTS idx_ephemrows_type');
+  for (const col of ['eph_em_type', 'assigned_cm_type', 'hierarchy', 'destination_folder',
+                     'assigned_by', 'assigned_at', 'override_reason', 'validation_flags']) {
+    await rawRun(`ALTER TABLE eph_em_import_rows DROP COLUMN IF EXISTS ${col}`);
+  }
 
   // Migrations: add instrument_tag, hierarchy, assignment columns to io_tags
   await addColumnIfMissing('io_tags', 'instrument_tag', 'instrument_tag TEXT');
@@ -1321,6 +1413,19 @@ async function ensureSchema() {
         console.log(`[DB] Backfilled ${backfilled} module parameter rows for ${pending.length} existing templates`);
       }
     }
+  }
+
+  // ── Migration: Fix NULL updated_at in projects ──────────────────────
+  try {
+    const nullProjects = await rawAll(
+      `SELECT COUNT(*) as count FROM projects WHERE updated_at IS NULL`
+    );
+    if (nullProjects[0]?.count > 0) {
+      await rawRun(`UPDATE projects SET updated_at = created_at WHERE updated_at IS NULL`);
+      console.log(`[DB] Fixed ${nullProjects[0].count} projects with NULL updated_at`);
+    }
+  } catch (e) {
+    console.warn('[DB] Migration: failed to fix NULL updated_at in projects:', e.message);
   }
 
   console.log('[DB] Schema ready');

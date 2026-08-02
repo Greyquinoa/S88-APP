@@ -200,7 +200,7 @@
 
 .detail-row .value {
   color: #333;
-  font-family: "Courier New", monospace;
+  font-family: var(--font-mono);
 }
 
 .confidence-good {
@@ -451,7 +451,7 @@
 .cm-list td {
   padding: 8px;
   border: 1px solid #dee2e6;
-  font-family: "Courier New", monospace;
+  font-family: var(--font-mono);
 }
 
 .cm-list tr:hover {
@@ -489,7 +489,7 @@
   padding: 12px 12px 12px 20px;
   border-radius: 4px;
   font-size: 12px;
-  font-family: "Courier New", monospace;
+  font-family: var(--font-mono);
 }
 
 .connections-list li {
@@ -579,7 +579,7 @@
 .members-box li {
   margin-bottom: 6px;
   color: #555;
-  font-family: "Courier New", monospace;
+  font-family: var(--font-mono);
 }
 
 .members-box li:before {

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import React, { useState, useEffect, useRef, useMemo, useCallback, useLayoutEffect, Fragment } from "react";
 import { AgGridReact } from "ag-grid-react";
 import { AllCommunityModule, ModuleRegistry, themeQuartz } from "ag-grid-community";
 
@@ -21,6 +21,7 @@ import {
   getLatestIoImport, getIOHeaders,
 } from "./api.js";
 import StepIOImport from "./StepIOImport.jsx";
+import StepEphEmImport from "./StepEphEmImport.jsx";
 import StepHWConfig from "./StepHWConfig.jsx";
 import InstancesGrid from "./InstancesGrid.tsx";
 import SignalMappingModal from "./SignalMappingModal.jsx";
@@ -32,8 +33,9 @@ import Spinner from "./Spinner.jsx";
 import ProgressBar from "./ProgressBar.jsx";
 import Sidebar from "./Sidebar.jsx";
 import { GlobalLoadingProvider } from "./LoadingContext.jsx";
+import Nimbus from "./components/Nimbus/Nimbus";
 
-const STEPS = ["Projects", "IO Import", "Library", "Unit Types", "Hierarchy", "Instances", "HW Config", "Generate"];
+const STEPS = ["Projects", "IO Import", "EPH/EM Import", "Library", "Unit Types", "Hierarchy", "Instances", "HW Config", "Generate"];
 const DEFAULT_ON_OPTIONAL = ["MV_Rate"];
 const S88_TYPES = ["", "ProcessCell", "Unit", "EMOD"];
 
@@ -97,13 +99,13 @@ export default function App() {
     loadValveCommands();
   }, []);
 
-  // Two-phase render for the Instances tab (step 5): the grid renders 2000 rows
+  // Two-phase render for the Instances tab (step 6): the grid renders 2000 rows
   // synchronously, which blocks the main thread for several seconds and prevents
   // the browser from painting the spinner. So we hold the grid back for one paint:
   // goTo() sets uiLoading + step, this effect waits until the spinner has actually
   // been painted (double rAF), then clears uiLoading so the grid mounts next frame.
   useEffect(() => {
-    if (step === 5 && uiLoading) {
+    if (step === 6 && uiLoading) {
       let raf2 = 0;
       const raf1 = requestAnimationFrame(() => {
         raf2 = requestAnimationFrame(() => setUiLoading(""));
@@ -585,7 +587,7 @@ export default function App() {
       }, p => setGenProgress(p));
       setResult(r);
       setGenProgress(null);
-      setStep(7);   // jump to the Generate tab, which renders the output
+      setStep(8);   // jump to the Generate tab, which renders the output
     } catch (e) {
       setError(e.message);
       setGenProgress(null);
@@ -599,11 +601,11 @@ export default function App() {
       return;
     }
     setError("");
-    // Show spinner immediately when navigating to Instances tab (step 5). The
+    // Show spinner immediately when navigating to Instances tab (step 6). The
     // grid render is what's slow (2000 rows block the main thread), so we always
     // show it — the effect above clears it after the spinner paints, letting the
     // grid mount on the following frame.
-    if (i === 5) {
+    if (i === 6) {
       setUiLoading("Loading instances...");
     }
     setStep(i);
@@ -618,6 +620,7 @@ export default function App() {
           onStepChange={goTo}
           libStatus={libStatus}
           projectName={savedProjectName}
+          instanceCount={instances.length}
         />
 
         {/* Main Content Area */}
@@ -642,9 +645,9 @@ export default function App() {
                   <tbody>
                     {errorConflictRows.map((r, i) => (
                       <tr key={i} style={{ borderBottom: "1px solid #FEE2E2" }}>
-                        <td style={{ padding: "4px 8px", fontFamily: "monospace" }}>{r.address}</td>
-                        <td style={{ padding: "4px 8px", fontFamily: "monospace" }}>{r.name || "—"}</td>
-                        <td style={{ padding: "4px 8px", fontFamily: "monospace" }}>{r.ip || "—"}</td>
+                        <td style={{ padding: "4px 8px", fontFamily: "var(--font-mono)" }}>{r.address}</td>
+                        <td style={{ padding: "4px 8px", fontFamily: "var(--font-mono)" }}>{r.name || "—"}</td>
+                        <td style={{ padding: "4px 8px", fontFamily: "var(--font-mono)" }}>{r.ip || "—"}</td>
                         <td style={{ padding: "4px 8px" }}>{r.reasons.join(", ")}</td>
                       </tr>
                     ))}
@@ -692,7 +695,7 @@ export default function App() {
                   }
                   await ingestIoRowsIntoHw(hwImport.id, ioImportId);
                   setPendingHwMapping({ hwImportId: hwImport.id, ioImportId, hardwareMappings });
-                  setStep(6);
+                  setStep(7);
                 } catch (e) {
                   setError(e.message);
                 }
@@ -700,6 +703,12 @@ export default function App() {
               setError={setError} />
           )}
           {step === 2 && (
+            <StepEphEmImport
+              projectId={savedProjectId}
+              onComplete={() => savedProjectId && loadProjectIntoState(savedProjectId)}
+            />
+          )}
+          {step === 3 && (
             <StepLibrary libStatus={libStatus} loading={loading}
               onUpload={handleUpload}
               cmtProfiles={cmtProfiles} ensureLoaded={ensureBlocksLoaded} toggleBlock={toggleBlock}
@@ -732,7 +741,7 @@ export default function App() {
               onImport={handleImportConfirm}
               onCancel={() => { setImportPreview(null); setImportDiff(null); }} />
           )}
-          {step === 3 && (
+          {step === 4 && (
             <StepUnitTypes
               unitTypes={unitTypes}
               unitInstances={unitInstances}
@@ -761,12 +770,12 @@ export default function App() {
               onSaveConnections={saveUnitConnectionsEditor}
             />
           )}
-          {step === 4 && (
+          {step === 5 && (
             <StepHierarchy hierarchy={hierarchy} setHierarchy={setHierarchy}
               instances={instances} setInstances={setInstances}
               savedProjectName={savedProjectName} />
           )}
-          {step === 5 && !uiLoading && (
+          {step === 6 && !uiLoading && (
             <StepInstances instances={instances} cmtProfiles={cmtProfiles}
               userProjects={userProjects} savedProjectName={savedProjectName}
               savedProjectId={savedProjectId}
@@ -785,16 +794,16 @@ export default function App() {
               valveCommands={valveCommands}
               setInstances={setInstances} />
           )}
-          {step === 6 && (
+          {step === 7 && (
             <StepHWConfig
               projectId={savedProjectId}
               pendingHwMapping={pendingHwMapping}
               onPendingHwMappingConsumed={() => setPendingHwMapping(null)}
             />
           )}
-          {step === 7 && (
+          {step === 8 && (
             result ? (
-              <StepOutput result={result} onBack={() => setStep(5)} />
+              <StepOutput result={result} onBack={() => setStep(6)} />
             ) : (
               <div style={{ padding: "2rem", textAlign: "center", color: "var(--color-text-secondary)" }}>
                 No XML generated yet. Go to the <b>Instances</b> step and click <b>Generate XML</b>.
@@ -876,14 +885,14 @@ function StepProjects({ loading, savedProjectName, savedProjectId,
 
   return (
     <div>
-        <div className="card">
-          <div className="card-header">
-            <div>
-              <h2 className="card-title">Projects</h2>
-              <p className="card-subtitle">Resume a saved project or create a new one. Changes save automatically.</p>
+        <div className="projects-header" style={{ background: "linear-gradient(135deg, #1F7A54 0%, #155C3F 100%)", borderRadius: "var(--border-radius-lg)", padding: "12px 28px", marginBottom: "24px", boxShadow: "0 1px 0 rgba(0,0,0,0.03), 0 8px 24px -12px rgba(0,0,0,0.15)" }}>
+          <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", position: "relative", zIndex: 1, gap: "16px" }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: "4px", flex: 1, minWidth: 0 }}>
+              <h2 style={{ fontFamily: "'Fraunces', serif", fontWeight: 500, fontSize: "28px", lineHeight: 1.1, letterSpacing: "-0.01em", margin: "0", color: "#fff" }}>Projects</h2>
+              <p style={{ color: "rgba(255,255,255,0.85)", fontSize: "14px", lineHeight: 1.5, margin: "0" }}>Resume a saved project or create a new one. Changes save automatically.</p>
             </div>
             {!creating && (
-              <Btn primary onClick={() => setCreating(true)} disabled={busy}>
+              <Btn primary onClick={() => setCreating(true)} disabled={busy} style={{ background: "#fff", color: "#1F7A54", padding: "10px 20px", fontWeight: 600, fontSize: "13.5px", borderRadius: "999px", border: "none", cursor: "pointer", display: "inline-flex", alignItems: "center", justifyContent: "center", gap: "6px", whiteSpace: "nowrap", flexShrink: 0, marginTop: "2px", boxShadow: "0 2px 8px rgba(0,0,0,0.12)" }}>
                 <i className="ti ti-plus" /> New project
               </Btn>
             )}
@@ -914,14 +923,15 @@ function StepProjects({ loading, savedProjectName, savedProjectId,
             No saved projects yet — create a new one above.
           </div>
         ) : (
-          <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)",
-              overflow: "hidden", marginBottom: "1.5rem" }}>
+          <div style={{ border: "1px solid rgba(28,27,25,0.08)", borderRadius: "22px",
+              overflow: "hidden", marginBottom: "1.5rem", background: "#FFFFFF",
+              boxShadow: "0 1px 0 rgba(0,0,0,0.02), 0 14px 30px -18px rgba(28,27,25,0.18)" }}>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 52px 52px 52px 180px 80px",
-                padding: "6px 12px", borderBottom: "0.5px solid var(--color-border-tertiary)",
-                background: "var(--color-background-secondary)" }}>
+                padding: "12px 16px", borderBottom: "1px solid rgba(28,27,25,0.08)",
+                background: "#FBF8F0" }}>
               {["Name", "CM", "EM", "EPH", "Updated", ""].map((h, i) => (
-                <div key={i} style={{ fontSize: 11, color: "var(--color-text-secondary)",
-                    fontWeight: 500, textTransform: "uppercase", letterSpacing: "0.04em" }}>{h}</div>
+                <div key={i} style={{ fontSize: 11, color: "#6B6862",
+                    fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em" }}>{h}</div>
               ))}
             </div>
             {projects.map((p, idx) => {
@@ -929,27 +939,30 @@ function StepProjects({ loading, savedProjectName, savedProjectId,
               return (
                 <div key={p.id} onClick={() => !active && handleLoad(p)}
                   style={{ display: "grid", gridTemplateColumns: "1fr 52px 52px 52px 180px 80px",
-                    padding: "8px 12px", alignItems: "center",
+                    padding: "12px 16px", alignItems: "center",
                     cursor: active ? "default" : (busy ? "wait" : "pointer"),
-                    background: active ? "#EEEDFE" : "transparent",
-                    borderBottom: idx < projects.length - 1 ? "0.5px solid var(--color-border-tertiary)" : "none" }}>
+                    background: active ? "#FBFAF7" : "transparent",
+                    borderBottom: idx < projects.length - 1 ? "1px solid rgba(28,27,25,0.08)" : "none",
+                    transition: "background 0.2s ease" }}>
                   <div>
-                    <div style={{ fontSize: 13, fontFamily: "var(--font-mono)", fontWeight: 500 }}>
+                    <div style={{ fontSize: 13, fontFamily: "var(--font-sans)", fontWeight: 500, color: "#1C1B19" }}>
                       {p.name}
-                      {active && <span style={{ marginLeft: 8, fontSize: 10, padding: "1px 6px", borderRadius: 8,
-                        background: "#7F77DD", color: "white", fontWeight: 500, fontFamily: "var(--font-sans)" }}>active</span>}
+                      {active && <span style={{ marginLeft: 8, fontSize: 10, padding: "2px 8px", borderRadius: 6,
+                        background: "#1F7A54", color: "white", fontWeight: 500, fontFamily: "var(--font-sans)" }}>active</span>}
                     </div>
-                    {p.comment && <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 1 }}>{p.comment}</div>}
+                    {p.comment && <div style={{ fontSize: 11, color: "#6B6862", marginTop: 2 }}>{p.comment}</div>}
                   </div>
-                  <div style={{ fontSize: 12 }}>{p.cm_count || 0}</div>
-                  <div style={{ fontSize: 12 }}>{p.em_count || 0}</div>
-                  <div style={{ fontSize: 12 }}>{p.eph_count || 0}</div>
-                  <div style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>
-                    {p.updated_at ? new Date(p.updated_at + "Z").toLocaleString() : ""}
+                  <div style={{ fontSize: 12, color: "#1C1B19" }}>{p.cm_count || 0}</div>
+                  <div style={{ fontSize: 12, color: "#1C1B19" }}>{p.em_count || 0}</div>
+                  <div style={{ fontSize: 12, color: "#1C1B19" }}>{p.eph_count || 0}</div>
+                  <div style={{ fontSize: 11, color: "#6B6862" }}>
+                    {p.updated_at ? new Date(p.updated_at).toLocaleString() : "No updates"}
                   </div>
                   <button onClick={e => { e.stopPropagation(); handleDelete(p); }}
                     style={{ background: "transparent", border: "none", cursor: "pointer",
-                      color: "var(--color-text-secondary)", fontSize: 16, padding: 0, justifySelf: "end" }}>
+                      color: "#6B6862", fontSize: 16, padding: 0, justifySelf: "end", transition: "color 0.2s ease" }}
+                    onMouseEnter={e => e.target.style.color = "#DC2626"}
+                    onMouseLeave={e => e.target.style.color = "#6B6862"}>
                     <i className="ti ti-trash" />
                   </button>
                 </div>
@@ -971,26 +984,29 @@ function StepProjects({ loading, savedProjectName, savedProjectId,
                 No user projects yet — add one below
               </div>
             ) : (
-              <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)",
-                  overflow: "hidden", marginBottom: "1rem" }}>
+              <div style={{ border: "1px solid rgba(28,27,25,0.08)", borderRadius: "22px",
+                  overflow: "hidden", marginBottom: "1rem", background: "#FFFFFF",
+                  boxShadow: "0 1px 0 rgba(0,0,0,0.02), 0 14px 30px -18px rgba(28,27,25,0.18)" }}>
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 32px",
-                    padding: "6px 12px", borderBottom: "0.5px solid var(--color-border-tertiary)",
-                    background: "var(--color-background-secondary)" }}>
-                  <div style={{ fontSize: 11, color: "var(--color-text-secondary)", fontWeight: 500,
+                    padding: "12px 16px", borderBottom: "1px solid rgba(28,27,25,0.08)",
+                    background: "#FBF8F0" }}>
+                  <div style={{ fontSize: 12, color: "#6B6862", fontWeight: 600,
                     textTransform: "uppercase", letterSpacing: "0.04em" }}>User project name</div>
                   <div />
                 </div>
                 {userProjects.map((name, idx) => (
                   <div key={idx} style={{ display: "grid", gridTemplateColumns: "1fr 32px",
-                      padding: "6px 12px", alignItems: "center",
-                      borderBottom: idx < userProjects.length - 1 ? "0.5px solid var(--color-border-tertiary)" : "none" }}>
+                      padding: "12px 16px", alignItems: "center",
+                      borderBottom: idx < userProjects.length - 1 ? "1px solid rgba(28,27,25,0.08)" : "none" }}>
                     <input value={name} onChange={e => updateUserProject(idx, e.target.value)}
-                      style={{ width: "100%", padding: "4px 8px", border: "0.5px solid var(--color-border-secondary)",
-                        borderRadius: "var(--border-radius-md)", fontSize: 12, fontFamily: "var(--font-mono)",
-                        background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
+                      style={{ width: "100%", padding: "6px 10px", border: "1px solid rgba(28,27,25,0.08)",
+                        borderRadius: "8px", fontSize: 12, fontFamily: "var(--font-mono)",
+                        background: "#FFFFFF", color: "#1C1B19" }} />
                     <button onClick={() => removeUserProject(idx)}
                       style={{ background: "transparent", border: "none", cursor: "pointer",
-                        color: "var(--color-text-secondary)", fontSize: 16, padding: 0, marginLeft: 6 }}>
+                        color: "#6B6862", fontSize: 16, padding: 0, marginLeft: 6, transition: "color 0.2s ease" }}
+                      onMouseEnter={e => e.target.style.color = "#DC2626"}
+                      onMouseLeave={e => e.target.style.color = "#6B6862"}>
                       <i className="ti ti-trash" />
                     </button>
                   </div>
@@ -1016,6 +1032,8 @@ function StepProjects({ loading, savedProjectName, savedProjectId,
             </div>
           )}
         </div>
+
+        <Nimbus />
     </div>
   );
 }
@@ -1211,7 +1229,7 @@ function StepLibrary({ libStatus, loading, onUpload, cmtProfiles, ensureLoaded, 
             return (
               <button key={t.key} onClick={() => setLibSubTab(t.key)}
                 style={{ padding: "7px 18px", border: "none", background: "transparent",
-                  cursor: "pointer", fontSize: 13, fontWeight: active ? 500 : 400,
+                  cursor: "pointer", fontSize: '1rem', fontWeight: active ? 600 : 400,
                   color: active ? "var(--color-text-primary)" : "var(--color-text-secondary)",
                   borderBottom: active ? "2px solid var(--color-text-primary)" : "2px solid transparent",
                   marginBottom: -1 }}>
@@ -1266,7 +1284,7 @@ function LibraryUploadPanel({ libStatus, loading, onUpload }) {
           onDragOver={e => e.preventDefault()}
           onDrop={e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) onUpload(f); }}>
           <i className="ti ti-file-code" style={{ fontSize: 32, color: "var(--color-text-secondary)", display: "block", marginBottom: 12 }} />
-          <div style={{ fontSize: 15, fontWeight: 500 }}>{loaded ? "Reload SIE_LIB.XML" : "Drop SIE_LIB.XML here"}</div>
+          <div style={{ fontSize: '1rem', fontWeight: 600 }}>{loaded ? "Reload SIE_LIB.XML" : "Drop SIE_LIB.XML here"}</div>
           <div style={{ fontSize: 13, color: "var(--color-text-secondary)", marginTop: 4 }}>
             {loaded ? "Upload a new version to replace the current library" : "Parsed once and stored in database — never needed again"}
           </div>
@@ -1309,6 +1327,21 @@ function CmtPanel({ cmtProfiles, ensureLoaded, toggleBlock, onDelete, onVarDefau
   const filtered = byType.filter(p => p.cmType.toLowerCase().includes(search.toLowerCase()));
   const profile  = cmtProfiles.find(p => p.id === selected);
 
+  // Measure the selected row itself rather than extrapolating from row 0.
+  // Row heights are not guaranteed uniform (the second line is conditional),
+  // so `idx * rowHeight` drifts further down the list; offsetTop does not.
+  const rowRef = useRef(null);
+  const [glider, setGlider] = useState({ top: 0, height: 44 });
+  const selectedIdx = filtered.findIndex(p => p.id === selected);
+  useLayoutEffect(() => {
+    const el = rowRef.current;
+    if (!el) return;
+    setGlider(prev =>
+      prev.top === el.offsetTop && prev.height === el.offsetHeight
+        ? prev
+        : { top: el.offsetTop, height: el.offsetHeight });
+  });
+
   async function selectCM(id) {
     setSelected(id);
     const p = cmtProfiles.find(x => x.id === id);
@@ -1344,15 +1377,15 @@ function CmtPanel({ cmtProfiles, ensureLoaded, toggleBlock, onDelete, onVarDefau
   return (
     <div>
         <div style={{ marginBottom: "1rem" }}>
-          <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 4 }}>CMT block configuration</div>
+          <div style={{ fontSize: 18, fontWeight: 600, marginBottom: 4 }}>CMT block configuration</div>
           <div style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>
             Toggle optional blocks per CM type. Data is loaded from the database.
           </div>
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "210px 1fr", gap: 12, height: "calc(100vh - 200px)" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "25% 1fr", gap: 12, height: "calc(100vh - 200px)" }}>
           {/* CM list */}
-          <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", overflow: "hidden", display: "flex", flexDirection: "column" }}>
-            <div style={{ display: "flex", borderBottom: "0.5px solid var(--color-border-tertiary)", background: "var(--color-background-secondary)", flexShrink: 0 }}>
+          <div style={{ border: "1px solid rgba(28,27,25,0.08)", borderRadius: "12px", overflow: "hidden", display: "flex", flexDirection: "column", background: "#FBFAF7", boxShadow: "0 1px 0 rgba(0,0,0,0.02), 0 14px 30px -18px rgba(28,27,25,0.18)" }}>
+            <div style={{ display: "flex", borderBottom: "1px solid rgba(28,27,25,0.08)", background: "#FBF8F0", flexShrink: 0 }}>
               {LIB_TABS.map(t => {
                 const count = t.key === "all"
                   ? cmtProfiles.length
@@ -1360,10 +1393,10 @@ function CmtPanel({ cmtProfiles, ensureLoaded, toggleBlock, onDelete, onVarDefau
                 const active = libTab === t.key;
                 return (
                   <button key={t.key} onClick={() => setLibTab(t.key)}
-                    style={{ flex: 1, padding: "5px 4px", border: "none", background: "transparent",
-                      cursor: "pointer", fontSize: 11, fontWeight: active ? 600 : 400,
-                      color: active ? "var(--color-text-primary)" : "var(--color-text-secondary)",
-                      borderBottom: active ? "2px solid var(--color-text-primary)" : "2px solid transparent",
+                    style={{ flex: 1, padding: "8px 12px", border: "none", background: "transparent",
+                      cursor: "pointer", fontSize: 12, fontWeight: active ? 600 : 400,
+                      color: active ? "#1C1B19" : "#6B6862",
+                      borderBottom: active ? "2px solid #065F46" : "2px solid transparent",
                       marginBottom: -1 }}>
                     {t.label}
                     <span style={{ marginLeft: 3, fontSize: 10, opacity: 0.7 }}>({count})</span>
@@ -1371,46 +1404,72 @@ function CmtPanel({ cmtProfiles, ensureLoaded, toggleBlock, onDelete, onVarDefau
                 );
               })}
             </div>
-            <div style={{ padding: "6px 8px", borderBottom: "0.5px solid var(--color-border-tertiary)", flexShrink: 0 }}>
+            <div style={{ padding: "8px 12px", borderBottom: "1px solid rgba(28,27,25,0.08)", flexShrink: 0 }}>
               <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Filter CMs…"
-                style={{ width: "100%", padding: "4px 8px", border: "0.5px solid var(--color-border-secondary)",
-                  borderRadius: "var(--border-radius-md)", fontSize: 12,
-                  background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
+                style={{ width: "100%", padding: "6px 10px", border: "1px solid rgba(28,27,25,0.08)",
+                  borderRadius: "6px", fontSize: 12,
+                  background: "#FFFFFF", color: "#1C1B19" }} />
             </div>
-            <div style={{ overflowY: "auto", flex: 1 }}>
-              {filtered.map(p => {
-                const optOn = p.enabledBlocks?.filter(b => p.subBlocks?.find(s => s.name === b && s.optional)).length || 0;
-                return (
-                  <div key={p.id} onClick={() => selectCM(p.id)}
-                    style={{ padding: "7px 10px", cursor: "pointer", borderBottom: "0.5px solid var(--color-border-tertiary)",
-                      background: selected === p.id ? "#EEEDFE" : "transparent",
-                      display: "flex", alignItems: "center", gap: 4 }}>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: 12, fontWeight: 500, fontFamily: "var(--font-mono)" }}>{p.cmType}</div>
-                      <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 1 }}>
-                        {p.subBlocks ? `${optOn}/${p.optionalBlocks} optional on` : `${p.optionalBlocks} optional`}
-                      </div>
-                    </div>
-                    {onDelete && (
-                      <button onClick={e => { e.stopPropagation(); onDelete(p.cmType); }}
-                        title="Remove from library"
-                        style={{ flexShrink: 0, border: "none", background: "transparent", cursor: "pointer",
-                          padding: "2px 4px", borderRadius: "var(--border-radius-md)",
-                          color: "var(--color-text-secondary)", fontSize: 13, lineHeight: 1 }}>
-                        <i className="ti ti-trash" />
-                      </button>
-                    )}
-                  </div>
-                );
-              })}
+            {/* The scroll lives on the outer div; the glass group inside it is the
+                positioning context, so the absolutely-positioned glider scrolls
+                with the rows instead of staying pinned to the viewport. */}
+            <div style={{ flex: 1, overflowY: "auto", minHeight: 0 }}>
+              {filtered.length === 0 ? (
+                <div style={{ padding: "1rem", fontSize: 12, color: "#888", textAlign: "center" }}>
+                  No CM types found
+                </div>
+              ) : (
+                <div className="glass-radio-group-vertical">
+                  {selectedIdx >= 0 && (
+                    <div className="glass-glider-vertical" style={{
+                      height: glider.height,
+                      transform: `translateY(${glider.top}px)`,
+                    }} />
+                  )}
+                  {filtered.map((p, idx) => {
+                    const optOn = p.enabledBlocks?.filter(b => p.subBlocks?.find(s => s.name === b && s.optional)).length || 0;
+                    return (
+                      <Fragment key={p.id}>
+                        <input
+                          type="radio"
+                          id={`cm-${p.id}`}
+                          name="cm-type"
+                          checked={selected === p.id}
+                          onChange={() => selectCM(p.id)} />
+                        <label ref={selected === p.id ? rowRef : undefined}
+                          htmlFor={`cm-${p.id}`}
+                          style={{ justifyContent: "space-between" }}>
+                          <div className="glass-label-text" title={p.cmType} style={{ minWidth: 0 }}>
+                            <div style={{ fontSize: 12, fontWeight: 500, fontFamily: "var(--font-sans)", color: "inherit", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.cmType}</div>
+                            <div style={{ fontSize: 11, color: "currentColor", marginTop: 2, opacity: 0.7, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                              {p.subBlocks ? `${optOn}/${p.optionalBlocks} optional on` : `${p.optionalBlocks} optional`}
+                            </div>
+                          </div>
+                          {selected === p.id && onDelete && (
+                            <span onClick={e => { e.preventDefault(); e.stopPropagation(); onDelete(p.cmType); }}
+                              className="io-import-icon-delete" title="Remove from library"
+                              style={{ cursor: "pointer", padding: "2px 4px",
+                                color: "#6b7280", fontSize: 13, lineHeight: 1, flexShrink: 0,
+                                transition: "color 0.15s ease" }}
+                              onMouseEnter={e => e.currentTarget.style.color = "#DC2626"}
+                              onMouseLeave={e => e.currentTarget.style.color = "#6b7280"}>
+                              <i className="ti ti-trash" />
+                            </span>
+                          )}
+                        </label>
+                      </Fragment>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           </div>
 
           {/* Detail panel with sub-tabs */}
-          <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)",
-              display: "flex", flexDirection: "column" }}>
-            <div style={{ display: "flex", borderBottom: "0.5px solid var(--color-border-tertiary)",
-                background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-lg) var(--border-radius-lg) 0 0",
+          <div style={{ border: "1px solid rgba(28,27,25,0.08)", borderRadius: "12px",
+              display: "flex", flexDirection: "column", background: "#FBFAF7", boxShadow: "0 1px 0 rgba(0,0,0,0.02), 0 14px 30px -18px rgba(28,27,25,0.18)" }}>
+            <div style={{ display: "flex", borderBottom: "1px solid rgba(28,27,25,0.08)",
+                background: "#FBF8F0", borderRadius: "12px 12px 0 0",
                 flexShrink: 0 }}>
               {DETAIL_TABS.map(t => {
                 const count = t.key === "blocks"
@@ -1419,20 +1478,21 @@ function CmtPanel({ cmtProfiles, ensureLoaded, toggleBlock, onDelete, onVarDefau
                 const active = detailTab === t.key;
                 return (
                   <button key={t.key} onClick={() => setDetailTab(t.key)}
-                    style={{ padding: "6px 14px", border: "none", background: "transparent",
+                    style={{ padding: "10px 16px", border: "none", background: "transparent",
                       cursor: "pointer", fontSize: 12, fontWeight: active ? 600 : 400,
-                      color: active ? "var(--color-text-primary)" : "var(--color-text-secondary)",
-                      borderBottom: active ? "2px solid var(--color-text-primary)" : "2px solid transparent",
+                      color: active ? "#1C1B19" : "#6B6862",
+                      textTransform: "uppercase", letterSpacing: "0.04em",
+                      borderBottom: active ? "2px solid #065F46" : "2px solid transparent",
                       marginBottom: -1 }}>
                     {t.label}
                     {profile?.subBlocks && (
-                      <span style={{ marginLeft: 4, fontSize: 10, opacity: 0.65 }}>({count})</span>
+                      <span style={{ marginLeft: 4, fontSize: 10, opacity: 0.7 }}>({count})</span>
                     )}
                   </button>
                 );
               })}
             </div>
-            <div style={{ flex: 1, display: "flex", flexDirection: "column", overflowY: "auto", padding: detailTab === "blocks" ? "1rem 1.25rem" : 0 }}>
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", overflowY: "auto", padding: "1rem 1.25rem" }}>
               {loadingBlocks ? (
                 <div style={{ color: "var(--color-text-secondary)", fontSize: 13, padding: "1rem 1.25rem" }}>Loading…</div>
               ) : !profile?.subBlocks ? (
@@ -1441,7 +1501,7 @@ function CmtPanel({ cmtProfiles, ensureLoaded, toggleBlock, onDelete, onVarDefau
                 <>
                   {detailTab === "blocks" && (
                     <>
-                      <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 2 }}>{profile.cmType}</div>
+                      <div style={{ fontSize: '1rem', fontWeight: 600, marginBottom: 2 }}>{profile.cmType}</div>
                       <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: "1rem" }}>
                         {profile.comment}{profile.samplingTime ? ` · ${profile.samplingTime} ms` : ""}
                       </div>
@@ -1456,7 +1516,7 @@ function CmtPanel({ cmtProfiles, ensureLoaded, toggleBlock, onDelete, onVarDefau
                   )}
                   {(detailTab === "inputs" || detailTab === "outputs") && (
                     <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
-                      <div style={{ padding: "0.75rem 1.25rem", borderBottom: "0.5px solid var(--color-border-tertiary)", fontSize: 12, fontWeight: 500, flexShrink: 0, color: "var(--color-text-secondary)" }}>
+                      <div style={{ padding: "10px 0", borderBottom: "1px solid rgba(28,27,25,0.08)", fontSize: 12, fontWeight: 600, flexShrink: 0, color: "#6B6862", textTransform: "uppercase", letterSpacing: "0.04em" }}>
                         {detailTab === "inputs" ? "Input Parameters" : "Output Parameters"}
                       </div>
                       <div style={{ flex: 1, minHeight: 0 }}>
@@ -1499,9 +1559,10 @@ class VarTableErrorBoundary extends React.Component {
 
 function VarTable({ vars, cmTypeName, editable, showValid, onVarDefaultChange, onVarValidChange }) {
   const gridRef = useRef(null);
-  const [drafts, setDrafts] = useState({});
-  const [saving, setSaving] = useState({});
   const [validSaving, setValidSaving] = useState({});
+  const draftsRef = useRef({});
+  const varsRef = useRef(vars);
+  varsRef.current = vars;
 
   if (!vars || !vars.length) {
     return (
@@ -1512,17 +1573,37 @@ function VarTable({ vars, cmTypeName, editable, showValid, onVarDefaultChange, o
   }
 
   async function commitVal(v, newVal) {
-    if (newVal === (v.val || "")) { setDrafts(d => { const n = {...d}; delete n[v.id]; return n; }); return; }
-    setSaving(s => ({ ...s, [v.id]: true }));
+    delete draftsRef.current[v.id];
+    if (newVal === (v.val || "")) return;
     try {
-        await patchVarDefault(cmTypeName, v.id, newVal);
+        console.log(`[VarTable] Saving var ${v.id} (${v.name}) in ${cmTypeName}: "${v.val}" → "${newVal}"`);
+        const result = await patchVarDefault(cmTypeName, v.id, newVal);
+        console.log(`[VarTable] Save successful:`, result);
         onVarDefaultChange?.(v.id, newVal);
-    } catch (_) {}
-    finally {
-        setSaving(s => { const n = {...s}; delete n[v.id]; return n; });
-        setDrafts(d => { const n = {...d}; delete n[v.id]; return n; });
+    } catch (err) {
+        console.error(`[VarTable] Failed to save default value for var ${v.id}:`, err.message);
     }
   }
+
+  useEffect(() => {
+    function flushDrafts() {
+      const pending = draftsRef.current;
+      const byId = new Map(varsRef.current.map(v => [v.id, v]));
+      for (const id of Object.keys(pending)) {
+        const v = byId.get(Number(id)) || byId.get(id);
+        if (v) commitVal(v, pending[id]);
+      }
+    }
+    function onVisibilityChange() {
+      if (document.visibilityState === "hidden") flushDrafts();
+    }
+    window.addEventListener("blur", flushDrafts);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.removeEventListener("blur", flushDrafts);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [cmTypeName]);
 
   async function toggleValid(v) {
     if (!v.id) return;
@@ -1537,7 +1618,7 @@ function VarTable({ vars, cmTypeName, editable, showValid, onVarDefaultChange, o
 
   const theme = useMemo(() => themeQuartz.withParams({
     fontSize: 12, rowHeight: 36, headerHeight: 36,
-    fontFamily: 'system-ui, -apple-system, sans-serif',
+    fontFamily: "'Inter', system-ui, -apple-system, sans-serif",
     accentColor: '#0C447C', browserColorScheme: 'light',
   }), []);
 
@@ -1551,12 +1632,12 @@ function VarTable({ vars, cmTypeName, editable, showValid, onVarDefaultChange, o
       {
         headerName: 'Block', field: 'blockName',
         filter: 'agTextColumnFilter', floatingFilter: true, minWidth: 120, flex: 1,
-        cellStyle: { fontFamily: 'ui-monospace, monospace', fontSize: 11, color: 'var(--color-text-secondary)' },
+        cellStyle: { fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--color-text-secondary)' },
       },
       {
         headerName: 'Parameter', field: 'name',
         filter: 'agTextColumnFilter', floatingFilter: true, minWidth: 140, flex: 1.2,
-        cellStyle: { fontFamily: 'ui-monospace, monospace', fontWeight: 500 },
+        cellStyle: { fontFamily: 'var(--font-mono)', fontWeight: 500 },
       },
       {
         headerName: 'Data Type', field: 'dtype',
@@ -1581,30 +1662,26 @@ function VarTable({ vars, cmTypeName, editable, showValid, onVarDefaultChange, o
         filter: 'agTextColumnFilter', floatingFilter: true, minWidth: 110, flex: 1,
         cellRenderer: p => {
           const v = p.data;
-          const isDraft = v.id in drafts;
-          const draftVal = isDraft ? drafts[v.id] : (v.val || '');
-          const isSaving = !!saving[v.id];
           const canEdit = editable && !!v.id;
 
           if (canEdit) {
             return (
               <input
-                value={draftVal}
-                onChange={e => setDrafts(d => ({ ...d, [v.id]: e.target.value }))}
-                onFocus={() => { if (!isDraft) setDrafts(d => ({ ...d, [v.id]: v.val || '' })); }}
+                key={v.id}
+                defaultValue={v.val || ''}
+                onChange={e => { draftsRef.current[v.id] = e.target.value; }}
                 onBlur={e => commitVal(v, e.target.value)}
                 onKeyDown={e => {
                   if (e.key === 'Enter') e.target.blur();
-                  if (e.key === 'Escape') { setDrafts(d => { const n={...d}; delete n[v.id]; return n; }); e.target.blur(); }
+                  if (e.key === 'Escape') { e.target.value = v.val || ''; e.target.blur(); }
                 }}
-                disabled={isSaving}
                 title="Click to edit default value"
                 style={{
                   width: '100%', padding: '2px 5px', fontSize: 11, fontFamily: 'var(--font-mono)',
-                  border: isDraft ? '1px solid #7F77DD' : '1px solid transparent',
-                  borderRadius: '4px', background: isDraft ? 'var(--color-background-primary)' : 'transparent',
-                  color: draftVal ? 'var(--color-text-primary)' : 'var(--color-text-secondary)',
-                  cursor: 'text', outline: 'none', opacity: isSaving ? 0.5 : 1
+                  border: '1px solid transparent',
+                  borderRadius: '4px', background: 'transparent',
+                  color: 'var(--color-text-primary)',
+                  cursor: 'text', outline: 'none',
                 }}
               />
             );
@@ -1652,12 +1729,12 @@ function VarTable({ vars, cmTypeName, editable, showValid, onVarDefaultChange, o
     });
 
     return cols;
-  }, [drafts, saving, validSaving, editable, showValid, vars]);
+  }, [validSaving, editable, showValid, vars]);
 
   const getRowId = useCallback(p => String(p.data.id || p.data.name), []);
 
   return (
-    <div className="ig-root" style={{ width: '100%', height: '100%', overflowY: 'auto' }}>
+    <div className="ig-root" style={{ width: '100%', height: '100%', overflowY: 'auto', background: '#FFFFFF' }}>
       <AgGridReact
         ref={gridRef}
         theme={theme}
@@ -1763,7 +1840,7 @@ function ModeCommandsPanel({ valveCommands, onValveCommandsChange }) {
                       <input value={r.name} onChange={e => updateRow(i, "name", e.target.value)}
                         placeholder="e.g. OPEN" style={{ ...inputSx, width: "100%", fontFamily: "var(--font-mono)" }} />
                     ) : (
-                      <span style={{ fontFamily: "var(--font-mono)", fontSize: 12 }}>{r.name}</span>
+                      <span style={{ fontFamily: "var(--font-sans)", fontSize: 12 }}>{r.name}</span>
                     )}
                   </td>
                   <td style={{ padding: "3px 8px", textAlign: "center" }}>
@@ -1852,6 +1929,20 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
     }
     if (Object.keys(updates).length) setValidVarsCache(prev => ({ ...prev, ...updates }));
   }, [cmtProfiles]);
+
+  // Sliding-glider geometry for the composite list. Measured from the selected
+  // row itself so a taller row (e.g. one wrapping the MTX badge) can't make the
+  // highlight drift the way `index * rowHeight` would.
+  const rowRef = useRef(null);
+  const [glider, setGlider] = useState({ top: 0, height: 44 });
+  useLayoutEffect(() => {
+    const el = rowRef.current;
+    if (!el) return;
+    setGlider(prev =>
+      prev.top === el.offsetTop && prev.height === el.offsetHeight
+        ? prev
+        : { top: el.offsetTop, height: el.offsetHeight });
+  });
 
   async function load() {
     try { setComposites(await listCompositeCmTypes()); } catch (e) { setLocalErr(e.message); }
@@ -2068,7 +2159,7 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
   return (
     <div>
         <div style={{ marginBottom: "1rem" }}>
-          <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 4 }}>Composite CM Types</div>
+          <div style={{ fontSize: '1rem', fontWeight: 600, marginBottom: 4 }}>Composite CM Types</div>
           <div style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>
             Group multiple CM types into a single reusable entity. Each member is placed in its own hierarchy folder and can carry a naming prefix/suffix.
           </div>
@@ -2091,36 +2182,61 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                 <i className="ti ti-plus" /> New Composite
               </Btn>
             </div>
-            <div style={{ overflowY: "auto", flex: 1 }}>
+            {/* Scroll lives on the outer div; the glass group inside is the
+                positioning context, so the glider scrolls with the rows. */}
+            <div style={{ overflowY: "auto", flex: 1, minHeight: 0 }}>
               {composites.length === 0 ? (
                 <div style={{ padding: "1rem", fontSize: 12, color: "var(--color-text-secondary)", textAlign: "center" }}>
                   No composites yet
                 </div>
-              ) : composites.map(c => (
-                <div key={c.id} onClick={() => selectComposite(c.id)}
-                  style={{ padding: "8px 10px", cursor: "pointer",
-                    borderBottom: "0.5px solid var(--color-border-tertiary)",
-                    background: selectedId === c.id ? "#EEEDFE" : "transparent",
-                    display: "flex", alignItems: "center", gap: 4 }}>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-                      <span style={{ fontSize: 12, fontWeight: 500, fontFamily: "var(--font-mono)" }}>{c.name}</span>
-                      {!!c.is_matrix && (
-                        <span style={{ fontSize: 9, padding: "0 4px", borderRadius: 3,
-                            background: "#DCFCE7", color: "#166534", fontWeight: 700, flexShrink: 0 }}>MTX</span>
-                      )}
-                    </div>
-                    <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 1 }}>
-                      {c.is_matrix ? "Matrix CM" : `${c.member_count} member${c.member_count !== 1 ? "s" : ""}`}
-                    </div>
-                  </div>
-                  <button onClick={e => { e.stopPropagation(); handleDelete(c.id); }}
-                    style={{ border: "none", background: "transparent", cursor: "pointer",
-                      padding: "2px 4px", color: "var(--color-text-secondary)", fontSize: 13, lineHeight: 1 }}>
-                    <i className="ti ti-trash" />
-                  </button>
+              ) : (
+                <div className="glass-radio-group-vertical">
+                  {composites.some(c => c.id === selectedId) && (
+                    <div className="glass-glider-vertical" style={{
+                      height: glider.height,
+                      transform: `translateY(${glider.top}px)`,
+                    }} />
+                  )}
+                  {composites.map(c => (
+                    <Fragment key={c.id}>
+                      <input
+                        type="radio"
+                        id={`comp-${c.id}`}
+                        name="composite-cm"
+                        checked={selectedId === c.id}
+                        onChange={() => selectComposite(c.id)} />
+                      <label ref={selectedId === c.id ? rowRef : undefined}
+                        htmlFor={`comp-${c.id}`}
+                        style={{ justifyContent: "space-between" }}>
+                        <div className="glass-label-text" title={c.name}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 5, minWidth: 0 }}>
+                            <span style={{ fontSize: 12, fontWeight: 500, fontFamily: "var(--font-sans)", color: "inherit",
+                                overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.name}</span>
+                            {!!c.is_matrix && (
+                              <span style={{ fontSize: 9, padding: "0 4px", borderRadius: 3,
+                                  background: "inherit", color: "inherit", fontWeight: 700, flexShrink: 0,
+                                  border: "1px solid currentColor", opacity: 0.7 }}>MTX</span>
+                            )}
+                          </div>
+                          <div style={{ fontSize: 11, color: "currentColor", marginTop: 2, opacity: 0.7,
+                              overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {c.is_matrix ? "Matrix CM" : `${c.member_count} member${c.member_count !== 1 ? "s" : ""}`}
+                          </div>
+                        </div>
+                        {selectedId === c.id && (
+                          <span onClick={e => { e.preventDefault(); e.stopPropagation(); handleDelete(c.id); }}
+                            className="io-import-icon-delete" title="Delete composite"
+                            style={{ cursor: "pointer", padding: "2px 4px",
+                              color: "#6b7280", fontSize: 13, lineHeight: 1, flexShrink: 0,
+                              transition: "color 0.15s ease" }}>
+                            <i className="ti ti-trash" />
+                          </span>
+                        )}
+                      </label>
+                    </Fragment>
+                  ))}
                 </div>
-              ))}
+              )}
             </div>
           </div>
 
@@ -2136,7 +2252,7 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                 {/* Header fields */}
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: "1.25rem" }}>
                   <div>
-                    <label style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em",
+                    <label style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em",
                         color: "var(--color-text-secondary)", display: "block", marginBottom: 4 }}>Name *</label>
                     <input value={editing.name} onChange={e => setEditing(p => ({ ...p, name: e.target.value }))}
                       placeholder="e.g. Composite_CM_AO"
@@ -2146,7 +2262,7 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                         fontFamily: "var(--font-mono)" }} />
                   </div>
                   <div>
-                    <label style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em",
+                    <label style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em",
                         color: "var(--color-text-secondary)", display: "block", marginBottom: 4 }}>Description</label>
                     <input value={editing.description} onChange={e => setEditing(p => ({ ...p, description: e.target.value }))}
                       placeholder="Optional description"
@@ -2178,7 +2294,7 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                           padding: "5px 8px", background: "var(--color-background-secondary)",
                           borderBottom: "0.5px solid var(--color-border-tertiary)", gap: 6 }}>
                         {["", "CM Type", "Folder", "Prefix", "Suffix", "Scope", ""].map((h, i) => (
-                          <div key={i} style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                          <div key={i} style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase",
                               letterSpacing: "0.04em", color: "var(--color-text-secondary)" }}>{h}</div>
                         ))}
                       </div>
@@ -2266,7 +2382,7 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                     <div style={{ marginTop: 10, padding: "8px 12px",
                         background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)",
                         border: "0.5px solid var(--color-border-tertiary)" }}>
-                      <div style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em",
+                      <div style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em",
                           color: "var(--color-text-secondary)", marginBottom: 6 }}>
                         Naming preview (base name = "TAG")
                       </div>
@@ -2869,7 +2985,7 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
 
                         {/* Type toggle */}
                         <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
-                          <div style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase",
+                          <div style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase",
                               letterSpacing: "0.04em", color: "var(--color-text-secondary)",
                               alignSelf: "center", marginRight: 4 }}>Type:</div>
                           {[
@@ -2897,7 +3013,7 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                             <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
                               {/* Member */}
                               <div style={{ flex: "0 0 180px" }}>
-                                <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                                <div style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase",
                                     letterSpacing: "0.04em", color: "#0F766E", marginBottom: 3 }}>Member</div>
                                 <select value={ioWire.memberIdx}
                                   onChange={e => setIoWire(w => ({ ...w, memberIdx: e.target.value, paramKey: "" }))}
@@ -2911,7 +3027,7 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
 
                               {/* Parameter (block derived automatically) */}
                               <div style={{ flex: 1 }}>
-                                <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                                <div style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase",
                                     letterSpacing: "0.04em", color: "#0F766E", marginBottom: 3 }}>Parameter</div>
                                 <select value={ioWire.paramKey}
                                   onChange={e => setIoWire(w => ({ ...w, paramKey: e.target.value }))}
@@ -2931,7 +3047,7 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
 
                               {/* Data type — derived (read-only) */}
                               <div style={{ flex: "0 0 80px" }}>
-                                <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                                <div style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase",
                                     letterSpacing: "0.04em", color: "var(--color-text-secondary)", marginBottom: 3 }}>Data type</div>
                                 <div style={{ padding: "5px 6px", border: "0.5px solid var(--color-border-tertiary)",
                                     borderRadius: "var(--border-radius-md)", fontSize: 11, fontFamily: "var(--font-mono)",
@@ -2944,7 +3060,7 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
 
                               {/* Prefix */}
                               <div style={{ flex: "0 0 90px" }}>
-                                <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                                <div style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase",
                                     letterSpacing: "0.04em", color: "var(--color-text-secondary)", marginBottom: 3 }}>Prefix</div>
                                 <input value={ioWire.prefix}
                                   onChange={e => setIoWire(w => ({ ...w, prefix: e.target.value }))}
@@ -2953,7 +3069,7 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
 
                               {/* Suffix */}
                               <div style={{ flex: "0 0 90px" }}>
-                                <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                                <div style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase",
                                     letterSpacing: "0.04em", color: "var(--color-text-secondary)", marginBottom: 3 }}>Suffix</div>
                                 <input value={ioWire.suffix}
                                   onChange={e => setIoWire(w => ({ ...w, suffix: e.target.value }))}
@@ -2996,7 +3112,7 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                             {/* Static / Derived slider — only for Value */}
                             {isValue && (
                               <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-                                <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                                <div style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase",
                                     letterSpacing: "0.04em", color: "var(--color-text-secondary)" }}>Value source:</div>
                                 <div style={{ display: "flex", border: "1px solid var(--color-border-secondary)",
                                     borderRadius: 999, padding: 2, background: "var(--color-background-primary)" }}>
@@ -3023,7 +3139,7 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                             {isInterconn && (
                               <>
                                 <div style={{ flex: 1 }}>
-                                  <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                                  <div style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase",
                                       letterSpacing: "0.04em", color: "#166534", marginBottom: 3 }}>Output from member</div>
                                   <div style={{ display: "flex", gap: 4 }}>
                                     <select value={wire.fromIdx}
@@ -3054,7 +3170,7 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                             {isValue && !isDerived && (
                               <>
                                 <div style={{ flex: "0 0 160px" }}>
-                                  <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                                  <div style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase",
                                       letterSpacing: "0.04em", color: "#854D0E", marginBottom: 3 }}>Static value</div>
                                   <input value={wire.staticValue}
                                     onChange={e => setWire(w => ({ ...w, staticValue: e.target.value }))}
@@ -3072,21 +3188,21 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                             {isDerived && (
                               <>
                                 <div style={{ flex: "0 0 90px" }}>
-                                  <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                                  <div style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase",
                                       letterSpacing: "0.04em", color: "#854D0E", marginBottom: 3 }}>Prefix</div>
                                   <input value={wire.prefix}
                                     onChange={e => setWire(w => ({ ...w, prefix: e.target.value }))}
                                     placeholder="" style={selStyle("#FCD34D")} />
                                 </div>
                                 <div style={{ flex: "0 0 90px" }}>
-                                  <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                                  <div style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase",
                                       letterSpacing: "0.04em", color: "#854D0E", marginBottom: 3 }}>Suffix</div>
                                   <input value={wire.suffix}
                                     onChange={e => setWire(w => ({ ...w, suffix: e.target.value }))}
                                     placeholder="_PV" style={selStyle("#FCD34D")} />
                                 </div>
                                 <div style={{ flex: 1 }}>
-                                  <div style={{ fontSize: 10, fontWeight: 600, textTransform: "uppercase",
+                                  <div style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase",
                                       letterSpacing: "0.04em", color: "#854D0E", marginBottom: 3 }}>Column</div>
                                   <select value={wire.column}
                                     onChange={e => setWire(w => ({ ...w, column: e.target.value }))}
@@ -3232,7 +3348,7 @@ function StepHierarchy({ hierarchy, setHierarchy, instances, setInstances, saved
   return (
     <div>
         <div style={{ marginBottom: "1rem" }}>
-          <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 4 }}>
+          <div style={{ fontSize: '1rem', fontWeight: 600, marginBottom: 4 }}>
             Plant hierarchy {savedProjectName && <span style={{ color: "var(--color-text-secondary)", fontWeight: 400 }}>· {savedProjectName}</span>}
           </div>
           <div style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>
@@ -3528,12 +3644,12 @@ function RolePanel({ inst, profile, instances, cmtProfiles, updateInstanceRole }
   return (
     <div style={{ padding: "12px 14px", display: "flex", flexDirection: "column", gap: 10, height: "100%", overflowY: "auto" }}>
         <div>
-          <div style={{ fontSize: 13, fontWeight: 600, fontFamily: "var(--font-mono)" }}>{inst.instanceName}</div>
+          <div style={{ fontSize: 13, fontWeight: 600, fontFamily: "var(--font-sans)" }}>{inst.instanceName}</div>
           <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 1 }}>
             {profile?.cmType} · {isEPH ? "Equipment Phase" : "Equipment Module"}
           </div>
         </div>
-        <div style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em",
+        <div style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em",
             color: "var(--color-text-secondary)", borderBottom: "0.5px solid var(--color-border-tertiary)", paddingBottom: 4 }}>
           Role Assignments
         </div>
@@ -3781,7 +3897,7 @@ function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName,
       {/* Header */}
       <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: "0.75rem", flexShrink: 0 }}>
         <div style={{ flex: 1 }}>
-          <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 2 }}>
+          <div style={{ fontSize: '1rem', fontWeight: 600, marginBottom: 2 }}>
             Instances {savedProjectName && <span style={{ color: "var(--color-text-secondary)", fontWeight: 400 }}>· {savedProjectName}</span>}
           </div>
           <div style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>
@@ -4262,7 +4378,7 @@ function StepUnitTypes({
           return (
             <button key={t.key} onClick={() => setUnitTab(t.key)}
               style={{ padding: "7px 18px", border: "none", background: "transparent",
-                cursor: "pointer", fontSize: 13, fontWeight: active ? 500 : 400,
+                cursor: "pointer", fontSize: '1rem', fontWeight: active ? 600 : 400,
                 color: active ? "var(--color-text-primary)" : "var(--color-text-secondary)",
                 borderBottom: active ? "2px solid var(--color-text-primary)" : "2px solid transparent",
                 marginBottom: -1 }}>
@@ -4279,7 +4395,7 @@ function StepUnitTypes({
         {/* Left: type list */}
         <div style={colLeft}>
           <div style={{ padding: "8px 10px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
-            <span style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em", color: "var(--color-text-secondary)" }}>Unit Types</span>
+            <span style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em", color: "var(--color-text-secondary)" }}>Unit Types</span>
             <div style={{ display: "flex", gap: 4 }}>
               <Btn onClick={() => setImportModalOpen(true)} disabled={busy} title="Import from PCS7"><i className="ti ti-upload" /></Btn>
               <Btn onClick={handleCreateType} disabled={busy}><i className="ti ti-plus" /></Btn>
@@ -4294,7 +4410,7 @@ function StepUnitTypes({
                 style={{ display: "flex", alignItems: "center", padding: "6px 10px", cursor: "pointer", gap: 6,
                   background: selectedTypeId === ut.id ? "var(--color-background-secondary)" : "transparent",
                   borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
-                <span style={{ flex: 1, fontSize: 12, fontFamily: "var(--font-mono)" }}>{ut.name}</span>
+                <span style={{ flex: 1, fontSize: 12, fontFamily: "var(--font-sans)" }}>{ut.name}</span>
                 <span style={{ fontSize: 10, color: "var(--color-text-secondary)" }}>{ut.member_count}m</span>
                 <button onClick={e => { e.stopPropagation(); handleDeleteType(ut.id); }}
                   style={{ background: "none", border: "none", cursor: "pointer", color: "var(--color-text-secondary)", padding: 0, fontSize: 13 }}>
@@ -4325,7 +4441,7 @@ function StepUnitTypes({
 
               {/* Members table — composite CM types only; folder path comes from the composite definition */}
               <div>
-                <div style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em", color: "var(--color-text-secondary)", marginBottom: 6 }}>Members</div>
+                <div style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em", color: "var(--color-text-secondary)", marginBottom: 6 }}>Members</div>
                 {(compositeCmTypes || []).length === 0 && (
                   <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 6 }}>
                     No composite CM types defined yet — create them in Library → Composite CM Types first.
@@ -4435,7 +4551,7 @@ function StepUnitTypes({
       {unitTab === "instances" && (
       <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
         <div style={{ padding: "8px 12px", borderBottom: "0.5px solid var(--color-border-tertiary)", display: "flex", alignItems: "center", gap: 8 }}>
-          <span style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em", color: "var(--color-text-secondary)", flex: 1 }}>
+          <span style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em", color: "var(--color-text-secondary)", flex: 1 }}>
             Unit Instances — {savedProjectId ? "" : "(save a project first)"}
           </span>
           <Btn onClick={() => { setNewUnitName(""); setNewUnitTypeId(unitTypes[0]?.id || ""); setNewUserProject(""); setNewParentPath(""); setAddModal(true); }}
@@ -4586,7 +4702,7 @@ function StepOutput({ result, onBack }) {
     <div>
       <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: "1rem" }}>
         <Btn onClick={onBack}><i className="ti ti-arrow-left" /> Back</Btn>
-        <span style={{ flex: 1, fontSize: 15, fontWeight: 500 }}>
+        <span style={{ flex: 1, fontSize: '1rem', fontWeight: 600 }}>
           {outputs.length} XML file{outputs.length === 1 ? "" : "s"} generated
         </span>
         {outputs.length > 1 && (
@@ -4621,7 +4737,7 @@ function OutputRow({ out, open, onToggle, onDownload, isLast }) {
         style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 14px", cursor: "pointer",
           background: open ? "var(--color-background-secondary)" : "transparent" }}>
         <i className={`ti ti-chevron-${open ? "down" : "right"}`} style={{ fontSize: 14, color: "var(--color-text-secondary)" }} />
-        <span style={{ flex: 1, fontSize: 13, fontFamily: "var(--font-mono)", fontWeight: 500 }}>{userProject}.xml</span>
+        <span style={{ flex: 1, fontSize: 13, fontFamily: "var(--font-sans)", fontWeight: 500 }}>{userProject}.xml</span>
         <span style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>
           {stats.blocks} blocks · {stats.vars} vars · {stats.msgs} msgs · {stats.sizeKb} KB
         </span>
@@ -4647,32 +4763,32 @@ function OutputRow({ out, open, onToggle, onDownload, isLast }) {
 
 // ── Shared components ────────────────────────────────────────────────────────
 function SLabel({ text, top }) {
-  return <div style={{ fontSize: 11, color: "var(--color-text-secondary)", textTransform: "uppercase",
-    letterSpacing: "0.05em", fontWeight: 500, margin: `${top ? "1rem" : 0} 0 8px` }}>{text}</div>;
+  return <div style={{ fontSize: 12, color: "#6B6862", fontFamily: "var(--font-sans)", fontWeight: 600,
+    textTransform: "uppercase", letterSpacing: "0.14em", margin: `${top ? "1.5rem" : 0} 0 12px` }}>{text}</div>;
 }
 
 function BlockRow({ block, on, required, onToggle }) {
   return (
     <div onClick={required ? undefined : onToggle}
-      style={{ display: "flex", alignItems: "center", gap: 10, padding: "5px 0",
-        borderBottom: "0.5px solid var(--color-border-tertiary)", cursor: required ? "default" : "pointer" }}>
-      <div style={{ width: 34, height: 18, borderRadius: 9, flexShrink: 0, position: "relative",
-          background: on ? "#7F77DD" : "var(--color-border-secondary)", opacity: required ? 0.6 : 1, transition: "background 0.15s" }}>
-        <div style={{ position: "absolute", top: 2, left: on ? 18 : 2, width: 14, height: 14,
-            borderRadius: "50%", background: "white", transition: "left 0.15s" }} />
+      style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 0",
+        borderBottom: "1px solid rgba(28,27,25,0.08)", background: "#FFFFFF",
+        cursor: required ? "default" : "pointer" }}>
+      <div className={`toggle-container ${on ? "checked" : ""}`} style={{ opacity: required ? 0.5 : 1, pointerEvents: "none", flexShrink: 0 }}>
+        <div className="toggle-button"></div>
       </div>
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <span style={{ fontSize: 12, fontFamily: "var(--font-mono)", fontWeight: 500 }}>{block.name}</span>
-        {block.comment && <span style={{ fontSize: 11, color: "var(--color-text-secondary)", marginLeft: 6 }}>{block.comment}</span>}
+      <div style={{ flex: 1, minWidth: 0, opacity: on ? 1 : 0.55 }}>
+        <span style={{ fontSize: 12, fontFamily: "var(--font-sans)", fontWeight: 500,
+            color: on ? "#1C1B19" : "var(--color-text-secondary)" }}>{block.name}</span>
+        {block.comment && <span style={{ fontSize: 11, color: "#6B6862", marginLeft: 6 }}>{block.comment}</span>}
       </div>
-      <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
-        <span style={{ fontSize: 10, padding: "1px 6px", borderRadius: 8,
-            background: required ? "#E6F1FB" : "var(--color-background-secondary)",
-            color: required ? "#0C447C" : "var(--color-text-secondary)", fontWeight: 500 }}>
+      <div style={{ display: "flex", gap: 6, flexShrink: 0, opacity: on ? 1 : 0.55 }}>
+        <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 6,
+            background: required ? "#DBEAFE" : "#F3F4F6",
+            color: required ? "#1D4ED8" : "#6B7280", fontWeight: 500 }}>
           {required ? "req" : "opt"}
         </span>
-        {block.msgs?.length > 0 && <span style={{ fontSize: 10, padding: "1px 6px", borderRadius: 8, background: "#FAEEDA", color: "#854F0B", fontWeight: 500 }}>{block.msgs.length}msg</span>}
-        <span style={{ fontSize: 10, color: "var(--color-text-secondary)" }}>{block.vars?.length || 0}v</span>
+        {block.msgs?.length > 0 && <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 6, background: "#FEF3C7", color: "#92400E", fontWeight: 500 }}>{block.msgs.length}msg</span>}
+        <span style={{ fontSize: 10, color: "#6B6862" }}>{block.vars?.length || 0}v</span>
       </div>
     </div>
   );

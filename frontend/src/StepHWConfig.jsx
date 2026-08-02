@@ -3342,7 +3342,7 @@ function ConfigurationPanel({
         {cfgs.length > 0 && (
           <a
             href={hwCfgDownloadUrl(importId, cfgs[0].id)}
-            download={`HW_Config_${cfgs[0].id}.cfg`}
+            download={`${controllerTagName || 'HW_Config'}.cfg`}
             style={{ ...btnStyle, background: "#1a8a4a", color: "#fff",
                      textDecoration: "none", display: "inline-flex", alignItems: "center", gap: 6 }}
           >

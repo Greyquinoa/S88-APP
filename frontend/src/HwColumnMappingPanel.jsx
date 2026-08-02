@@ -230,7 +230,7 @@ export default function HwColumnMappingPanel({ importId, excelHeaders, selectedC
                       background: 'var(--color-background-primary)', cursor: 'pointer',
                     }}>
                       <input type="checkbox" checked={true} onChange={() => toggleColumn(col)} style={{ cursor: 'pointer' }} />
-                      <span style={{ fontSize: 11, fontFamily: 'var(--font-mono)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      <span style={{ fontSize: 11, fontFamily: 'var(--font-sans)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {col}
                       </span>
                     </label>
@@ -250,7 +250,7 @@ export default function HwColumnMappingPanel({ importId, excelHeaders, selectedC
                       background: 'transparent', cursor: 'pointer', opacity: 0.6,
                     }}>
                       <input type="checkbox" checked={false} onChange={() => toggleColumn(col)} style={{ cursor: 'pointer' }} />
-                      <span style={{ fontSize: 11, fontFamily: 'var(--font-mono)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      <span style={{ fontSize: 11, fontFamily: 'var(--font-sans)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {col}
                       </span>
                     </label>

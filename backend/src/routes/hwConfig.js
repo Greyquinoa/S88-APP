@@ -2497,13 +2497,20 @@ router.get('/imports/:id/cfgs', async (req, res) => {
 
 router.get('/imports/:id/cfgs/:cfgId/download', async (req, res) => {
   try {
-    const db    = getDb();
-    const cfgId = parseInt(req.params.cfgId, 10);
-    const row   = await db.prepare('SELECT cfg_text FROM hw_generated_cfgs WHERE id=?').get(cfgId);
+    const db       = getDb();
+    const importId = parseInt(req.params.id, 10);
+    const cfgId    = parseInt(req.params.cfgId, 10);
+    const row      = await db.prepare(`
+      SELECT cfg.cfg_text, ctrl.T16_Controller_TagName
+      FROM hw_generated_cfgs cfg
+      JOIN hw_imports imp ON imp.id = cfg.hw_import_id
+      LEFT JOIN hw_controllers ctrl ON ctrl.project_id = imp.project_id
+      WHERE cfg.id = ?`).get(cfgId);
     if (!row) return err(res, 404, 'CFG not found');
 
+    const tagName = row.T16_Controller_TagName || 'HW_Config';
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="HW_Config_${cfgId}.cfg"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${tagName}.cfg"`);
     res.send(row.cfg_text);
   } catch (e) { err(res, 500, e.message); }
 });

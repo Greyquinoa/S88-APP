@@ -330,10 +330,21 @@ async function _mergeUpdatedCmType(cmTypeId, newType, db) {
 router.get('/status', async (req, res) => {
   try {
     const db  = getDb();
-    const row = await db.prepare(`
-      SELECT COUNT(*) AS cm_count, MAX(loaded_at) AS last_loaded FROM lib_cm_types
-    `).get();
-    res.json({ ...row, cm_count: Number(row.cm_count) });
+    const rows = await db.prepare(`
+      SELECT cm_type, COUNT(*) AS count, MAX(loaded_at) AS last_loaded FROM lib_cm_types GROUP BY cm_type
+    `).all();
+
+    const result = { cm_count: 0, em_count: 0, eph_count: 0, last_loaded: null };
+    for (const row of rows) {
+      // lib_cm_types.cm_type stores the long form ('ControlModule', …); older
+      // rows may use the short codes. Accept both so the status never reads 0
+      // against a populated library.
+      if (row.cm_type === 'ControlModule'   || row.cm_type === 'CM')  result.cm_count  = Number(row.count);
+      else if (row.cm_type === 'EquipmentModule' || row.cm_type === 'EM')  result.em_count  = Number(row.count);
+      else if (row.cm_type === 'EquipmentPhase'  || row.cm_type === 'EPH') result.eph_count = Number(row.count);
+      if (row.last_loaded) result.last_loaded = row.last_loaded;
+    }
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

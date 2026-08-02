@@ -3,6 +3,129 @@ import {
   getIOColumnMaps, createIOColumnMap, updateIOColumnMap, deleteIOColumnMap,
 } from './api.js';
 
+// Glass radio button styles for config selection (green theme, smooth sliding glider)
+const glassRadioCss = `
+.glass-radio-group-vertical {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  background: rgba(255, 255, 255, 0);
+  padding: 0.5rem 0;
+  border: 0px solid rgb(255, 255, 255, 0);
+  backdrop-filter: blur(16px);
+  overflow-x: hidden;
+  gap: 0;
+}
+
+.glass-radio-group-vertical input {
+  display: none;
+}
+
+.glass-radio-group-vertical label {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  padding: 0.75rem 1rem;
+  font-weight: 500;
+  font-size: 0.9rem;
+  color: #1a1a1a;
+  cursor: pointer;
+  z-index: 2;
+  transition: color 0.4s ease-in-out;
+  overflow: hidden;
+}
+
+.glass-label-text {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Rendered before the rows so it paints beneath them; the rows are transparent
+   and sit at a higher z-index. Only 'transform' animates, so the slide is
+   compositor-driven and stays smooth. */
+/* Spans the sidebar edge to edge with a shiny glass effect. The layered
+   shadows create depth (inset highlight at top, shadow at bottom), and the
+   gradient overlay simulates refracted light. */
+.glass-glider-vertical {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0.5rem;
+  z-index: 0;
+  pointer-events: none;
+  flex: none;
+  border-radius: 0;
+  transition: transform 0.4s cubic-bezier(0.5, 1.6, 0.4, 1);
+  background: linear-gradient(135deg, #3a3a3a, #555555);
+  box-shadow:
+    inset 0 0.2rem 0.6rem rgba(255, 255, 255, 0.25),
+    inset 0 -0.1rem 0.3rem rgba(0, 0, 0, 0.5),
+    inset 0 -0.3rem 0.6rem rgba(255, 255, 255, 0.3),
+    0 2rem 2rem rgba(0, 0, 0, 0.2);
+  overflow: hidden;
+}
+
+/* Pseudo-element for the glossy highlight overlay. */
+.glass-glider-vertical::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 50%;
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.2) 0%,
+    rgba(255, 255, 255, 0.05) 40%,
+    transparent 100%
+  );
+  pointer-events: none;
+}
+
+/* Selected row sits on the dark band, so its text inverts to white. */
+.glass-radio-group-vertical input:checked + label {
+  color: #FFFFFF;
+  font-weight: 600;
+}
+.glass-radio-group-vertical input:checked + label .glass-sub-text {
+  color: rgba(255, 255, 255, 0.75) !important;
+}
+.glass-radio-group-vertical input:checked + label .ti-trash {
+  color: #FFFFFF !important;
+}
+.glass-radio-group-vertical input:checked + label .ti-trash:hover {
+  color: #FF4444 !important;
+}
+
+/* Unselected rows stay dark-on-light and lift slightly on hover. */
+.glass-radio-group-vertical input:not(:checked) + label:hover {
+  background: rgba(28, 27, 25, 0.05);
+}
+`;
+
+// Row height before the first measurement lands, and the flex `gap` between rows.
+const GLIDER_FALLBACK_H = 44;
+const GLIDER_GAP = 0;   // matches `gap: 0` on .glass-radio-group-vertical
+
+// Shares the single 'glass-radio-styles' tag with StepIOImport.jsx — both files
+// define the same class names, so separate tags would just overwrite each other
+// in load order. Contents are always rewritten so edits survive a hot reload.
+if (typeof document !== 'undefined') {
+  let style = document.getElementById('glass-radio-styles');
+  if (!style) {
+    style = document.createElement('style');
+    style.id = 'glass-radio-styles';
+    document.head.appendChild(style);
+  }
+  style.textContent = glassRadioCss;
+}
+
 /**
  * UnifiedColumnMappingScreen — Single merged Column Mapping for both:
  * 1. Instance & Hierarchy (top panel)
@@ -20,10 +143,10 @@ import {
 // Instance/Hierarchy Fields
 const INSTANCE_INTERNAL_FIELDS = ['instrument_tag', 'function_val', 'hierarchy', 'assignment'];
 const INSTANCE_FIELD_LABELS = {
-  instrument_tag: 'Instrument Tag',
-  function_val: 'Function',
-  hierarchy: 'Hierarchy',
-  assignment: 'AS Assignment',
+  instrument_tag: 'INSTRUMENT TAG *',
+  function_val: 'FUNCTION *',
+  hierarchy: 'HIERARCHY *',
+  assignment: 'AS ASSIGNMENT',
 };
 const INSTANCE_FIELD_DESCRIPTIONS = {
   instrument_tag: 'CM identity — groups IO rows into one instance',
@@ -34,34 +157,64 @@ const INSTANCE_FIELD_DESCRIPTIONS = {
 
 // Hardware Fields
 const HW_CORE_MANDATORY = [
-  { key: 'station_address', label: 'Station Address', desc: 'Hardware device ID' },
-  { key: 'slot', label: 'Slot', desc: 'Module position in rack' },
-  { key: 'tag', label: 'Tag', desc: 'Signal identifier' },
-  { key: 'channel', label: 'Channel', desc: 'Signal channel number' },
+  { key: 'station_address', label: 'STATION ADDRESS *', desc: 'Hardware device ID' },
+  { key: 'slot', label: 'SLOT *', desc: 'Module position in rack' },
+  { key: 'tag', label: 'TAG *', desc: 'Signal identifier' },
+  { key: 'channel', label: 'CHANNEL *', desc: 'Signal channel number' },
 ];
 
-const HW_MODULE_ORDER_FIELD = { key: 'module_order_no', label: 'Module Order No (Card MLFB)', desc: 'Siemens module catalog number — Tier 1' };
-const HW_PROTOCOL_FIELD = { key: 'protocol', label: 'Protocol', desc: 'Used with Signal Type to resolve Card MLFB — Tier 2' };
-const HW_SIGNAL_TYPE_FIELD = { key: 'signal_type', label: 'Signal Type', desc: 'DI / DO / AI / AO — required for Tier 2' };
+const HW_MODULE_ORDER_FIELD = { key: 'module_order_no', label: 'MODULE ORDER NO (CARD MLFB)', desc: 'Siemens module catalog number — Tier 1' };
+const HW_PROTOCOL_FIELD = { key: 'protocol', label: 'PROTOCOL', desc: 'Used with Signal Type to resolve Card MLFB — Tier 2' };
+const HW_SIGNAL_TYPE_FIELD = { key: 'signal_type', label: 'SIGNAL TYPE', desc: 'DI / DO / AI / AO — required for Tier 2' };
 
 const HW_OPTIONAL_FIELDS = [
-  { key: 'station_name', label: 'Station Name' },
-  { key: 'ip_address', label: 'IP Address' },
-  { key: 'description', label: 'Description' },
-  { key: 'subsystem_no', label: 'Subsystem No' },
-  { key: 'router_address', label: 'Router Address' },
+  { key: 'station_name', label: 'STATION NAME' },
+  { key: 'ip_address', label: 'IP ADDRESS' },
+  { key: 'description', label: 'DESCRIPTION' },
+  { key: 'subsystem_no', label: 'SUBSYSTEM NO' },
+  { key: 'router_address', label: 'ROUTER ADDRESS' },
 ];
 
 // UI Styles
 const inputSx = {
-  padding: '4px 8px',
+  padding: '6px 10px',
   border: '0.5px solid var(--color-border-secondary)',
   borderRadius: 6,
-  fontSize: 12,
+  fontSize: 14,
   fontFamily: 'var(--font-mono)',
   background: 'var(--color-background-primary)',
   color: 'var(--color-text-primary)',
   width: '100%',
+};
+
+// Glass morphism sidebar card + its header strip — mirrors glassPanelSx /
+// glassPanelHeaderSx in StepIOImport.jsx so the Column Mapping configs sidebar
+// reads identically to the Function Mapping one.
+const glassPanelSx = {
+  border: '1px solid rgba(255,255,255,0.3)',
+  borderRadius: '16px',
+  display: 'flex',
+  flexDirection: 'column',
+  overflow: 'hidden',
+  flex: 1,
+  minHeight: 0,
+  background: 'rgba(255,255,255,0.18)',
+  backdropFilter: 'blur(16px)',
+  boxShadow: '0 8px 32px 0 rgba(0,0,0,0.1)',
+};
+
+const glassPanelHeaderSx = {
+  padding: '12px 16px',
+  borderBottom: '1px solid rgba(255,255,255,0.25)',
+  background: 'rgba(255,255,255,0.12)',
+  flexShrink: 0,
+};
+
+// Field label matching the hero's "AT A GLANCE" eyebrow (.nimbus-eyebrow-label).
+const eyebrowLabelSx = {
+  marginBottom: 3,
+  fontFamily: "'Inter', sans-serif", fontWeight: 600, fontSize: 13,
+  letterSpacing: '0.02em', textTransform: 'uppercase', color: '#6B6862',
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -72,12 +225,22 @@ function Btn({ onClick, primary, danger, disabled, children, style }) {
   return (
     <button onClick={onClick} disabled={disabled}
       style={{
-        padding: '5px 14px', borderRadius: 6, fontSize: 12, fontWeight: primary ? 500 : 400,
-        border: danger ? '1px solid #FCA5A5' : primary ? 'none' : '0.5px solid var(--color-border-secondary)',
+        padding: '7px 18px',
+        borderRadius: 'var(--border-radius-md)',
+        fontSize: 13,
+        fontWeight: primary ? 500 : 400,
+        border: danger ? '0.5px solid #FCA5A5' : primary ? 'none' : '0.5px solid var(--color-border-secondary)',
         cursor: disabled ? 'not-allowed' : 'pointer',
-        background: danger ? '#FEE2E2' : primary ? 'var(--color-text-primary)' : 'transparent',
-        color: danger ? '#991B1B' : primary ? 'var(--color-background-primary)' : 'var(--color-text-primary)',
-        opacity: disabled ? 0.4 : 1, display: 'inline-flex', alignItems: 'center', gap: 5, ...style,
+        background: danger ? '#FEE2E2' : primary ? 'var(--color-accent)' : 'transparent',
+        color: danger ? '#991B1B' : primary ? 'white' : 'var(--color-text-primary)',
+        opacity: disabled ? 0.45 : 1,
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 6,
+        whiteSpace: 'nowrap',
+        transition: 'opacity 0.15s ease',
+        ...style,
       }}>
       {children}
     </button>
@@ -216,6 +379,17 @@ export default function UnifiedColumnMappingScreen({
   const [hardwareMappings, setHardwareMappings] = useState({});
   const [headers, setHeaders] = useState(excelHeaders);
   const [busy, setBusy] = useState(false);
+
+  // Sliding-highlight geometry. The row height is measured rather than assumed:
+  // rows size to their own content (a description makes a row taller), so a
+  // hard-coded value drifts the highlight further off with every row down.
+  const rowRef = React.useRef(null);
+  const [rowH, setRowH] = useState(GLIDER_FALLBACK_H);
+  const selectedIdx = configs.findIndex(c => c.id === selectedConfigId);
+  React.useLayoutEffect(() => {
+    const h = rowRef.current?.offsetHeight;
+    if (h) setRowH(h);
+  }, [configs, selectedConfigId]);
 
   // Load configs on mount
   useEffect(() => {
@@ -516,47 +690,84 @@ export default function UnifiedColumnMappingScreen({
   }
 
   return (
-    <div style={{ display: 'flex', gap: 0, height: '100%' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
+      {/* Panel heading — mirrors PanelHeading in StepIOImport.jsx (subtitle only,
+          matching the Upload and Function Mapping tabs). */}
+      <div style={{ marginBottom: '1rem' }}>
+        <div style={{ fontSize: 13, color: 'var(--color-text-secondary)' }}>
+          Assign each column from your imported IO list to the corresponding field used by the application for processing.
+        </div>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '220px 1fr', gap: 12, flex: 1, minHeight: 0 }}>
       {/* ═══════════════════════════════════════════════════════════════════════ */}
       {/* CONFIGS SIDEBAR */}
       {/* ═══════════════════════════════════════════════════════════════════════ */}
-      <div style={{
-        width: 220, flexShrink: 0, borderRight: '0.5px solid var(--color-border-tertiary)',
-        display: 'flex', flexDirection: 'column',
-      }}>
-        <div style={{
-          padding: '6px 10px', display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-          borderBottom: '0.5px solid var(--color-border-tertiary)', background: 'var(--color-background-secondary)',
-        }}>
-          <span style={{
-            fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em',
-            color: 'var(--color-text-secondary)',
-          }}>Configs</span>
-          <Btn onClick={newConfig}><i className="ti ti-plus" /></Btn>
-        </div>
-        <div style={{ overflowY: 'auto', flex: 1 }}>
-          {configs.map(cm => (
-            <div key={cm.id} onClick={() => selectConfig(cm)}
-              style={{
-                padding: '7px 10px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6,
-                borderBottom: '0.5px solid var(--color-border-tertiary)',
-                background: selectedConfigId === cm.id ? '#EEEDFE' : 'transparent',
-              }}>
-              <span style={{ flex: 1, fontSize: 12, fontFamily: 'var(--font-mono)' }}>{cm.name}</span>
-              <button onClick={e => { e.stopPropagation(); deleteConfig(cm.id); }}
-                style={{
-                  background: 'none', border: 'none', cursor: 'pointer',
-                  color: 'var(--color-text-secondary)', fontSize: 13,
-                }}>
-                <i className="ti ti-trash" />
-              </button>
-            </div>
-          ))}
-          {configs.length === 0 && (
-            <div style={{ padding: 10, fontSize: 12, color: 'var(--color-text-secondary)' }}>
-              No configs yet.
-            </div>
-          )}
+      <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+        <div style={glassPanelSx}>
+          <div style={glassPanelHeaderSx}>
+            <Btn primary onClick={newConfig} style={{ width: '100%' }}>
+              <i className="ti ti-plus" /> New config
+            </Btn>
+          </div>
+          <div className="glass-radio-group-vertical" style={{ flex: 1, overflowY: 'auto' }}>
+            {configs.length === 0 ? (
+              <div style={{ padding: '1rem', fontSize: 12, color: '#888', textAlign: 'center' }}>
+                No configs yet
+              </div>
+            ) : (
+              <>
+                {/* Sliding highlight. Rendered first so it paints beneath the rows,
+                    and positioned from the measured row height (rows vary — those
+                    with a description are taller than those without). */}
+                {selectedIdx >= 0 && (
+                  <div className="glass-glider-vertical" style={{
+                    height: rowH,
+                    transform: `translateY(${selectedIdx * (rowH + GLIDER_GAP)}px)`,
+                  }} />
+                )}
+                {configs.map(cm => (
+                  <React.Fragment key={cm.id}>
+                    <input
+                      type="radio"
+                      id={`colmap-${cm.id}`}
+                      name="column-map"
+                      checked={selectedConfigId === cm.id}
+                      onChange={() => selectConfig(cm)} />
+                    <label ref={cm.id === configs[0].id ? rowRef : undefined}
+                      htmlFor={`colmap-${cm.id}`}
+                      style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <div className="glass-label-text" style={{ minWidth: 0 }} title={cm.name}>
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {cm.name}
+                          </div>
+                          {cm.description && (
+                            <div className="glass-sub-text" style={{ fontSize: '0.85rem', color: '#999',
+                                marginTop: '0.2rem',
+                                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {cm.description}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                      {selectedConfigId === cm.id && (
+                        <span onClick={e => { e.preventDefault(); e.stopPropagation(); deleteConfig(cm.id); }}
+                          title="Delete config"
+                          style={{ cursor: 'pointer', padding: '2px 4px', color: '#6b7280',
+                            fontSize: 13, lineHeight: 1, flexShrink: 0,
+                            transition: 'color 0.15s ease' }}
+                          onMouseEnter={e => e.currentTarget.style.color = '#DC2626'}
+                          onMouseLeave={e => e.currentTarget.style.color = '#6b7280'}>
+                          <i className="ti ti-trash" />
+                        </span>
+                      )}
+                    </label>
+                  </React.Fragment>
+                ))}
+              </>
+            )}
+          </div>
         </div>
       </div>
 
@@ -564,7 +775,7 @@ export default function UnifiedColumnMappingScreen({
       {/* MAIN EDITOR AREA */}
       {/* ═══════════════════════════════════════════════════════════════════════ */}
       <div style={{
-        flex: 1, padding: '12px 16px', overflowY: 'auto', display: 'flex',
+        minWidth: 0, overflowY: 'auto', display: 'flex',
         flexDirection: 'column', gap: 12,
       }}>
         {!draft ? (
@@ -573,153 +784,165 @@ export default function UnifiedColumnMappingScreen({
           </div>
         ) : (
           <>
-            {/* Config Name & Description */}
-            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-              <div style={{ flex: 1, minWidth: 160 }}>
-                <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', marginBottom: 3 }}>Config name</div>
+            {/* Config Name & Description (50-50) + Save Button + Auto-detect */}
+            <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
+              <div style={{ flex: 1 }}>
+                <div style={eyebrowLabelSx}>Config name</div>
                 <input
                   value={draft.name}
                   onChange={e => setDraft(d => ({ ...d, name: e.target.value }))}
-                  style={inputSx}
+                  style={{ ...inputSx, width: '100%' }}
                 />
               </div>
-              <div style={{ flex: 2, minWidth: 200 }}>
-                <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', marginBottom: 3 }}>Description</div>
+              <div style={{ flex: 1 }}>
+                <div style={eyebrowLabelSx}>Description</div>
                 <input
                   value={draft.description}
                   onChange={e => setDraft(d => ({ ...d, description: e.target.value }))}
-                  style={inputSx}
+                  style={{ ...inputSx, width: '100%' }}
                 />
               </div>
+              <Btn primary onClick={saveConfig} disabled={busy || !draft.name.trim()}>
+                <i className="ti ti-device-floppy" /> {busy ? 'Saving…' : 'Save config'}
+              </Btn>
+              <Btn onClick={autoDetectColumns} disabled={busy || !draft || headers.length === 0}>
+                <i className="ti ti-wand" /> Auto-detect
+              </Btn>
             </div>
 
             {/* ═══════════════════════════════════════════════════════════════ */}
             {/* PANEL 1: INSTANCE & HIERARCHY */}
             {/* ═══════════════════════════════════════════════════════════════ */}
-            <div style={{ marginTop: 12 }}>
+            <div style={{
+              fontSize: 14, fontWeight: 600, textTransform: 'uppercase',
+              letterSpacing: '0.04em', color: 'var(--color-text-secondary)',
+              marginTop: 16, marginBottom: 8,
+            }}>
+              INSTANCE & HIERARCHY FIELDS
+            </div>
+            <div style={{ border: '1px solid rgba(28,27,25,0.08)', borderRadius: '12px', overflow: 'hidden', background: '#FBFAF7', boxShadow: '0 1px 0 rgba(0,0,0,0.02), 0 14px 30px -18px rgba(28,27,25,0.18)', flexShrink: 0 }}>
               <div style={{
-                fontSize: 11, fontWeight: 600, textTransform: 'uppercase',
-                color: 'var(--color-text-secondary)', marginBottom: 8,
-              }}>
-                Instance & Hierarchy Fields
-              </div>
-
-              <div style={{
-                border: '0.5px solid var(--color-border-tertiary)', borderRadius: 6,
-                overflow: 'hidden',
+                display: 'grid', gridTemplateColumns: '40% 60%', gap: 0,
+                background: '#FBF8F0',
+                borderBottom: '1px solid rgba(28,27,25,0.08)',
               }}>
                 <div style={{
-                  display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 0,
-                  background: 'var(--color-background-secondary)',
-                  borderBottom: '0.5px solid var(--color-border-tertiary)',
+                  padding: '10px 16px', fontSize: 12, fontWeight: 600, textTransform: 'uppercase',
+                  color: '#6B6862',
+                }}>
+                  INTERNAL FIELD
+                </div>
+                <div style={{
+                  padding: '10px 16px', fontSize: 12, fontWeight: 600, textTransform: 'uppercase',
+                  color: '#6B6862', borderLeft: '1px solid rgba(28,27,25,0.08)',
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                }}>
+                  <span>CUSTOMER COLUMN</span>
+                  <Btn primary onClick={handleImportInstances} disabled={busy || !draft}
+                    style={{ textTransform: 'none', letterSpacing: 'normal' }}>
+                    <i className="ti ti-upload" /> {busy ? 'Importing…' : 'Import Instances'}
+                  </Btn>
+                </div>
+              </div>
+
+              {INSTANCE_INTERNAL_FIELDS.map((field, idx) => (
+                <div key={field} style={{
+                  display: 'grid', gridTemplateColumns: '40% 60%',
+                  borderBottom: '1px solid rgba(28,27,25,0.08)',
+                  background: '#FFFFFF',
+                  borderLeft: '1px solid rgba(28,27,25,0.08)',
+                  borderRight: '1px solid rgba(28,27,25,0.08)',
                 }}>
                   <div style={{
-                    padding: '8px 12px', fontSize: 10, fontWeight: 600, textTransform: 'uppercase',
-                    color: 'var(--color-text-secondary)',
+                    padding: '10px 16px', display: 'flex', flexDirection: 'column', gap: 2,
+                    borderRight: '1px solid rgba(28,27,25,0.08)',
                   }}>
-                    Internal Field
+                    <div style={{ fontSize: 14, fontWeight: 600, fontFamily: 'var(--font-sans)', textTransform: 'uppercase' }}>
+                      {INSTANCE_FIELD_LABELS[field]}
+                    </div>
+                    <div style={{
+                      fontSize: 12, color: 'var(--color-text-secondary)', lineHeight: 1.3,
+                    }}>
+                      {INSTANCE_FIELD_DESCRIPTIONS[field]}
+                    </div>
                   </div>
-                  <div style={{
-                    padding: '8px 12px', fontSize: 10, fontWeight: 600, textTransform: 'uppercase',
-                    color: 'var(--color-text-secondary)', borderLeft: '0.5px solid var(--color-border-tertiary)',
-                  }}>
-                    Customer Column
+
+                  <div style={{ padding: '10px 16px', display: 'flex', alignItems: 'center' }}>
+                    <select
+                      value={instanceFieldToColumn[field] || ''}
+                      onChange={e => updateInstanceMapping(field, e.target.value || null)}
+                      style={{ ...inputSx, flex: 1 }}>
+                      <option value="">— select column —</option>
+                      {headers.map(h => (
+                        <option key={h} value={h}>{h}</option>
+                      ))}
+                    </select>
                   </div>
                 </div>
-
-                {INSTANCE_INTERNAL_FIELDS.map((field, idx) => (
-                  <div key={field} style={{
-                    display: 'grid', gridTemplateColumns: '1fr 1fr',
-                    borderBottom: idx < INSTANCE_INTERNAL_FIELDS.length - 1 ? '0.5px solid var(--color-border-tertiary)' : 'none',
-                    minHeight: 80,
-                  }}>
-                    <div style={{
-                      padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 4,
-                      borderRight: '0.5px solid var(--color-border-tertiary)',
-                    }}>
-                      <div style={{ fontSize: 12, fontWeight: 500, fontFamily: 'var(--font-mono)' }}>
-                        {field}
-                      </div>
-                      <div style={{
-                        fontSize: 11, color: 'var(--color-text-secondary)', lineHeight: 1.4,
-                      }}>
-                        {INSTANCE_FIELD_DESCRIPTIONS[field]}
-                      </div>
-                    </div>
-
-                    <div style={{ padding: '10px 12px', display: 'flex', alignItems: 'center' }}>
-                      <select
-                        value={instanceFieldToColumn[field] || ''}
-                        onChange={e => updateInstanceMapping(field, e.target.value || null)}
-                        style={{ ...inputSx, flex: 1 }}>
-                        <option value="">— select column —</option>
-                        {headers.map(h => (
-                          <option key={h} value={h}>{h}</option>
-                        ))}
-                      </select>
-                    </div>
-                  </div>
-                ))}
-              </div>
+              ))}
             </div>
 
             {/* ═══════════════════════════════════════════════════════════════ */}
             {/* PANEL 2: HARDWARE */}
             {/* ═══════════════════════════════════════════════════════════════ */}
-            <div style={{ marginTop: 20 }}>
+            <div style={{
+              fontSize: 14, fontWeight: 600, textTransform: 'uppercase',
+              letterSpacing: '0.04em', color: 'var(--color-text-secondary)',
+              marginTop: 20, marginBottom: 8,
+            }}>
+              HARDWARE FIELDS
+            </div>
+            <div style={{ border: '1px solid rgba(28,27,25,0.08)', borderRadius: '12px', overflow: 'hidden', background: '#FBFAF7', boxShadow: '0 1px 0 rgba(0,0,0,0.02), 0 14px 30px -18px rgba(28,27,25,0.18)', flexShrink: 0 }}>
               <div style={{
-                fontSize: 11, fontWeight: 600, textTransform: 'uppercase',
-                color: 'var(--color-text-secondary)', marginBottom: 8,
-              }}>
-                Hardware Fields
-              </div>
-
-              <div style={{
-                border: '0.5px solid var(--color-border-tertiary)', borderRadius: 6,
-                overflow: 'hidden',
+                display: 'grid', gridTemplateColumns: '40% 60%', gap: 0,
+                background: '#FBF8F0',
+                borderBottom: '1px solid rgba(28,27,25,0.08)',
               }}>
                 <div style={{
-                  display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 0,
-                  background: 'var(--color-background-secondary)',
-                  borderBottom: '0.5px solid var(--color-border-tertiary)',
+                  padding: '10px 16px', fontSize: 12, fontWeight: 600, textTransform: 'uppercase',
+                  color: '#6B6862',
                 }}>
-                  <div style={{
-                    padding: '8px 12px', fontSize: 10, fontWeight: 600, textTransform: 'uppercase',
-                    color: 'var(--color-text-secondary)',
-                  }}>
-                    Field
-                  </div>
-                  <div style={{
-                    padding: '8px 12px', fontSize: 10, fontWeight: 600, textTransform: 'uppercase',
-                    color: 'var(--color-text-secondary)', borderLeft: '0.5px solid var(--color-border-tertiary)',
-                  }}>
-                    Column
-                  </div>
+                  FIELD
                 </div>
+                <div style={{
+                  padding: '10px 16px', fontSize: 12, fontWeight: 600, textTransform: 'uppercase',
+                  color: '#6B6862', borderLeft: '1px solid rgba(28,27,25,0.08)',
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                }}>
+                  <span>COLUMN</span>
+                  <Btn primary onClick={handleImportHardware} disabled={busy || !draft}
+                    style={{ textTransform: 'none', letterSpacing: 'normal' }}>
+                    <i className="ti ti-upload" /> {busy ? 'Importing…' : 'Import Hardware'}
+                  </Btn>
+                </div>
+              </div>
 
                 {/* CORE MANDATORY */}
                 {HW_CORE_MANDATORY.map((field, idx) => (
                   <div key={field.key} style={{
-                    display: 'grid', gridTemplateColumns: '1fr 1fr',
-                    borderBottom: '0.5px solid var(--color-border-tertiary)',
-                    minHeight: 70,
+                    display: 'grid', gridTemplateColumns: '40% 60%',
+                    borderBottom: '1px solid rgba(28,27,25,0.08)',
+                    background: '#FFFFFF',
+                    borderLeft: '1px solid rgba(28,27,25,0.08)',
+                    borderRight: '1px solid rgba(28,27,25,0.08)',
                   }}>
                     <div style={{
-                      padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 4,
-                      borderRight: '0.5px solid var(--color-border-tertiary)',
+                      padding: '10px 16px', display: 'flex', flexDirection: 'column', gap: 2,
+                      borderRight: '1px solid rgba(28,27,25,0.08)',
                     }}>
                       <div style={{
-                        fontSize: 12, fontWeight: 500, fontFamily: 'var(--font-mono)',
+                        fontSize: 14, fontWeight: 600, fontFamily: 'var(--font-sans)',
                         color: !hardwareFieldToColumn[field.key] ? '#991B1B' : 'inherit',
+                        textTransform: 'uppercase',
                       }}>
                         {field.label}
                       </div>
-                      <div style={{ fontSize: 10, color: 'var(--color-text-secondary)', lineHeight: 1.3 }}>
+                      <div style={{ fontSize: 12, color: 'var(--color-text-secondary)', lineHeight: 1.3 }}>
                         {field.desc}
                       </div>
                     </div>
 
-                    <div style={{ padding: '10px 12px', display: 'flex', alignItems: 'center' }}>
+                    <div style={{ padding: '10px 16px', display: 'flex', alignItems: 'center' }}>
                       <select
                         value={hardwareFieldToColumn[field.key] || ''}
                         onChange={e => updateHardwareMapping(field.key, e.target.value || null)}
@@ -735,24 +958,25 @@ export default function UnifiedColumnMappingScreen({
 
                 {/* TIER 1: MODULE ORDER */}
                 <div style={{
-                  display: 'grid', gridTemplateColumns: '1fr 1fr',
-                  borderBottom: '0.5px solid var(--color-border-tertiary)',
-                  minHeight: 70,
-                  background: 'var(--color-background-secondary)',
+                  display: 'grid', gridTemplateColumns: '40% 60%',
+                  borderBottom: '1px solid rgba(28,27,25,0.08)',
+                  background: '#FFFFFF',
+                  borderLeft: '1px solid rgba(28,27,25,0.08)',
+                  borderRight: '1px solid rgba(28,27,25,0.08)',
                 }}>
                   <div style={{
-                    padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 4,
-                    borderRight: '0.5px solid var(--color-border-tertiary)',
+                    padding: '10px 16px', display: 'flex', flexDirection: 'column', gap: 2,
+                    borderRight: '1px solid rgba(28,27,25,0.08)',
                   }}>
-                    <div style={{ fontSize: 12, fontWeight: 500, fontFamily: 'var(--font-mono)' }}>
+                    <div style={{ fontSize: 14, fontWeight: 600, fontFamily: 'var(--font-sans)', textTransform: 'uppercase' }}>
                       {HW_MODULE_ORDER_FIELD.label}
                     </div>
-                    <div style={{ fontSize: 10, color: 'var(--color-text-secondary)', lineHeight: 1.3 }}>
+                    <div style={{ fontSize: 12, color: 'var(--color-text-secondary)', lineHeight: 1.3 }}>
                       {HW_MODULE_ORDER_FIELD.desc}
                     </div>
                   </div>
 
-                  <div style={{ padding: '10px 12px', display: 'flex', alignItems: 'center' }}>
+                  <div style={{ padding: '10px 16px', display: 'flex', alignItems: 'center' }}>
                     <select
                       value={hardwareFieldToColumn[HW_MODULE_ORDER_FIELD.key] || ''}
                       onChange={e => updateHardwareMapping(HW_MODULE_ORDER_FIELD.key, e.target.value || null)}
@@ -769,7 +993,7 @@ export default function UnifiedColumnMappingScreen({
                 {!hardwareFieldToColumn[HW_MODULE_ORDER_FIELD.key] && (
                   <>
                     <div style={{
-                      padding: '8px 12px', background: '#FEF3C7', borderBottom: '0.5px solid var(--color-border-tertiary)',
+                      padding: '8px 16px', background: '#FEF3C7', borderBottom: '1px solid rgba(28,27,25,0.08)',
                       fontSize: 10, color: '#92400E', fontWeight: 500,
                     }}>
                       ⚠️ Tier 2 Resolution (MLFB not mapped — Protocol + Signal Type required)
@@ -777,26 +1001,29 @@ export default function UnifiedColumnMappingScreen({
 
                     {[HW_PROTOCOL_FIELD, HW_SIGNAL_TYPE_FIELD].map(field => (
                       <div key={field.key} style={{
-                        display: 'grid', gridTemplateColumns: '1fr 1fr',
-                        borderBottom: field.key === HW_SIGNAL_TYPE_FIELD.key ? '0.5px solid var(--color-border-tertiary)' : '0.5px solid var(--color-border-tertiary)',
-                        minHeight: 70,
+                        display: 'grid', gridTemplateColumns: '40% 60%',
+                        borderBottom: '1px solid rgba(28,27,25,0.08)',
+                        background: '#FFFFFF',
+                        borderLeft: '1px solid rgba(28,27,25,0.08)',
+                        borderRight: '1px solid rgba(28,27,25,0.08)',
                       }}>
                         <div style={{
-                          padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 4,
-                          borderRight: '0.5px solid var(--color-border-tertiary)',
+                          padding: '10px 16px', display: 'flex', flexDirection: 'column', gap: 2,
+                          borderRight: '1px solid rgba(28,27,25,0.08)',
                         }}>
                           <div style={{
-                            fontSize: 12, fontWeight: 500, fontFamily: 'var(--font-mono)',
+                            fontSize: 14, fontWeight: 600, fontFamily: 'var(--font-sans)',
                             color: !hardwareFieldToColumn[field.key] ? '#991B1B' : 'inherit',
+                            textTransform: 'uppercase',
                           }}>
                             {field.label}
                           </div>
-                          <div style={{ fontSize: 10, color: 'var(--color-text-secondary)', lineHeight: 1.3 }}>
+                          <div style={{ fontSize: 12, color: 'var(--color-text-secondary)', lineHeight: 1.3 }}>
                             {field.desc}
                           </div>
                         </div>
 
-                        <div style={{ padding: '10px 12px', display: 'flex', alignItems: 'center' }}>
+                        <div style={{ padding: '10px 16px', display: 'flex', alignItems: 'center' }}>
                           <select
                             value={hardwareFieldToColumn[field.key] || ''}
                             onChange={e => updateHardwareMapping(field.key, e.target.value || null)}
@@ -815,20 +1042,22 @@ export default function UnifiedColumnMappingScreen({
                 {/* OPTIONAL FIELDS */}
                 {HW_OPTIONAL_FIELDS.map((field, idx) => (
                   <div key={field.key} style={{
-                    display: 'grid', gridTemplateColumns: '1fr 1fr',
-                    borderBottom: idx < HW_OPTIONAL_FIELDS.length - 1 ? '0.5px solid var(--color-border-tertiary)' : 'none',
-                    minHeight: 50,
+                    display: 'grid', gridTemplateColumns: '40% 60%',
+                    borderBottom: idx < HW_OPTIONAL_FIELDS.length - 1 ? '1px solid rgba(28,27,25,0.08)' : 'none',
+                    background: '#FFFFFF',
+                    borderLeft: '1px solid rgba(28,27,25,0.08)',
+                    borderRight: idx < HW_OPTIONAL_FIELDS.length - 1 ? '1px solid rgba(28,27,25,0.08)' : 'none',
                   }}>
                     <div style={{
-                      padding: '10px 12px', display: 'flex', alignItems: 'center',
-                      borderRight: '0.5px solid var(--color-border-tertiary)',
+                      padding: '10px 16px', display: 'flex', alignItems: 'center',
+                      borderRight: '1px solid rgba(28,27,25,0.08)',
                     }}>
-                      <div style={{ fontSize: 12, fontFamily: 'var(--font-mono)' }}>
+                      <div style={{ fontSize: 14, fontFamily: 'var(--font-sans)', fontWeight: 600, textTransform: 'uppercase' }}>
                         {field.label}
                       </div>
                     </div>
 
-                    <div style={{ padding: '10px 12px', display: 'flex', alignItems: 'center' }}>
+                    <div style={{ padding: '10px 16px', display: 'flex', alignItems: 'center' }}>
                       <select
                         value={hardwareFieldToColumn[field.key] || ''}
                         onChange={e => updateHardwareMapping(field.key, e.target.value || null)}
@@ -841,32 +1070,11 @@ export default function UnifiedColumnMappingScreen({
                     </div>
                   </div>
                 ))}
-              </div>
             </div>
 
-            {/* ═══════════════════════════════════════════════════════════════ */}
-            {/* ACTION BUTTONS */}
-            {/* ═══════════════════════════════════════════════════════════════ */}
-            <div style={{
-              display: 'flex', gap: 8, justifyContent: 'flex-end', alignItems: 'center',
-              flexWrap: 'wrap', marginTop: 16,
-            }}>
-              <Btn onClick={autoDetectColumns} disabled={busy || !draft || headers.length === 0}
-                style={{ marginRight: 'auto' }}>
-                <i className="ti ti-wand" /> Auto-detect columns
-              </Btn>
-              <Btn onClick={handleImportInstances} disabled={busy || !draft}>
-                <i className="ti ti-upload" /> {busy ? 'Importing…' : 'Import Instances'}
-              </Btn>
-              <Btn onClick={handleImportHardware} disabled={busy || !draft}>
-                <i className="ti ti-upload" /> {busy ? 'Importing…' : 'Import Hardware'}
-              </Btn>
-              <Btn primary onClick={saveConfig} disabled={busy || !draft || !draft.name.trim()}>
-                <i className="ti ti-device-floppy" /> Save config
-              </Btn>
-            </div>
           </>
         )}
+      </div>
       </div>
     </div>
   );

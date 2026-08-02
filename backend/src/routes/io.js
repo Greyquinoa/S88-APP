@@ -623,8 +623,17 @@ router.put('/function-maps/:id', async (req, res) => {
   try {
     const db = getDb();
     const { name, description } = req.body || {};
-    await db.prepare(`UPDATE io_function_map_configs SET name=?, description=?, updated_at=NOW() WHERE id=?`)
-      .run(name?.trim() || '', description || '', req.params.id);
+
+    // Patch semantics: only touch the fields the caller actually sent. A rename
+    // posts { name } alone, and an unconditional SET would blank the description.
+    const sets = [], vals = [];
+    if (name !== undefined)        { sets.push('name=?');        vals.push(name?.trim() || ''); }
+    if (description !== undefined) { sets.push('description=?'); vals.push(description || ''); }
+    if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
+
+    sets.push('updated_at=NOW()');
+    vals.push(req.params.id);
+    await db.prepare(`UPDATE io_function_map_configs SET ${sets.join(', ')} WHERE id=?`).run(...vals);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });

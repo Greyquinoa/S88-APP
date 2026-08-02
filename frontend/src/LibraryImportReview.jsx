@@ -247,7 +247,7 @@ function LibraryImportReview({ diffResult, onImport, onCancel }) {
                   {/* Name + Status */}
                   <div style={{ minWidth: 0 }}>
                     <div style={{
-                      fontFamily: "var(--font-mono)", fontSize: 12, fontWeight: 500,
+                      fontFamily: "var(--font-sans)", fontSize: 12, fontWeight: 500,
                       color: "var(--color-text-primary)", marginBottom: 4
                     }}>
                       {item.name}
