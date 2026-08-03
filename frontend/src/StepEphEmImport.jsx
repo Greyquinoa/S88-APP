@@ -1042,12 +1042,10 @@ export default function StepEphEmImport({ projectId, onComplete }) {
                             preview: fullImport.preview || [],
                           });
                           setImportId(fullImport.id);
-                          setUnitColumn(null);
-                          setSelectedTypeMapping(null);
                           setAssignmentError(null);
                           setAssignmentSuccess(false);
-                          // Clear saved state when switching imports
-                          clearFormState();
+                          // Preserve form selections when switching imports
+                          saveFormState(unitColumn, selectedTypeMapping, assignmentSuccess, fullImport.id);
                         } catch (e) {
                           alert('Failed to load import: ' + e.message);
                         }
