@@ -28,9 +28,13 @@ router.get('/:id', async (req, res) => {
     const db = getDb();
     const comp = await db.prepare('SELECT * FROM composite_cm_types WHERE id = ?').get(req.params.id);
     if (!comp) return res.status(404).json({ error: 'Not found' });
-    const members = await db.prepare(
+    let members = await db.prepare(
       'SELECT * FROM composite_cm_members WHERE composite_id = ? ORDER BY sort_order, id'
     ).all(req.params.id);
+    members = members.map(m => ({
+      ...m,
+      roles: m.roles ? (typeof m.roles === 'string' ? JSON.parse(m.roles) : m.roles) : {},
+    }));
     let connections = await db.prepare(
       'SELECT * FROM composite_cm_connections WHERE composite_id = ? ORDER BY sort_order, id'
     ).all(req.params.id);
@@ -267,11 +271,12 @@ async function _insertConnections(db, compId, connections) {
 async function _insertMembers(db, compId, members) {
   const stmt = db.prepare(`
     INSERT INTO composite_cm_members
-      (composite_id, cm_type_name, hierarchy_folder, name_prefix, name_suffix, is_primary, scope, sort_order)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      (composite_id, cm_type_name, hierarchy_folder, name_prefix, name_suffix, is_primary, scope, roles, sort_order)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   for (let i = 0; i < members.length; i++) {
     const m = members[i];
+    const roles = m.roles && Object.keys(m.roles).length > 0 ? JSON.stringify(m.roles) : null;
     await stmt.run(
       compId,
       (m.cm_type_name || '').trim(),
@@ -282,6 +287,7 @@ async function _insertMembers(db, compId, members) {
       (m.name_suffix || '').trim(),
       !!m.is_primary,
       m.scope === 'project' ? 'project' : 'unit',
+      roles,
       i,
     );
   }

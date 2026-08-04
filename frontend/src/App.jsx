@@ -792,7 +792,8 @@ export default function App() {
               getCompositeCmType={getCompositeCmType}
               extractMemberConnections={extractMemberConnections}
               valveCommands={valveCommands}
-              setInstances={setInstances} />
+              setInstances={setInstances}
+              loadProjectIntoState={loadProjectIntoState} />
           )}
           {step === 7 && (
             <StepHWConfig
@@ -1877,7 +1878,7 @@ function ModeCommandsPanel({ valveCommands, onValveCommandsChange }) {
 
 // ── Composite CM Types sub-tab ────────────────────────────────────────────────
 const EMPTY_COMPOSITE = { name: "", description: "", members: [], is_matrix: false, matrixColumns: [], matrixModes: [] };
-const EMPTY_MEMBER    = { cm_type_name: "", hierarchy_folder: "", name_prefix: "", name_suffix: "", scope: "unit" };
+const EMPTY_MEMBER    = { cm_type_name: "", hierarchy_folder: "", name_prefix: "", name_suffix: "", scope: "unit", roles: {} };
 
 function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valveCommands }) {
   const [composites, setComposites]   = useState([]);
@@ -1902,6 +1903,8 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
   // in scope). Column names are stored as free strings, so this only seeds the
   // dropdown — actual resolution always uses whichever import the target project has.
   const [ioColumns, setIoColumns] = useState([]);
+  const [otherCompositeMembers, setOtherCompositeMembers] = useState([]);
+
   useEffect(() => {
     (async () => {
       try {
@@ -1913,6 +1916,34 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
       } catch { setIoColumns([]); }
     })();
   }, []);
+
+  // Load members from other composites for role assignment dropdowns
+  useEffect(() => {
+    const loadOtherMembers = async () => {
+      const members = [];
+      for (const comp of composites) {
+        if (comp.id === selectedId) continue; // Skip current composite
+        try {
+          const detail = await getCompositeCmType(comp.id);
+          for (const member of (detail.members || [])) {
+            if (member.cm_type_name) {
+              members.push({
+                label: `${comp.name} — ${member.cm_type_name}`,
+                value: `${comp.id}::${member.cm_type_name}`,
+                compositeName: comp.name,
+                compositeId: comp.id,
+                memberType: member.cm_type_name,
+              });
+            }
+          }
+        } catch (e) {
+          // Silently skip composites we can't load
+        }
+      }
+      setOtherCompositeMembers(members);
+    };
+    loadOtherMembers();
+  }, [composites, selectedId]);
 
   useEffect(() => { load(); }, []);
 
@@ -1973,6 +2004,19 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
     });
     if (Object.keys(updates).length) setValidVarsCache(prev => ({ ...prev, ...updates }));
   }
+
+  // Roles live on the CM type, not on the composite member — but `roles` is only
+  // attached to a profile once ensureLoaded() has fetched its detail. The list
+  // from listCmTypes() has no roles, so an EM/EPH member renders "no roles" until
+  // its type is loaded. ensureValidVars() can't be relied on for this: it
+  // early-returns whenever validVarsCache is already warm.
+  useEffect(() => {
+    const pending = (editing?.members || [])
+      .map(m => m.cm_type_name)
+      .filter(n => n && !cmtProfiles.find(p => p.cmType === n)?.roles);
+    if (!pending.length) return;
+    Promise.all([...new Set(pending)].map(n => ensureLoaded?.(n).catch(() => null)));
+  }, [editing?.members, cmtProfiles, ensureLoaded]);
 
   async function loadIoRulesForMembers(members) {
     const missing = members.filter(m => m.cm_type_name && !ioRulesCache[m.cm_type_name]);
@@ -2406,6 +2450,114 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                       })}
                     </div>
                   )}
+
+                  {/* Role assignment for EM/EPH members */}
+                  {editing.members.length > 0 && editing.members.map((m, idx) => {
+                    const cmProfile = cmtProfiles.find(p => p.cmType === m.cm_type_name);
+                    const libType = cmProfile?.libType || '';
+                    const isEMorEPH = libType === 'EquipmentModule' || libType === 'EquipmentPhase';
+                    if (!isEMorEPH || !cmProfile) return null;
+
+                    const roles = cmProfile.roles;
+                    const roleKindMap = cmProfile.roleKindMap || {};
+                    const memberRoles = m.roles || {};
+                    const availableMembers = otherCompositeMembers;
+
+                    return (
+                      <div key={`roles-${idx}`} style={{ marginTop: "1.5rem", padding: "12px",
+                          background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)",
+                          border: "0.5px solid var(--color-border-tertiary)" }}>
+                        <div style={{ marginBottom: 10 }}>
+                          <div style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em",
+                              color: "var(--color-text-secondary)" }}>
+                            Roles: {m.cm_type_name}
+                            <span style={{ marginLeft: 6, fontSize: 9, padding: "1px 5px", borderRadius: 6,
+                                background: "#E6F1FB", color: "#0C447C", fontFamily: "var(--font-mono)" }}>
+                              {libType === "EquipmentPhase" ? "EPH" : "EM"}
+                            </span>
+                          </div>
+                          <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 2 }}>
+                            Assign roles to members
+                          </div>
+                        </div>
+
+                        {roles == null ? (
+                          <div style={{ fontSize: 12, color: "var(--color-text-secondary)", fontStyle: "italic", padding: "8px" }}>
+                            Loading roles…
+                          </div>
+                        ) : roles.length === 0 ? (
+                          <div style={{ fontSize: 12, color: "var(--color-text-secondary)", fontStyle: "italic", padding: "8px" }}>
+                            No roles defined in library for this type.
+                          </div>
+                        ) : (
+                          <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-md)",
+                              overflow: "hidden" }}>
+                            {roles.map((role, roleIdx) => {
+                              const roleKind = roleKindMap[role] || "cm";
+                              const assignment = memberRoles[role] || { alias: "", member: "" };
+                              return (
+                                <div key={role} style={{ display: "grid", gridTemplateColumns: "120px 1fr 1fr",
+                                    gap: 8, padding: "10px 12px", alignItems: "center",
+                                    borderBottom: roleIdx < roles.length - 1
+                                      ? "0.5px solid var(--color-border-tertiary)" : "none",
+                                    background: roleIdx % 2 === 0 ? "var(--color-background-primary)" : "var(--color-background-secondary)" }}>
+
+                                  {/* Role label with badge */}
+                                  <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                                    <span style={{ fontFamily: "var(--font-mono)", fontWeight: 500, fontSize: 12, color: "var(--color-text-primary)" }}>
+                                      {role}
+                                    </span>
+                                    <span style={{ fontSize: 9, padding: "0 4px", borderRadius: 5,
+                                        background: roleKind === "em" ? "#E6F1FB" : "var(--color-background-secondary)",
+                                        color: roleKind === "em" ? "#0C447C" : "var(--color-text-secondary)" }}>
+                                      {roleKind === "em" ? "EM" : "CM"}
+                                    </span>
+                                  </div>
+
+                                  {/* Alias input */}
+                                  <input value={assignment.alias || ""}
+                                    onChange={e => {
+                                      setEditing(prev => ({
+                                        ...prev,
+                                        members: prev.members.map((mem, i) => i === idx
+                                          ? { ...mem, roles: { ...memberRoles, [role]: { ...assignment, alias: e.target.value } } }
+                                          : mem),
+                                      }));
+                                    }}
+                                    placeholder="e.g. equipment_phase_a"
+                                    style={{ padding: "5px 8px", border: "0.5px solid var(--color-border-secondary)",
+                                      borderRadius: "var(--border-radius-md)", fontSize: 11, boxSizing: "border-box",
+                                      background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
+
+                                  {/* Member dropdown — shows members from other composites */}
+                                  <select value={assignment.member || ""}
+                                    onChange={e => {
+                                      setEditing(prev => ({
+                                        ...prev,
+                                        members: prev.members.map((mem, i) => i === idx
+                                          ? { ...mem, roles: { ...memberRoles, [role]: { ...assignment, member: e.target.value } } }
+                                          : mem),
+                                      }));
+                                    }}
+                                    title={availableMembers.length === 0 ? "Loading members from other composites..." : "Select a member from another composite"}
+                                    style={{ padding: "5px 8px", border: "0.5px solid var(--color-border-secondary)",
+                                      borderRadius: "var(--border-radius-md)", fontSize: 11, boxSizing: "border-box",
+                                      background: "var(--color-background-primary)", color: "var(--color-text-primary)", cursor: "pointer" }}>
+                                    <option value="">— select member —</option>
+                                    {availableMembers.map((opt, optIdx) => (
+                                      <option key={optIdx} value={opt.value}>
+                                        {opt.label}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
 
                 {/* Matrix toggle — shown after members are defined */}
@@ -3344,9 +3496,12 @@ function StepHierarchy({ hierarchy, setHierarchy, instances, setInstances, saved
   }
 
   const roots = hierarchy.filter(f => f.parentId == null);
+  const units = hierarchy.filter(f => f.s88Type === 'Unit').sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
 
   return (
-    <div>
+    <div style={{ display: "flex", gap: "1.5rem", height: "100%", minHeight: 0 }}>
+      {/* Left side: hierarchy editor (50%) */}
+      <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
         <div style={{ marginBottom: "1rem" }}>
           <div style={{ fontSize: '1rem', fontWeight: 600, marginBottom: 4 }}>
             Plant hierarchy {savedProjectName && <span style={{ color: "var(--color-text-secondary)", fontWeight: 400 }}>· {savedProjectName}</span>}
@@ -3364,7 +3519,7 @@ function StepHierarchy({ hierarchy, setHierarchy, instances, setInstances, saved
           </div>
         ) : (
           <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)",
-              padding: "0.5rem 0.75rem", marginBottom: "1rem" }}>
+              padding: "0.5rem 0.75rem", marginBottom: "1rem", flex: 1, overflow: "auto" }}>
             {roots.map(r => (
               <FolderRow key={r.id} folder={r} all={hierarchy} depth={0}
                 onAdd={addFolder} onUpdate={updateFolder} onDelete={deleteFolder} />
@@ -3375,16 +3530,63 @@ function StepHierarchy({ hierarchy, setHierarchy, instances, setInstances, saved
         <div style={{ display: "flex", justifyContent: "flex-start" }}>
           <Btn onClick={() => addFolder(null)}><i className="ti ti-plus" /> Add root folder</Btn>
         </div>
+      </div>
+
+      {/* Right side: Units summary (50%) */}
+      <div style={{ flex: 1, minWidth: 0, borderLeft: "0.5px solid var(--color-border-tertiary)", paddingLeft: "1.5rem", display: "flex", flexDirection: "column" }}>
+        <div style={{ fontSize: '0.9rem', fontWeight: 600, marginBottom: "0.75rem" }}>
+          Equipments (Units)
+        </div>
+        {units.length === 0 ? (
+          <div style={{ fontSize: 12, color: "var(--color-text-secondary)", fontStyle: "italic" }}>
+            No units defined yet
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem", flex: 1, overflow: "auto" }}>
+            {units.map(u => (
+              <div key={u.id} style={{
+                padding: "10px",
+                background: "var(--color-background-secondary)",
+                borderRadius: "6px",
+                border: "0.5px solid var(--color-border-secondary)",
+                color: "var(--color-text-primary)"
+              }}>
+                <div style={{ fontSize: 13, fontWeight: 600, marginBottom: "6px" }}>
+                  {u.name}
+                </div>
+                <input value={u.description || ""} onChange={e => updateFolder(u.id, "description", e.target.value)}
+                  placeholder="Description"
+                  style={{ width: "100%", padding: "4px 6px", border: "0.5px solid var(--color-border-secondary)",
+                    borderRadius: "4px", fontSize: 11, fontFamily: "var(--font-sans)",
+                    background: "var(--color-background-primary)", color: "var(--color-text-primary)", boxSizing: "border-box" }} />
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
 
 function FolderRow({ folder, all, depth, onAdd, onUpdate, onDelete }) {
+  const [expanded, setExpanded] = useState(true);
   const children = all.filter(f => f.parentId === folder.id);
+  const isUnit = folder.s88Type === 'Unit';
+  const hasChildren = children.length > 0;
+
   return (
     <div>
         <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "4px 0",
             paddingLeft: depth * 18 }}>
+          {hasChildren ? (
+            <button onClick={() => setExpanded(!expanded)} title="Toggle folder"
+              style={{ background: "transparent", border: "none", cursor: "pointer",
+                color: "var(--color-text-secondary)", fontSize: 12, padding: 0, width: 14, height: 14, display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <i className={`ti ti-${expanded ? 'chevron-down' : 'chevron-right'}`} />
+            </button>
+          ) : (
+            <div style={{ width: 14 }} />
+          )}
           <i className="ti ti-folder" style={{ fontSize: 14, color: "var(--color-text-secondary)" }} />
           <input value={folder.name} onChange={e => onUpdate(folder.id, "name", e.target.value)}
             placeholder="folder name"
@@ -3408,7 +3610,7 @@ function FolderRow({ folder, all, depth, onAdd, onUpdate, onDelete }) {
             <i className="ti ti-trash" />
           </button>
         </div>
-        {children.map(c => (
+        {expanded && children.map(c => (
           <FolderRow key={c.id} folder={c} all={all} depth={depth + 1}
             onAdd={onAdd} onUpdate={onUpdate} onDelete={onDelete} />
         ))}
@@ -3698,7 +3900,7 @@ function RolePanel({ inst, profile, instances, cmtProfiles, updateInstanceRole }
 
 // ── Instance sub-tab (list + optional role panel) ─────────────────────────────
 function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, folderOptions, hasHierarchy,
-    addInstance, removeInstance, updateInstance, updateInstanceRole, ensureLoaded, savedProjectId, saveProjectNow, setError = () => {}, getCompositeCmType, extractMemberConnections, setInstances, compositeCmTypes, valveCommands }) {
+    addInstance, removeInstance, updateInstance, updateInstanceRole, ensureLoaded, savedProjectId, saveProjectNow, setError = () => {}, getCompositeCmType, extractMemberConnections, setInstances, compositeCmTypes, valveCommands, loadProjectIntoState }) {
   const [selectedId, setSelectedId] = useState(null);
   const [mapInst, setMapInst] = useState(null);   // instance whose signal-mapping modal is open
   const [connResult, setConnResult] = useState(null); // last "Generate Connections" outcome
@@ -3823,6 +4025,8 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
                 const r = await generateConnections(savedProjectId);
                 setConnResult({ ok: true, ...r });
                 await loadConnStatus();
+                // Reload instances to reflect any auto-assigned roles from connection generation
+                if (savedProjectId && loadProjectIntoState) await loadProjectIntoState(savedProjectId);
               } catch (e) {
                 setConnResult({ ok: false, message: e.message });
               }
@@ -3871,7 +4075,7 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
 function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName, savedProjectId,
     hierarchy, compositeCmTypes, addInstance, removeInstance, updateInstance,
     updateInstanceRole, addCompositeInstances, ensureLoaded, loading, generating, saveProjectNow, onGenerate, setError,
-    getCompositeCmType, extractMemberConnections, valveCommands, setInstances }) {
+    getCompositeCmType, extractMemberConnections, valveCommands, setInstances, loadProjectIntoState }) {
   const noUserProjects = !userProjects?.length;
   const folderOptions  = allFolderOptions(hierarchy || []);
   const hasHierarchy   = (hierarchy?.length || 0) > 0;
@@ -3890,7 +4094,7 @@ function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName,
 
   const commonTabProps = { instances, cmtProfiles, userProjects, folderOptions, hasHierarchy,
     addInstance, removeInstance, updateInstance, updateInstanceRole, ensureLoaded, savedProjectId,
-    saveProjectNow, setError, getCompositeCmType, extractMemberConnections, setInstances, compositeCmTypes, valveCommands };
+    saveProjectNow, setError, getCompositeCmType, extractMemberConnections, setInstances, compositeCmTypes, valveCommands, loadProjectIntoState };
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>

@@ -10,6 +10,7 @@ const express = require('express');
 const { getDb } = require('../db');
 const { reconcileConnections } = require('../connections');
 const { resolveDerivedValues } = require('../derivedValues');
+const { autoAssignRoles } = require('../services/autoRoleAssignment');
 
 const router = express.Router();
 function err(res, code, msg) { return res.status(code).json({ error: msg }); }
@@ -26,6 +27,8 @@ router.post('/project/:projectId/generate', async (req, res) => {
 
     const result = await reconcileConnections(db, projectId);
     const derived = await resolveDerivedValues(db, projectId);
+    // Auto-assign roles for composite instances after connection generation succeeds
+    await autoAssignRoles(db, projectId);
     res.json({ ...result, derivedValues: derived });
   } catch (e) { err(res, 500, e.message); }
 });

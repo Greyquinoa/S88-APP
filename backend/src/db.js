@@ -354,6 +354,9 @@ async function ensureSchema() {
   await addColumnIfMissing('project_hierarchy_folders', 'source_unit_instance_id', 'source_unit_instance_id INTEGER');
   await rawRun('CREATE INDEX IF NOT EXISTS idx_phf_srcui ON project_hierarchy_folders(source_unit_instance_id)');
 
+  // Migrations: add description to project_hierarchy_folders
+  await addColumnIfMissing('project_hierarchy_folders', 'description', 'description TEXT');
+
   // Migrations: add user_project + parent_path to unit_instances
   await addColumnIfMissing('unit_instances', 'user_project', 'user_project TEXT');
   await addColumnIfMissing('unit_instances', 'parent_path', 'parent_path TEXT');
@@ -363,6 +366,9 @@ async function ensureSchema() {
 
   // Migration: add instantiation scope to composite_cm_members.
   await addColumnIfMissing('composite_cm_members', 'scope', `scope TEXT NOT NULL DEFAULT 'unit'`);
+
+  // Migration: add role assignments to composite_cm_members (for EM/EPH types)
+  await addColumnIfMissing('composite_cm_members', 'roles', 'roles JSONB');
 
   // Migration: extend unit_type_member_roles to address composite sub-members.
   await addColumnIfMissing('unit_type_member_roles', 'source_member_idx', 'source_member_idx INTEGER NOT NULL DEFAULT 0');

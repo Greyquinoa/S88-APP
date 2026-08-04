@@ -207,7 +207,7 @@ export default function UnitConnectionsEditor({
   return (
     <div style={{ padding: '0.75rem' }}>
       <h3 style={{ marginTop: 0, marginBottom: '1rem', fontSize: '14px', fontWeight: 'bold' }}>
-        Wiring: {unitType.name}
+        Unit Level Connections: {unitType.name}
       </h3>
 
       {error && (
