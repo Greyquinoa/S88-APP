@@ -22,9 +22,15 @@
  *
  * Dry-run by default. Pass --apply to write.
  *
+ * By default, unit types that exist only on the remote are DELETED so the
+ * remote ends up matching local exactly. Pass --keep-remote-only to preserve
+ * them instead — necessary when a remote-only unit type is referenced by a
+ * unit_instances row (a project built directly in production).
+ *
  * Usage:
  *   node sync-unit-library.js "postgresql://user:pass@host/db?sslmode=require"
  *   node sync-unit-library.js "postgresql://..." --apply
+ *   node sync-unit-library.js "postgresql://..." --apply --keep-remote-only
  */
 
 const path = require('path');
@@ -59,6 +65,7 @@ async function columnsOf(pool, table) {
 async function main() {
   const connStr = process.argv[2];
   const apply = process.argv.includes('--apply');
+  const keepRemoteOnly = process.argv.includes('--keep-remote-only');
 
   if (!connStr || connStr.startsWith('--')) {
     console.error('Usage: node sync-unit-library.js "<remote-connection-string>" [--apply]');
@@ -128,6 +135,29 @@ async function main() {
     console.log(`  ${ut.name} (${members.length} members): ${members.map(m => m.alias).join(', ')}`);
   }
 
+  // Unit types present remotely but not locally. Deleting one that a
+  // unit_instances row points at violates a foreign key, so surface them.
+  const localUtIds = new Set(data['unit_types'].rows.map(u => u.id));
+  const remoteOnly = (await remote.query(`
+    SELECT ut.id, ut.name,
+           (SELECT COUNT(*)::int FROM unit_instances ui WHERE ui.unit_type_id = ut.id) AS instances
+    FROM unit_types ut ORDER BY ut.id
+  `)).rows.filter(u => !localUtIds.has(u.id));
+
+  if (remoteOnly.length) {
+    console.log(`\nUnit types on remote but not local (${keepRemoteOnly ? 'PRESERVING' : 'WILL BE DELETED'}):`);
+    for (const u of remoteOnly) {
+      const used = u.instances > 0 ? `  <-- used by ${u.instances} unit instance(s)` : '';
+      console.log(`  [${u.id}] ${u.name}${used}`);
+    }
+    if (!keepRemoteOnly && remoteOnly.some(u => u.instances > 0)) {
+      console.log('\n  These are referenced by unit_instances and cannot be deleted.');
+      console.log('  Re-run with --keep-remote-only to preserve them.');
+    }
+  }
+
+  const preserveIds = keepRemoteOnly ? remoteOnly.map(u => u.id) : [];
+
   if (!apply) {
     console.log('\nDry run complete. Re-run with --apply to write.\n');
     await local.end(); await remote.end();
@@ -138,10 +168,27 @@ async function main() {
   try {
     await client.query('BEGIN');
 
-    // Delete children first.
+    // Rows belonging to preserved (remote-only) unit types must survive both
+    // the delete and the re-insert. Everything else is replaced from local.
+    const keepList = preserveIds.length ? `(${preserveIds.join(',')})` : '(-1)';
+    const WHERE_KEEP = {
+      unit_type_members:            `unit_type_id NOT IN ${keepList}`,
+      unit_type_member_connections: `unit_type_id NOT IN ${keepList}`,
+      unit_type_member_roles:
+        `member_id NOT IN (SELECT id FROM unit_type_members WHERE unit_type_id IN ${keepList})`,
+    };
+
+    // unit_types and composite_cm_types are referenced by rows we must not touch
+    // (unit_instances, project_instances). Upsert them by id instead of
+    // delete-and-reinsert, so the FK targets survive.
+    const UPSERT_IN_PLACE = new Set(['unit_types', 'composite_cm_types']);
+
+    // Delete children first, skipping the upsert-in-place parents.
     for (const t of [...TABLES].reverse()) {
-      const r = await client.query(`DELETE FROM ${t}`);
-      console.log(`  cleared ${t} (${r.rowCount} rows)`);
+      if (UPSERT_IN_PLACE.has(t)) continue;
+      const where = WHERE_KEEP[t] ? ` WHERE ${WHERE_KEEP[t]}` : '';
+      const r = await client.query(`DELETE FROM ${t}${where}`);
+      console.log(`  cleared ${t} (${r.rowCount} rows)${where ? ' [preserved remote-only]' : ''}`);
     }
 
     // Insert parents first.
@@ -149,11 +196,18 @@ async function main() {
       const { cols, rows } = data[t];
       if (!rows.length) continue;
       const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
-      const sql = `INSERT INTO ${t} (${cols.join(', ')}) VALUES (${placeholders})`;
+
+      // Upsert-in-place parents: update the existing row rather than replacing it.
+      const conflict = UPSERT_IN_PLACE.has(t)
+        ? ` ON CONFLICT (id) DO UPDATE SET ${cols.filter(c => c !== 'id')
+            .map(c => `${c} = EXCLUDED.${c}`).join(', ')}`
+        : '';
+
+      const sql = `INSERT INTO ${t} (${cols.join(', ')}) VALUES (${placeholders})${conflict}`;
       for (const row of rows) {
         await client.query(sql, cols.map(c => row[c]));
       }
-      console.log(`  inserted ${rows.length} rows into ${t}`);
+      console.log(`  ${conflict ? 'upserted' : 'inserted'} ${rows.length} rows into ${t}`);
     }
 
     // Bump SERIAL sequences past the copied ids so future inserts don't collide.
