@@ -1318,7 +1318,7 @@ async function ensureSchema() {
 
   await addColumnIfMissing('instance_ios', 'signal_type', 'signal_type TEXT');
   await addColumnIfMissing('instance_ios', 'required', 'required BOOLEAN NOT NULL DEFAULT TRUE');
-  await addColumnIfMissing('instance_ios', 'cascade_status', `cascade_status TEXT CHECK(cascade_status IN ('cascaded_from_parent'))')`);
+  await addColumnIfMissing('instance_ios', 'cascade_status', `cascade_status TEXT CHECK(cascade_status IN ('cascaded_from_parent'))`);
 
   // Migration: add source column to project_instances.
   await addColumnIfMissing('project_instances', 'source', `source TEXT NOT NULL DEFAULT 'manual'`);
