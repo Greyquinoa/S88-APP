@@ -140,28 +140,30 @@ export default function SignalMappingModal({ projectId, instance, profile, compo
   const activeBlocks = useMemo(() => {
     const blocks = profile?.subBlocks || [];
 
-    // Build child→parents reverse map from IO connections
+    // Build child→parents reverse map from this instance's IO rules. Instance-level
+    // rules use the target_block/target_pin shape (hierarchyBuilder), not the
+    // composite-level block_name/to_var_name shape.
     const childToParents = {};
     if (instance.connections && Array.isArray(instance.connections)) {
       for (const conn of instance.connections) {
-        if (conn.conn_type === 'io_connection' && conn.childBlocks && Array.isArray(conn.childBlocks)) {
-          for (const child of conn.childBlocks) {
-            childToParents[child] ??= [];
-            childToParents[child].push(conn.block_name);
-          }
+        if (!conn.target_block || !Array.isArray(conn.childBlocks)) continue;
+        for (const child of conn.childBlocks) {
+          (childToParents[child] ??= []).push(conn.target_block);
         }
       }
     }
 
-    // Compute omitted blocks: those with required unmatched signals OR cascaded from parent
-    const omittedBlocks = new Set();
-    for (const [key, io] of Object.entries(connIoByKey)) {
-      if (io.cascade_status !== null && io.cascade_status !== undefined) {
-        omittedBlocks.add(io.block_name);
-      } else if (io.status === 'dummy' && io.required) {
-        omittedBlocks.add(io.block_name);
-      }
+    // A driver block is omitted under the same rule the exporter applies: some pin
+    // is a required unmatched dummy AND no pin is real. One real pin keeps it.
+    const realBlocks = new Set();
+    const unmatchedBlocks = new Set();
+    for (const io of Object.values(connIoByKey)) {
+      if (io.status === 'real') realBlocks.add(io.block_name);
+      else if (io.required) unmatchedBlocks.add(io.block_name);
     }
+    const omittedBlocks = new Set(
+      [...unmatchedBlocks].filter(b => !realBlocks.has(b))
+    );
 
     return blocks
       .filter(b => !b.optional || enabledBlocks.includes(b.name))

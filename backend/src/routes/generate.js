@@ -122,6 +122,64 @@ async function runGeneration(db, body, onProgress) {
       }
     }
 
+    // Cascade child blocks: an IO rule may name childBlocks that live or die with
+    // their driver block. The driver's verdict is the same "no block if
+    // required+unmatched, unless some pin is real" rule the emitter applies, so it
+    // is computed here from the assembled signalMaps and handed to the generator as
+    // a per-instance omit set. Children carry no signalMap entry of their own.
+    const cascadeOmitByInstance = {};   // { instanceName: Set<blockName> }
+    if (projectName) {
+      const proj = await db.prepare(`SELECT id FROM projects WHERE name = ?`).get(projectName);
+      if (proj) {
+        const ruleRows = await db.prepare(
+          `SELECT instance_name, connections FROM project_instances WHERE project_id = ?`
+        ).all(proj.id);
+        for (const row of ruleRows) {
+          let conns = [];
+          try { conns = JSON.parse(row.connections || '[]'); } catch { conns = []; }
+          if (!Array.isArray(conns) || !conns.length) continue;
+          const instName = row.instance_name;
+          const pins = signalMaps[instName] || {};
+
+          // parent -> [children], from every rule that declares childBlocks
+          const childMap = {};
+          for (const c of conns) {
+            if (!c.target_block || !Array.isArray(c.childBlocks) || !c.childBlocks.length) continue;
+            (childMap[c.target_block] ||= []).push(...c.childBlocks);
+          }
+          if (!Object.keys(childMap).length) continue;
+
+          // Which drivers are omitted? Mirror xmlGenerator's per-block rule.
+          const omitted = new Set();
+          for (const parent of Object.keys(childMap)) {
+            let hasReal = false, hasRequiredUnmatched = false;
+            for (const [key, s] of Object.entries(pins)) {
+              if (key.slice(0, key.indexOf('.')) !== parent) continue;
+              if (!s.dummy) hasReal = true;
+              else if (s.required ?? 1) hasRequiredUnmatched = true;
+            }
+            if (hasRequiredUnmatched && !hasReal) omitted.add(parent);
+          }
+
+          // Fixed point: a cascaded child can itself be a driver.
+          const cascade = new Set(omitted);
+          let changed = true;
+          while (changed) {
+            changed = false;
+            for (const [parent, children] of Object.entries(childMap)) {
+              if (!cascade.has(parent)) continue;
+              for (const child of children) {
+                if (!cascade.has(child)) { cascade.add(child); changed = true; }
+              }
+            }
+          }
+          // Drivers stay under their own rule; only children are omitted here.
+          for (const parent of Object.keys(childMap)) cascade.delete(parent);
+          if (cascade.size) cascadeOmitByInstance[instName] = cascade;
+        }
+      }
+    }
+
     if (excludedDummies.length) {
       const dummySet = new Set(excludedDummies);
       instances = instances.filter(i => !dummySet.has(i.instanceName));
@@ -271,6 +329,7 @@ async function runGeneration(db, body, onProgress) {
         libType:        cm.cm_type,
         instanceName:   inst.instanceName,
         enabledBlocks:  inst.enabledBlocks || [],
+        cascadeOmitBlocks: cascadeOmitByInstance[inst.instanceName] || null,
         samplingTime:   inst.samplingTime  || cm.sampling_time || '1000',
         roleAssignments: inst.roleAssignments || {},
       };

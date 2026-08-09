@@ -249,8 +249,16 @@ function emitInstanceLines(inst, counters, preAllocatedId, instanceIdMap, fx, wi
   const { cmTypeDef, instanceName, enabledBlocks, samplingTime, libType, roleAssignments } = inst;
   if (!cmTypeDef) return lines;
 
+  // Cascade children: blocks listed as childBlocks of an IO rule whose driver block
+  // was omitted (required signal unmatched). They carry no signalMap entry of their
+  // own, so the per-block omission rule below can never see them — they have to be
+  // dropped here, before IDs are allocated.
+  const cascadeOmit = inst.cascadeOmitBlocks instanceof Set
+    ? inst.cascadeOmitBlocks
+    : new Set(inst.cascadeOmitBlocks || []);
+
   const activeBlocks = cmTypeDef.subBlocks.filter(blk =>
-    !blk.optional || enabledBlocks.includes(blk.name)
+    (!blk.optional || enabledBlocks.includes(blk.name)) && !cascadeOmit.has(blk.name)
   );
 
   // preAllocatedVarIds: { varName -> varId } — use pre-allocated IDs when available
