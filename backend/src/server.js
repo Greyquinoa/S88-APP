@@ -24,6 +24,8 @@ const ioConnectionRoutes   = require('./routes/ioConnections');
 const connectionRoutes     = require('./routes/connections');
 const moduleParametersRoutes = require('./routes/moduleParameters');
 const workflowRoutes       = require('./routes/workflow');
+const instanceConflictRoutes = require('./routes/instanceConflicts');
+const reconciliationRoutes = require('./routes/reconciliation');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -59,6 +61,8 @@ app.use('/api/io-connections',   ioConnectionRoutes);
 app.use('/api/connections',      connectionRoutes);
 app.use('/api/module-parameters', moduleParametersRoutes);
 app.use('/api/workflow',         workflowRoutes);
+app.use('/api/instance-conflicts', instanceConflictRoutes);
+app.use('/api/reconciliation',   reconciliationRoutes);
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 

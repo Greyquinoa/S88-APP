@@ -141,14 +141,16 @@ if (typeof document !== 'undefined') {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // Instance/Hierarchy Fields
-const INSTANCE_INTERNAL_FIELDS = ['instrument_tag', 'function_val', 'hierarchy', 'assignment'];
+const INSTANCE_INTERNAL_FIELDS = ['tag_name', 'instrument_tag', 'function_val', 'hierarchy', 'assignment'];
 const INSTANCE_FIELD_LABELS = {
+  tag_name: 'SIGNAL TAG',
   instrument_tag: 'INSTRUMENT TAG *',
   function_val: 'FUNCTION *',
   hierarchy: 'HIERARCHY *',
   assignment: 'AS ASSIGNMENT',
 };
 const INSTANCE_FIELD_DESCRIPTIONS = {
+  tag_name: 'Full signal tag (e.g., XV001_GSH) — must be unique; duplicates are flagged',
   instrument_tag: 'CM identity — groups IO rows into one instance',
   function_val: 'Maps to CM type for instance creation',
   hierarchy: 'Full path (e.g., Area/Cell/Unit) — determines folder structure',
@@ -268,7 +270,12 @@ function Tag({ text, color }) {
 
 function suggestColumnMapping(columnName) {
   const ALIASES = {
-    instrument_tag: ['instrument', 'instrumenttag', 'instrument_tag', 'cm_tag', 'cmtag', 'device', 'device_tag', 'tag_id', 'kks', 'tag', 'tagname'],
+    // 'tag'/'tagname' belong to tag_name (the full signal tag, e.g. XV001_GSH).
+    // The CM identity column is usually named "Tag CM" / "Instrument", which
+    // scores higher against instrument_tag's own aliases.
+    // No bare 'signal' alias — it fuzzy-matches "Signal_Type" and would hijack the column.
+    tag_name: ['tag', 'tagname', 'tag_name', 'signaltag', 'signal_tag', 'iotag', 'io_tag'],
+    instrument_tag: ['instrument', 'instrumenttag', 'instrument_tag', 'tagcm', 'tag_cm', 'cm_tag', 'cmtag', 'device', 'device_tag', 'tag_id', 'kks'],
     function_val: ['function', 'func', 'type', 'instrument_type', 'iotype', 'category'],
     hierarchy: ['hierarchy', 'path', 'location', 'hierarchy_path', 'plant_path', 'structure', 'plant_structure', 'plant_hierarchy'],
     assignment: ['assignment', 'as', 'as_assignment', 'controller', 'plc', 'cpu', 'station', 'as01', 'as_station'],

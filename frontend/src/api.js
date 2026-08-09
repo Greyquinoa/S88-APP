@@ -760,3 +760,52 @@ export async function runEphEmAssignment(importId, type_column_mappings) {
 export async function promoteEphEmImport(importId, projectId) {
   return request('POST', `/eph-em/imports/${importId}/promote`, { projectId });
 }
+
+export async function detectInstanceConflicts(projectId, instances) {
+  return request('POST', '/instance-conflicts/detect', { projectId, instances });
+}
+
+export async function resolveInstanceConflicts(projectId, instances, resolutions) {
+  return request('POST', '/instance-conflicts/resolve', { projectId, instances, resolutions });
+}
+
+export async function detectUnitInstanceConflicts(projectId) {
+  return request('POST', '/instance-conflicts/unit-instances/detect', { projectId });
+}
+
+export async function expandUnitInstancesWithResolution(projectId, plannedInstances, resolutions) {
+  return request('POST', '/instance-conflicts/unit-instances/expand', { projectId, plannedInstances, resolutions });
+}
+
+// ── Reconciliation ────────────────────────────────────────────────────────────
+export async function runReconciliation(projectId) {
+  return request('POST', `/reconciliation/project/${projectId}/run`);
+}
+
+export async function getReconciliationSummary(projectId) {
+  return request('GET', `/reconciliation/project/${projectId}/summary`);
+}
+
+export async function getReconciliationInstances(projectId, { status, search } = {}) {
+  const qs = new URLSearchParams();
+  if (status) qs.set('status', status);
+  if (search) qs.set('search', search);
+  const suffix = qs.toString() ? `?${qs}` : '';
+  return request('GET', `/reconciliation/project/${projectId}/instances${suffix}`);
+}
+
+export async function acceptDummyInstance(instanceId, acceptedBy) {
+  return request('PATCH', `/reconciliation/instances/${instanceId}/accept`, { acceptedBy });
+}
+
+export async function revertDummyInstance(instanceId) {
+  return request('PATCH', `/reconciliation/instances/${instanceId}/revert`);
+}
+
+export async function bulkAcceptDummyInstances(instanceIds, acceptedBy) {
+  return request('PATCH', '/reconciliation/instances/bulk-accept', { instanceIds, acceptedBy });
+}
+
+export async function bulkRevertDummyInstances(instanceIds) {
+  return request('PATCH', '/reconciliation/instances/bulk-revert', { instanceIds });
+}

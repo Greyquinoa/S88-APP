@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { BookMarked, FileText, FolderTree, Cpu, Boxes, BookOpenCheck, Home, ArrowDownToLine } from 'lucide-react';
 
+// ids index into App.jsx's STEPS array — keep the two in sync.
 const STEPS_CONFIG = [
   { id: 0, label: 'Projects', icon: null, component: Home },
   { id: 1, label: 'IO Import', icon: null, component: FileText },

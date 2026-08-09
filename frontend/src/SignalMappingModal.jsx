@@ -135,17 +135,50 @@ export default function SignalMappingModal({ projectId, instance, profile, compo
 
   // Active blocks = non-optional, or optional-and-enabled (matches export filter).
   // Filter variables to only show those marked valid in the library.
+  // Additionally, hide cascaded child blocks when their parent blocks are all omitted.
   const enabledBlocks = profile?.enabledBlocks || [];
   const activeBlocks = useMemo(() => {
     const blocks = profile?.subBlocks || [];
+
+    // Build child→parents reverse map from IO connections
+    const childToParents = {};
+    if (instance.connections && Array.isArray(instance.connections)) {
+      for (const conn of instance.connections) {
+        if (conn.conn_type === 'io_connection' && conn.childBlocks && Array.isArray(conn.childBlocks)) {
+          for (const child of conn.childBlocks) {
+            childToParents[child] ??= [];
+            childToParents[child].push(conn.block_name);
+          }
+        }
+      }
+    }
+
+    // Compute omitted blocks: those with required unmatched signals OR cascaded from parent
+    const omittedBlocks = new Set();
+    for (const [key, io] of Object.entries(connIoByKey)) {
+      if (io.cascade_status !== null && io.cascade_status !== undefined) {
+        omittedBlocks.add(io.block_name);
+      } else if (io.status === 'dummy' && io.required) {
+        omittedBlocks.add(io.block_name);
+      }
+    }
+
     return blocks
       .filter(b => !b.optional || enabledBlocks.includes(b.name))
+      .filter(b => {
+        // Hide cascaded child blocks: if this block is a child AND all its parents are omitted, hide it
+        const parents = childToParents[b.name] || [];
+        if (parents.length > 0 && parents.every(p => omittedBlocks.has(p))) {
+          return false;  // hide cascaded child
+        }
+        return true;
+      })
       .map(blk => ({
         ...blk,
         vars: (blk.vars || []).filter(v => v.isValid),  // Silent filter: only valid variables (backend returns camelCase)
       }))
       .filter(blk => blk.vars.length > 0);  // Hide blocks with no valid variables
-  }, [profile, enabledBlocks]);
+  }, [profile, enabledBlocks, instance.connections, connIoByKey]);
 
   // Load existing mappings and values on open.
   useEffect(() => {

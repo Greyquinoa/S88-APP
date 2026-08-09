@@ -3,6 +3,7 @@
 
 // Minimum internal fields needed to build instances and hierarchy.
 const INTERNAL_FIELDS = [
+  'tag_name',       // full signal tag — must be unique (used for duplicate detection)
   'instrument_tag', // CM identity — groups IO rows into one instance
   'function_val',   // drives library-type assignment
   'hierarchy',      // full path e.g. "Area/Cell/Unit/EM" — parsed positionally
@@ -28,7 +29,7 @@ async function applyMapping(db, importId, mappings) {
 
   const update = db.prepare(`
     UPDATE io_tags SET
-      instrument_tag=?, function_val=?, hierarchy=?, assignment=?,
+      tag_name=?, instrument_tag=?, function_val=?, hierarchy=?, assignment=?,
       updated_at=NOW()
     WHERE id=?
   `);
@@ -43,7 +44,7 @@ async function applyMapping(db, importId, mappings) {
         return v != null ? String(v).trim() || null : null;
       };
       await update.run(
-        get('instrument_tag'), get('function_val'), get('hierarchy'), get('assignment'),
+        get('tag_name'), get('instrument_tag'), get('function_val'), get('hierarchy'), get('assignment'),
         tag.id
       );
     }
@@ -59,7 +60,12 @@ async function applyMapping(db, importId, mappings) {
  */
 function suggestMappings(customerHeaders) {
   const ALIASES = {
-    instrument_tag: ['instrument', 'instrumenttag', 'instrument_tag', 'cm_tag', 'cmtag', 'device', 'device_tag', 'tag_id', 'kks', 'tag', 'tagname'],
+    // 'tag'/'tagname' belong to tag_name (the full signal tag, e.g. XV001_GSH).
+    // The CM identity column is usually named "Tag CM" / "Instrument", which
+    // scores higher against instrument_tag's own aliases.
+    // No bare 'signal' alias — it fuzzy-matches "Signal_Type" and would hijack the column.
+    tag_name:       ['tag', 'tagname', 'tag_name', 'signaltag', 'signal_tag', 'iotag', 'io_tag'],
+    instrument_tag: ['instrument', 'instrumenttag', 'instrument_tag', 'tagcm', 'tag_cm', 'cm_tag', 'cmtag', 'device', 'device_tag', 'tag_id', 'kks'],
     function_val:   ['function', 'func', 'type', 'instrument_type', 'iotype', 'category'],
     hierarchy:      ['hierarchy', 'path', 'location', 'hierarchy_path', 'plant_path', 'structure', 'plant_structure', 'plant_hierarchy'],
     assignment:     ['assignment', 'as', 'as_assignment', 'controller', 'plc', 'cpu', 'station', 'as01', 'as_station'],

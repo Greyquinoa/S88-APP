@@ -445,13 +445,11 @@ router.delete('/project/:projectId/unit-instances/:id', async (req, res) => {
   }
 });
 
-// ── POST /api/unit-types/project/:projectId/unit-instances/expand ─────────────
 // Idempotent: deletes and recreates all unit-sourced instances + folders.
-router.post('/project/:projectId/unit-instances/expand', async (req, res) => {
-  try {
-    const db        = getDb();
-    const projectId = parseInt(req.params.projectId, 10);
-
+// Extracted from the route handler below so the conflict-aware expand endpoint
+// (routes/instanceConflicts.js) runs this exact logic rather than a copy of it.
+async function expandUnitInstances(db, projectId) {
+  {
     // Load enabled_blocks profile per cm_type for this project (or default to all required)
     const profileRows = await db.prepare(
       'SELECT cm_type, enabled_blocks FROM project_cmt_profiles WHERE project_id = ?'
@@ -660,27 +658,43 @@ router.post('/project/:projectId/unit-instances/expand', async (req, res) => {
 
             const connections = await getIOConnectionsForMember(m.compositeCmId, cmIdx);
 
-            await db.prepare(`
-              INSERT INTO project_instances
-                (project_id, cm_type, instance_name, sampling_time, user_project,
-                 folder_id, role_assignments, sort_order, source_unit_instance_id,
-                 composite_group_id, composite_id, member_idx, connections)
-              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-            `).run(
-              projectId,
-              cm.cm_type_name,
-              instanceName,
-              '1000',
-              instanceUserProject,
-              subFolderId,
-              JSON.stringify(roleAssignments),
-              instSO++,
-              ui.id,
-              compositeGroupId,
-              m.compositeCmId,
-              cmIdx,
-              JSON.stringify(connections),
-            );
+            // Check if an instance with this name already exists (from IO import)
+            const existingInst = await db.prepare(
+              'SELECT id FROM project_instances WHERE project_id=? AND instance_name=?'
+            ).get(projectId, instanceName);
+
+            if (existingInst) {
+              // Update existing instance to mark as generated
+              await db.prepare(`
+                UPDATE project_instances
+                SET is_generated=true, last_reconciled_at=NOW()
+                WHERE id=?
+              `).run(existingInst.id);
+            } else {
+              // Create new instance marked as generated
+              await db.prepare(`
+                INSERT INTO project_instances
+                  (project_id, cm_type, instance_name, sampling_time, user_project,
+                   folder_id, role_assignments, sort_order, source_unit_instance_id,
+                   composite_group_id, composite_id, member_idx, connections, is_generated)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              `).run(
+                projectId,
+                cm.cm_type_name,
+                instanceName,
+                '1000',
+                instanceUserProject,
+                subFolderId,
+                JSON.stringify(roleAssignments),
+                instSO++,
+                ui.id,
+                compositeGroupId,
+                m.compositeCmId,
+                cmIdx,
+                JSON.stringify(connections),
+                true
+              );
+            }
             instanceCount++;
           }
         }
@@ -713,7 +727,17 @@ router.post('/project/:projectId/unit-instances/expand', async (req, res) => {
       }
     })();
 
-    res.json({ success: true, instanceCount, folderCount, folderIdMap });
+    return { instanceCount, folderCount, folderIdMap };
+  }
+}
+
+// ── POST /api/unit-types/project/:projectId/unit-instances/expand ─────────────
+router.post('/project/:projectId/unit-instances/expand', async (req, res) => {
+  try {
+    const db        = getDb();
+    const projectId = parseInt(req.params.projectId, 10);
+    const result    = await expandUnitInstances(db, projectId);
+    res.json({ success: true, ...result });
   } catch (err) {
     console.error('[UnitTypes] Expand error:', err.message);
     res.status(500).json({ error: err.message });
@@ -833,3 +857,7 @@ router.post('/import-pcs7', async (req, res) => {
 });
 
 module.exports = router;
+// Exported so the conflict-detection planner and the conflict-aware expand
+// endpoint reuse this file's logic instead of duplicating the query shapes.
+module.exports.loadUnitTypeDetail = loadUnitTypeDetail;
+module.exports.expandUnitInstances = expandUnitInstances;

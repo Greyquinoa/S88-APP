@@ -5,7 +5,7 @@ import {
   uploadEphEmList, listEphEmImports, getEphEmImport, deleteEphEmImport, getEphEmRows, patchEphEmRow, rejectEphEmRow,
   applyEphEmColumnMap, runEphEmAssignment, promoteEphEmImport,
   getEphEmTypeMappingConfigs, createEphEmTypeMappingConfig, updateEphEmTypeMappingConfig, deleteEphEmTypeMappingConfig,
-  listCompositeCmTypes,
+  listCompositeCmTypes, detectInstanceConflicts, resolveInstanceConflicts,
 } from './api.js';
 import { AllCommunityModule, ModuleRegistry, themeQuartz } from 'ag-grid-community';
 // Same primitives the IO import renders with, so both workflows stay in step.
@@ -15,6 +15,7 @@ import {
   panelSx, glassPanelSx, panelHeaderSx, glassPanelHeaderSx,
   inputSx, textInputSx, eyebrowLabelSx,
 } from './ImportUIKit.jsx';
+import InstanceConflictModal from './InstanceConflictModal.jsx';
 
 ModuleRegistry.registerModules([AllCommunityModule]);
 
@@ -260,6 +261,8 @@ export default function StepEphEmImport({ projectId, onComplete }) {
   const [assignmentSuccess, setAssignmentSuccess] = useState(false);
   const [storedImports, setStoredImports] = useState([]);
   const [importsLoading, setImportsLoading] = useState(false);
+  const [conflictData, setConflictData] = useState(null);
+  const [isResolvingConflicts, setIsResolvingConflicts] = useState(false);
   const gridRef = useRef(null);
 
   // Save form selections to localStorage. Each field is written authoritatively
@@ -1546,6 +1549,24 @@ export default function StepEphEmImport({ projectId, onComplete }) {
       if (!confirm('Create instances for all assigned rows?')) return;
       try {
         setPromoting(true);
+
+        // Get assigned rows that will be created as instances
+        const assignedRows = (transformedRows || []).filter(r => r.assignmentStatus === 'assigned');
+        const incomingInstances = assignedRows.map(r => ({
+          name: r.ephEmDesignation,
+          cmType: r.assignedCmType,
+        }));
+
+        // Detect conflicts
+        const conflictResult = await detectInstanceConflicts(projectId, incomingInstances);
+
+        if (conflictResult.conflicts.length > 0) {
+          // Show modal; wait for user resolution
+          setConflictData(conflictResult);
+          return; // Modal handler calls handleApplyResolutions
+        }
+
+        // No conflicts, promote directly
         await promoteEphEmImport(importId, projectId);
         alert('EPH/EM instances created successfully.');
         onComplete?.();
@@ -1553,6 +1574,34 @@ export default function StepEphEmImport({ projectId, onComplete }) {
         alert('Promotion failed: ' + e.message);
       } finally {
         setPromoting(false);
+      }
+    };
+
+    const handleApplyResolutions = async (resolutions) => {
+      try {
+        setIsResolvingConflicts(true);
+
+        const assignedRows = (transformedRows || []).filter(r => r.assignmentStatus === 'assigned');
+        const incomingInstances = assignedRows.map(r => ({
+          name: r.ephEmDesignation,
+          cmType: r.assignedCmType,
+        }));
+
+        // Apply resolutions
+        const result = await resolveInstanceConflicts(projectId, incomingInstances, resolutions);
+
+        // Close modal and show summary
+        setConflictData(null);
+        alert(result.summary);
+
+        // Promote (will have no conflicts now)
+        await promoteEphEmImport(importId, projectId);
+        alert('EPH/EM instances created successfully.');
+        onComplete?.();
+      } catch (e) {
+        alert('Conflict resolution failed: ' + e.message);
+      } finally {
+        setIsResolvingConflicts(false);
       }
     };
 
@@ -1628,6 +1677,14 @@ export default function StepEphEmImport({ projectId, onComplete }) {
             )}
           </div>
         </div>
+
+        {conflictData && (
+          <InstanceConflictModal
+            conflicts={conflictData.conflicts}
+            onResolve={handleApplyResolutions}
+            onCancel={() => setConflictData(null)}
+          />
+        )}
       </div>
     );
   }

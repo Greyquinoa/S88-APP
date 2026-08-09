@@ -27,8 +27,9 @@ const router = express.Router();
 async function runGeneration(db, body, onProgress) {
   const report = (pct, phase, msg) => { if (onProgress) onProgress({ pct, phase, msg }); };
 
-  const { projectName, instances, generatedBy, userProjects } = body;
-  if (!instances?.length) { const e = new Error('instances array required'); e.status = 400; throw e; }
+  const { projectName, instances: rawInstances, generatedBy, userProjects } = body;
+  if (!rawInstances?.length) { const e = new Error('instances array required'); e.status = 400; throw e; }
+  let instances = rawInstances;
 
   // Determine which user projects to emit. If none provided, fall back to a single
   // group using projectName (legacy behavior).
@@ -41,9 +42,16 @@ async function runGeneration(db, body, onProgress) {
   let projectConfig = null;
   let signalMaps = {};   // { instanceName: { "block.var": { tag, ... } } } — injected at export
   let matrixOverrides = {};   // { instanceName: { enabled, cells: { mode_nr: { colName: val } } } }
+  // Instances whose reconciliation left them as unaccepted DUMMY are excluded
+  // from the export — they exist only in unit-type generation, not the IO list.
+  let excludedDummies = [];
   if (projectName) {
       const proj = await db.prepare(`SELECT id FROM projects WHERE name = ?`).get(projectName);
       if (proj) {
+        const dummyRows = await db.prepare(
+          `SELECT instance_name FROM project_instances WHERE project_id = ? AND reconciliation_status = 'DUMMY'`
+        ).all(proj.id);
+        excludedDummies = dummyRows.map(r => r.instance_name);
         hierarchy = await db.prepare(`
           SELECT id, parent_id, name, s88_type, sort_order
           FROM project_hierarchy_folders
@@ -112,6 +120,12 @@ async function runGeneration(db, body, onProgress) {
           }
         }
       }
+    }
+
+    if (excludedDummies.length) {
+      const dummySet = new Set(excludedDummies);
+      instances = instances.filter(i => !dummySet.has(i.instanceName));
+      report(2, 'setup', `Excluding ${excludedDummies.length} unaccepted dummy instance(s)…`);
     }
 
     report(3, 'setup', 'Loading project…');
@@ -457,7 +471,7 @@ async function runGeneration(db, body, onProgress) {
 
     // Strip the `instances` field from the response — caller doesn't need it back.
     const responseOutputs = outputs.map(({ userProject, xml, stats }) => ({ userProject, xml, stats }));
-    return { outputs: responseOutputs, auditIds };
+    return { outputs: responseOutputs, auditIds, excludedDummies };
 }
 
 // ── POST /api/generate ──────────────────────────────────────────────────────────

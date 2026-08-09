@@ -12,6 +12,7 @@ import {
   getUnitTypes, getUnitType, createUnitType, updateUnitType, deleteUnitType,
   getUnitTypeConnections, saveUnitTypeConnections, deleteUnitTypeConnection, getCmTypeVariablesForUnit,
   getUnitInstances, addUnitInstance, updateUnitInstance, deleteUnitInstance, expandUnitInstances,
+  detectUnitInstanceConflicts, expandUnitInstancesWithResolution,
   listCompositeCmTypes, getCompositeCmType, createCompositeCmType, updateCompositeCmType, deleteCompositeCmType,
   getProjectConfig, saveProjectConfig, parseProjectXml,
   getValveCommands, saveValveCommands,
@@ -19,15 +20,18 @@ import {
   generateConnections, getConnectionIOs,
   listHwImports, ingestIoRowsIntoHw,
   getLatestIoImport, getIOHeaders,
+  runReconciliation, getReconciliationInstances,
 } from "./api.js";
 import StepIOImport from "./StepIOImport.jsx";
 import StepEphEmImport from "./StepEphEmImport.jsx";
+import ReconciliationOverviewModal from "./ReconciliationOverviewModal.jsx";
 import StepHWConfig from "./StepHWConfig.jsx";
 import InstancesGrid from "./InstancesGrid.tsx";
 import SignalMappingModal from "./SignalMappingModal.jsx";
 import UnitConnectionsEditor from "./UnitConnectionsEditor.jsx";
 import LibraryImportReview from "./LibraryImportReview.jsx";
 import UnitTypeImportModal from "./UnitTypeImportModal.jsx";
+import InstanceConflictModal from "./InstanceConflictModal.jsx";
 import UnitTypeSpirograph from "./UnitTypeSpirograph.jsx";
 import Spinner from "./Spinner.jsx";
 import ProgressBar from "./ProgressBar.jsx";
@@ -58,6 +62,13 @@ export default function App() {
   const [genProgress, setGenProgress] = useState(null);    // { pct, phase, msg } while generating XML; null = idle
   const [error, setErrorRaw]          = useState("");
   const [errorConflictRows, setErrorConflictRows] = useState(null); // tabular detail for duplicate-station errors
+  const [toast, setToast]             = useState("");      // transient success message
+  // StepUnitTypes has its own toast for unit-type actions; this one covers the
+  // expansion flow, which is driven from App rather than from that step.
+  const showToast = (msg) => {
+    setToast(msg);
+    setTimeout(() => setToast(""), 3000);
+  };
   // setError(str) clears conflictRows (existing call sites, unchanged behavior).
   // setError(Error) — e.g. setError(e) from a catch block — also captures e.conflictRows
   // (attached by api.js on "Duplicate stations" 400s) for tabular display in the banner.
@@ -70,6 +81,8 @@ export default function App() {
       setErrorConflictRows(null);
     }
   };
+  const [unitInstanceConflictData, setUnitInstanceConflictData] = useState(null);
+  const [isResolvingUnitConflicts, setIsResolvingUnitConflicts] = useState(false);
   const [importPreview, setImportPreview] = useState(null); // { token, diffResult }
   const [importDiff, setImportDiff]   = useState(null);     // diff result from compute-diff
 
@@ -594,6 +607,39 @@ export default function App() {
     }
   }
 
+  const onApplyUnitConflictResolutions = async (resolutions) => {
+    if (!savedProjectId || !unitInstanceConflictData) return;
+    setIsResolvingUnitConflicts(true);
+    try {
+      // Apply resolutions and expand
+      const result = await expandUnitInstancesWithResolution(
+        savedProjectId,
+        unitInstanceConflictData.plannedInstances,
+        resolutions
+      );
+
+      // Close modal
+      setUnitInstanceConflictData(null);
+
+      // Show toast with action counts
+      const { created, updated, skipped } = result.resolutions || {};
+      const parts = [];
+      if (created > 0) parts.push(`${created} created`);
+      if (updated > 0) parts.push(`${updated} updated`);
+      if (skipped > 0) parts.push(`${skipped} skipped`);
+      const summary = parts.length > 0 ? parts.join(', ') : 'Instances expanded successfully.';
+      showToast(summary);
+
+      // Reload project and instances
+      await loadProjectIntoState(savedProjectId);
+      loadUnitInstances(savedProjectId);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setIsResolvingUnitConflicts(false);
+    }
+  };
+
   function goTo(i) {
     if (i > 0 && !savedProjectName.trim()) {
       setError("Select or create a project first.");
@@ -755,13 +801,37 @@ export default function App() {
               onUnitTypesChange={loadUnitTypes}
               onExpand={async () => {
                 if (!savedProjectId) return;
-                setLoading("Generating instances…");
+                setLoading("Detecting instance conflicts…");
                 try {
+                  // Detect conflicts from unit instance expansion. This is a
+                  // read-only probe — nothing is written until we expand below.
+                  const conflictResult = await detectUnitInstanceConflicts(savedProjectId);
+
+                  if (conflictResult.conflicts.length > 0) {
+                    // Show modal; wait for user resolution
+                    setUnitInstanceConflictData(conflictResult);
+                    setLoading("");
+                    return; // Modal handler calls onApplyUnitConflictResolutions
+                  }
+
+                  // No conflicts, expand directly. Expansion creates the clean
+                  // names and flips is_generated on the silent-update ones, so
+                  // report those two counts rather than its combined total.
+                  setLoading("Expanding instances…");
                   await expandUnitInstances(savedProjectId);
+                  const createdCount = conflictResult.clean?.length || 0;
+                  const updatedCount = conflictResult.silentUpdates?.length || 0;
+                  const parts = [];
+                  if (createdCount > 0) parts.push(`${createdCount} created`);
+                  if (updatedCount > 0) parts.push(`${updatedCount} updated`);
+                  if (parts.length > 0) showToast(parts.join(', '));
                   await loadProjectIntoState(savedProjectId);
                   loadUnitInstances(savedProjectId);
-                } catch (e) { setError(e.message); }
-                finally { setLoading(""); }
+                  setLoading("");
+                } catch (e) {
+                  setError(e.message);
+                  setLoading("");
+                }
               }}
               onUnitInstancesChange={() => loadUnitInstances(savedProjectId)}
               unitConnections={unitConnections}
@@ -812,6 +882,25 @@ export default function App() {
             )
           )}
         </div>
+
+        {/* Toast notification */}
+        {toast && (
+          <div style={{ position: "fixed", bottom: 24, left: "50%", transform: "translateX(-50%)", background: "#166534", color: "#fff",
+              padding: "10px 20px", borderRadius: "var(--border-radius-md)", fontSize: 13, fontWeight: 500,
+              boxShadow: "0 4px 12px rgba(0,0,0,0.25)", zIndex: 1000 }}>
+            <i className="ti ti-circle-check" style={{ marginRight: 6 }} />{toast}
+          </div>
+        )}
+
+        {/* Unit-type expansion name conflicts — rendered at app root so it
+            overlays whichever step is active. */}
+        {unitInstanceConflictData && (
+          <InstanceConflictModal
+            conflicts={unitInstanceConflictData.conflicts}
+            onResolve={onApplyUnitConflictResolutions}
+            onCancel={() => setUnitInstanceConflictData(null)}
+          />
+        )}
       </div>
     </GlobalLoadingProvider>
   );
@@ -1897,6 +1986,8 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
   // New-rule draft: paramKey encodes "block>>var" of the selected input parameter
   const [ioWire, setIoWire] = useState({ memberIdx: "", paramKey: "", suffix: "", prefix: "", required: true });
   const [ioErr, setIoErr]                 = useState("");
+  // Child block editing: index of the IO rule being edited for child blocks
+  const [editingIoRuleIdx, setEditingIoRuleIdx] = useState(null);
 
   // Column-name suggestions for derived Value connections, sourced from the most
   // recently uploaded IO import across all projects (this panel has no single project
@@ -2955,6 +3046,7 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                         suffix: ioWire.suffix,
                         dtype: ioDtype,                      // data type (derived from param)
                         required: ioWire.required,
+                        childBlocks: [],                     // NEW: cascade child blocks
                       }],
                     }));
                     setIoWire(w => ({ ...w, paramKey: "", suffix: "", prefix: "" }));
@@ -3056,7 +3148,19 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                                     <span style={{ padding: "0 5px", borderRadius: 3, fontSize: 10,
                                         background: "#F3F4F6", color: "#6B7280" }}>optional</span>
                                   )}
+                                  {c.childBlocks && c.childBlocks.length > 0 && (
+                                    <span style={{ padding: "0 5px", borderRadius: 3, fontSize: 10, fontWeight: 600,
+                                        background: "#DCFCE7", color: "#166534", fontFamily: "var(--font-mono)" }}>
+                                      +{c.childBlocks.length}
+                                    </span>
+                                  )}
                                   <div style={{ flex: 1 }} />
+                                  <button onClick={() => setEditingIoRuleIdx(ci)}
+                                    title="Edit child blocks"
+                                    style={{ border: "none", background: "transparent", cursor: "pointer",
+                                      color: "#7C3AED", fontSize: 14, padding: "2px 4px" }}>
+                                    <i className="ti ti-edit" />
+                                  </button>
                                   <button onClick={() => handleDeleteIoRule(ci)}
                                     style={{ border: "none", background: "transparent", cursor: "pointer",
                                       color: "#DC2626", fontSize: 14, padding: "2px 4px" }}>
@@ -3129,6 +3233,104 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                             );
                           })}
                         </div>
+                      )}
+
+                      {/* Child Block Editor Modal (for IO rules) */}
+                      {editingIoRuleIdx !== null && editing.connections[editingIoRuleIdx]?.conn_type === 'io_connection' && (
+                        (() => {
+                          const ioRule = editing.connections[editingIoRuleIdx];
+                          const memberIdx = ioRule.to_member_idx;
+                          const member = editing.members[memberIdx];
+                          const cmTypeProfile = member ? cmtProfiles.find(p => p.name === member.cm_type_name) : null;
+                          const memberBlocks = (cmTypeProfile?.subBlocks || []).filter(b => b.name !== ioRule.block_name);
+                          const currentChildBlocks = ioRule.childBlocks || [];
+
+                          return (
+                            <div style={{
+                              position: "fixed", top: 0, left: 0, right: 0, bottom: 0,
+                              background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center",
+                              zIndex: 9999
+                            }}>
+                              <div style={{
+                                background: "var(--color-background-primary)", borderRadius: "var(--border-radius-lg)",
+                                padding: 20, maxWidth: 500, maxHeight: "80vh", overflow: "auto",
+                                boxShadow: "0 20px 25px -5px rgba(0,0,0,0.1)", border: "1px solid var(--color-border-secondary)"
+                              }}>
+                                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+                                  <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700 }}>
+                                    Edit Child Blocks: <span style={{ color: "#0F766E", fontFamily: "var(--font-mono)" }}>{ioRule.block_name}</span>
+                                  </h3>
+                                  <button onClick={() => setEditingIoRuleIdx(null)}
+                                    style={{ border: "none", background: "transparent", cursor: "pointer", fontSize: 20, color: "var(--color-text-secondary)" }}>
+                                    ✕
+                                  </button>
+                                </div>
+
+                                <p style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 16 }}>
+                                  When <span style={{ fontWeight: 600, color: "#0F766E", fontFamily: "var(--font-mono)" }}>
+                                    {ioRule.prefix || ""}&lt;tag&gt;{ioRule.suffix || ""}
+                                  </span> is matched in hardware, these child blocks will also be populated.
+                                  If the signal is not matched, all these blocks will be omitted.
+                                </p>
+
+                                <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 16,
+                                    borderTop: "1px solid var(--color-border-tertiary)", paddingTop: 12 }}>
+                                  {memberBlocks.length === 0 ? (
+                                    <div style={{ fontSize: 12, color: "var(--color-text-secondary)", padding: "8px 0" }}>
+                                      No other blocks in this CM type.
+                                    </div>
+                                  ) : (
+                                    memberBlocks.map(block => (
+                                      <label key={block.name} style={{
+                                        display: "flex", alignItems: "center", gap: 8, padding: 8,
+                                        borderRadius: "var(--border-radius-md)", cursor: "pointer",
+                                        background: "var(--color-background-secondary)", fontSize: 12
+                                      }}>
+                                        <input type="checkbox"
+                                          checked={currentChildBlocks.includes(block.name)}
+                                          onChange={e => {
+                                            setEditing(prev => {
+                                              const newConnections = [...prev.connections];
+                                              if (e.target.checked) {
+                                                if (!newConnections[editingIoRuleIdx].childBlocks.includes(block.name)) {
+                                                  newConnections[editingIoRuleIdx].childBlocks.push(block.name);
+                                                }
+                                              } else {
+                                                newConnections[editingIoRuleIdx].childBlocks =
+                                                  newConnections[editingIoRuleIdx].childBlocks.filter(n => n !== block.name);
+                                              }
+                                              return { ...prev, connections: newConnections };
+                                            });
+                                          }}
+                                          style={{ cursor: "pointer" }}
+                                        />
+                                        <span style={{ fontFamily: "var(--font-mono)", fontWeight: 600, color: "#0F766E" }}>
+                                          {block.name}
+                                        </span>
+                                        {block.comment && (
+                                          <span style={{ color: "var(--color-text-secondary)", fontSize: 11 }}>
+                                            — {block.comment}
+                                          </span>
+                                        )}
+                                      </label>
+                                    ))
+                                  )}
+                                </div>
+
+                                <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                                  <button onClick={() => setEditingIoRuleIdx(null)}
+                                    style={{
+                                      padding: "6px 12px", borderRadius: "var(--border-radius-md)",
+                                      border: "1px solid var(--color-border-secondary)", background: "var(--color-background-secondary)",
+                                      cursor: "pointer", fontSize: 12, fontWeight: 600, color: "var(--color-text-primary)"
+                                    }}>
+                                    Close
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })()
                       )}
 
                       {/* Add-connection row */}
@@ -3900,7 +4102,8 @@ function RolePanel({ inst, profile, instances, cmtProfiles, updateInstanceRole }
 
 // ── Instance sub-tab (list + optional role panel) ─────────────────────────────
 function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, folderOptions, hasHierarchy,
-    addInstance, removeInstance, updateInstance, updateInstanceRole, ensureLoaded, savedProjectId, saveProjectNow, setError = () => {}, getCompositeCmType, extractMemberConnections, setInstances, compositeCmTypes, valveCommands, loadProjectIntoState }) {
+    addInstance, removeInstance, updateInstance, updateInstanceRole, ensureLoaded, savedProjectId, saveProjectNow, setError = () => {}, getCompositeCmType, extractMemberConnections, setInstances, compositeCmTypes, valveCommands, loadProjectIntoState,
+    reconData, setReconData, reconModal, setReconModal, reconSummary, setReconSummary }) {
   const [selectedId, setSelectedId] = useState(null);
   const [mapInst, setMapInst] = useState(null);   // instance whose signal-mapping modal is open
   const [connResult, setConnResult] = useState(null); // last "Generate Connections" outcome
@@ -3921,6 +4124,7 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
     } catch { setConnStatus({}); }
   }
   useEffect(() => { loadConnStatus(); }, [savedProjectId]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const tabInstances = instances.filter(i => {
     const p = cmtProfiles.find(x => x.id === i.profileId);
     return p?.libType === libType;
@@ -4032,6 +4236,7 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
               }
             } : undefined}
             connStatusByInstance={savedProjectId ? connStatus : undefined}
+            reconciliationDataByInstance={savedProjectId ? reconData : undefined}
           />
         </div>
 
@@ -4081,6 +4286,11 @@ function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName,
   const hasHierarchy   = (hierarchy?.length || 0) > 0;
   const folderMissing  = hasHierarchy && instances.some(i => !i.folderId);
   const [compModal, setCompModal] = useState(false);
+  const [reconData, setReconData] = useState({});
+  const [reconInstances, setReconInstances] = useState([]);
+  const [reconModal, setReconModal] = useState(false);
+  const [reconSummary, setReconSummary] = useState({});
+  const [runningRecon, setRunningRecon] = useState(false);
 
   // Sub-tab state: CM | EM | EPH
   const [instTab, setInstTab] = useState("ControlModule");
@@ -4092,9 +4302,49 @@ function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName,
 
   const countOf = libType => instances.filter(i => cmtProfiles.find(p => p.id === i.profileId)?.libType === libType).length;
 
+  async function loadReconData() {
+    if (!savedProjectId) { setReconData({}); setReconInstances([]); setReconSummary({}); return; }
+    try {
+      const { summary, instances: insts } = await getReconciliationInstances(savedProjectId);
+      setReconSummary(summary || {});
+      setReconInstances(insts || []);
+      const byName = {};
+      for (const inst of (insts || [])) {
+        byName[inst.instanceName] = {
+          status: inst.reconciliationStatus,
+          isImported: inst.isImported,
+          isGenerated: inst.isGenerated,
+          acceptedAt: inst.acceptedAt,
+          acceptedBy: inst.acceptedBy,
+        };
+      }
+      setReconData(byName);
+    } catch (err) {
+      console.error('Failed to load reconciliation data:', err);
+      setReconData({}); setReconInstances([]); setReconSummary({});
+    }
+  }
+
+  useEffect(() => { loadReconData(); }, [savedProjectId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  async function handleRunReconciliation() {
+    if (!savedProjectId || runningRecon) return;
+    setRunningRecon(true);
+    try {
+      await runReconciliation(savedProjectId);
+      await loadReconData();
+    } catch (err) {
+      console.error('Reconciliation failed:', err);
+      setError(err.message);
+    } finally {
+      setRunningRecon(false);
+    }
+  }
+
   const commonTabProps = { instances, cmtProfiles, userProjects, folderOptions, hasHierarchy,
     addInstance, removeInstance, updateInstance, updateInstanceRole, ensureLoaded, savedProjectId,
-    saveProjectNow, setError, getCompositeCmType, extractMemberConnections, setInstances, compositeCmTypes, valveCommands, loadProjectIntoState };
+    saveProjectNow, setError, getCompositeCmType, extractMemberConnections, setInstances, compositeCmTypes, valveCommands, loadProjectIntoState,
+    reconData, setReconData, reconModal, setReconModal, reconSummary, setReconSummary };
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
@@ -4113,6 +4363,12 @@ function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName,
             <i className="ti ti-layout-grid" /> Add Composite
           </Btn>
         )}
+        <Btn onClick={handleRunReconciliation} disabled={!instances.length || !savedProjectId || runningRecon}>
+          <i className="ti ti-refresh" /> {runningRecon ? "Running…" : "Run Reconciliation"}
+        </Btn>
+        <Btn onClick={() => setReconModal(true)} disabled={!instances.length || !savedProjectId}>
+          <i className="ti ti-list-check" /> View Overview
+        </Btn>
         <Btn primary onClick={onGenerate}
             disabled={!instances.length || !!loading || generating || noUserProjects
               || instances.some(i => !i.userProject) || folderMissing}>
@@ -4127,6 +4383,15 @@ function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName,
           userProjects={userProjects}
           onConfirm={async (args) => { setCompModal(false); await addCompositeInstances(args); }}
           onCancel={() => setCompModal(false)} />
+      )}
+
+      {reconModal && (
+        <ReconciliationOverviewModal
+          projectId={savedProjectId}
+          instances={reconInstances}
+          onClose={() => setReconModal(false)}
+          onDataUpdate={loadReconData}
+        />
       )}
 
       {noUserProjects && (
@@ -4762,7 +5027,8 @@ function StepUnitTypes({
             disabled={!savedProjectId || busy}>
             <i className="ti ti-plus" /> Add Unit Instance
           </Btn>
-          <Btn primary onClick={async () => { await onExpand(); showToast("Instances generated successfully."); }}
+          {/* onExpand reports its own created/updated/skipped counts via toast. */}
+          <Btn primary onClick={onExpand}
             disabled={!savedProjectId || busy || unitInstances.length === 0}>
             <i className="ti ti-player-play" /> Generate Instances
           </Btn>
@@ -4881,6 +5147,7 @@ function StepUnitTypes({
             compositeCmTypes={compositeCmTypes}
             compDetails={compDetails}
             cmtProfiles={cmtProfiles}
+            unitLevelConnections={unitConnections[selectedTypeId] || []}
             onClose={() => setSpirogramOpen(false)}
           />
         </div>

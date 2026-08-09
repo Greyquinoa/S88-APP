@@ -17,6 +17,7 @@ import {
 } from "ag-grid-community";
 // @ts-ignore — Vite handles CSS imports; TS doesn't need to resolve them
 import "./InstancesGrid.css";
+import ReconciliationStatusRenderer from "./ReconciliationStatusRenderer";
 
 ModuleRegistry.registerModules([AllCommunityModule]);
 
@@ -66,6 +67,15 @@ interface InstancesGridProps {
    *  "Connections" column shows how many dummy IOs are bound to hardware (real)
    *  out of the total. Omit to hide the column. */
   connStatusByInstance?: Record<string, { real: number; dummy: number; total: number }>;
+  /** Per-instance reconciliation status keyed by instanceName. When provided, a
+   *  "Status" column shows the reconciliation state (OK, IMPORTED_OK, DUMMY, etc.) */
+  reconciliationDataByInstance?: Record<string, {
+    status: 'OK' | 'IMPORTED_OK' | 'DUMMY' | 'DUMMY_ACCEPTED' | 'ERROR' | 'PENDING';
+    isImported: boolean;
+    isGenerated: boolean;
+    acceptedAt?: string | null;
+    acceptedBy?: string | null;
+  }>;
 }
 
 // ── Delete button cell renderer ───────────────────────────────────────────────
@@ -205,6 +215,7 @@ export default function InstancesGrid({
   onMapSignals,
   onGenerateConnections,
   connStatusByInstance,
+  reconciliationDataByInstance,
 }: InstancesGridProps) {
   const gridRef = useRef<AgGridReact<InstanceRow>>(null);
   const [quickFilter, setQuickFilter] = useState("");
@@ -392,16 +403,21 @@ export default function InstancesGrid({
             : null,
       },
       {
-        headerName: "Imported",
-        field: "source",
+        headerName: "Status",
+        colId: "reconStatus",
         editable: false,
         sortable: true,
         filter: "agSetColumnFilter",
         floatingFilter: false,
         resizable: true,
-        minWidth: 100,
-        flex: 0.6,
-        cellRenderer: ImportedCheckboxRenderer,
+        minWidth: 120,
+        flex: 0.8,
+        cellRenderer: (props: { data: InstanceRow; context: { reconciliationDataByInstance?: Record<string, any> } }) => (
+          <ReconciliationStatusRenderer
+            reconData={props.context.reconciliationDataByInstance}
+            instanceName={props.data.instanceName}
+          />
+        ),
         cellStyle: { display: "flex", alignItems: "center", justifyContent: "center" },
         suppressHeaderMenuButton: true,
       },
@@ -450,7 +466,7 @@ export default function InstancesGrid({
         suppressHeaderMenuButton: true,
       },
     ],
-    [typeValues, userProjectValues, folderValues, folderLabels, cmtProfiles, folderOptions.length, onMapSignals, folderLabels, connStatusByInstance]
+    [typeValues, userProjectValues, folderValues, folderLabels, cmtProfiles, folderOptions.length, onMapSignals, folderLabels, connStatusByInstance, reconciliationDataByInstance]
   );
 
   // Detect duplicate instance names for cell styling
@@ -478,8 +494,8 @@ export default function InstancesGrid({
   );
 
   const context = useMemo(
-    () => ({ onDelete: onRowDelete, duplicateNames, onMapSignals, connStatusByInstance }),
-    [onRowDelete, duplicateNames, onMapSignals, connStatusByInstance]
+    () => ({ onDelete: onRowDelete, duplicateNames, onMapSignals, connStatusByInstance, reconciliationDataByInstance }),
+    [onRowDelete, duplicateNames, onMapSignals, connStatusByInstance, reconciliationDataByInstance]
   );
 
   const defaultColDef = useMemo<ColDef>(

@@ -182,7 +182,7 @@ async function promoteToProject(db, importId, projectId) {
            t.assigned_cm_type, t.assignment_status, t.assignment, t.id AS tag_id
     FROM io_hierarchy_nodes n
     JOIN io_tags t ON t.hierarchy_node_id = n.id
-    WHERE n.import_id = ? AND n.level = 'ControlModule'
+    WHERE n.import_id = ?
       AND t.assignment_status IN ('auto','manual_override','approved')
       AND t.assigned_cm_type IS NOT NULL AND t.validation_status != 'error'
     ORDER BY t.id
@@ -339,6 +339,7 @@ async function promoteToProject(db, importId, projectId) {
       //   block_name    → the sub-block within the member's CM type (from meta JSON)
       //   prefix/suffix → wrap the instrument tag to build the dummy signal name
       //   dtype         → IO direction/type (DI/DO/AI/AO)
+      //   childBlocks   → array of child block names that cascade with this parent
       return composite.ioConnections
         .filter(c => Number(c.to_member_idx) === Number(memberIdx))  // Rules targeting this member
         .map(c => ({
@@ -348,6 +349,7 @@ async function promoteToProject(db, importId, projectId) {
           suffix: c.suffix || '',
           signal_type: c.dtype || c.signal_type || 'DI',
           required: c.required ? 1 : 0,
+          childBlocks: (Array.isArray(c.childBlocks) ? c.childBlocks : []) || [],
         }));
     }
 
@@ -358,11 +360,24 @@ async function promoteToProject(db, importId, projectId) {
     for (const tag of approvedTags) {
       const baseFolderId = tag.node_parent_id ? (nodeToFolderId[tag.node_parent_id] ?? null) : null;
 
-      // Avoid duplicate base instance names
+      // Avoid duplicate base instance names. A row can already be here because
+      // unit-type expansion ran first — that row is the same physical device, so
+      // flag it as imported too (making it OK at reconciliation) rather than
+      // leaving it looking purely generated. Mirrors the existing-row branch in
+      // expandUnitInstances for the opposite ordering.
       const existing = await db.prepare(
         'SELECT id FROM project_instances WHERE project_id=? AND instance_name=?'
       ).get(projectId, tag.node_name);
-      if (existing) continue;
+      // Do not `continue` here: for a composite tag this row is only the base
+      // member. Its sibling members (e.g. the NIF_-prefixed one) may still be
+      // unflagged, and they are derived inside the member loop below — skipping
+      // the tag outright would leave them looking purely generated.
+      if (existing) {
+        await db.prepare(
+          'UPDATE project_instances SET is_imported=true WHERE id=?'
+        ).run(existing.id);
+      }
+      const baseAlreadyExisted = !!existing;
 
       const composite = await resolveComposite(tag.assigned_cm_type);
 
@@ -375,12 +390,18 @@ async function promoteToProject(db, importId, projectId) {
           const instName = isProject
             ? (`${m.name_prefix || ''}${m.name_suffix || ''}`.trim() || m.cm_type_name || tag.node_name)
             : `${m.name_prefix || ''}${tag.node_name}${m.name_suffix || ''}`;
-          // Skip project-scope members that already exist
+          // Skip project-scope members that already exist — but still mark them
+          // imported, for the same reason as the base-name guard above.
           if (isProject) {
             const ex = await db.prepare(
               'SELECT id FROM project_instances WHERE project_id=? AND instance_name=?'
             ).get(projectId, instName);
-            if (ex) continue;
+            if (ex) {
+              await db.prepare(
+                'UPDATE project_instances SET is_imported=true WHERE id=?'
+              ).run(ex.id);
+              continue;
+            }
           }
 
           // Apply hierarchy_folder rule from composite member definition
@@ -390,12 +411,25 @@ async function promoteToProject(db, importId, projectId) {
             memberFolderId = await ensureFolderPath(baseFolderId, m.hierarchy_folder);
           }
 
+          // A derived member name (e.g. NIF_<tag>) can collide even when the base
+          // tag name did not, so this needs its own check rather than relying on
+          // the guard above.
+          const exMember = await db.prepare(
+            'SELECT id FROM project_instances WHERE project_id=? AND instance_name=?'
+          ).get(projectId, instName);
+          if (exMember) {
+            await db.prepare(
+              'UPDATE project_instances SET is_imported=true WHERE id=?'
+            ).run(exMember.id);
+            continue;
+          }
+
           const connections = getIOConnectionsForMember(composite, mi);
           await db.prepare(`
             INSERT INTO project_instances
               (project_id, cm_type, instance_name, sampling_time, user_project, folder_id, sort_order,
-               composite_group_id, composite_id, member_idx, source, connections)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+               composite_group_id, composite_id, member_idx, source, connections, is_imported)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
           `).run(
             projectId,
             m.cm_type_name,
@@ -408,16 +442,19 @@ async function promoteToProject(db, importId, projectId) {
             comp.id,
             mi,
             'imported',
-            JSON.stringify(connections)
+            JSON.stringify(connections),
+            true
           );
           instancesCreated++;
         }
-      } else {
-        // Raw CM type (legacy / non-composite)
+      } else if (!baseAlreadyExisted) {
+        // Raw CM type (legacy / non-composite). Unlike a composite, the base name
+        // IS the whole tag here — if it already existed it was flagged above and
+        // there is nothing further to insert.
         await db.prepare(`
           INSERT INTO project_instances
-            (project_id, cm_type, instance_name, sampling_time, user_project, folder_id, sort_order, source, connections)
-          VALUES (?,?,?,?,?,?,?,?,?)
+            (project_id, cm_type, instance_name, sampling_time, user_project, folder_id, sort_order, source, connections, is_imported)
+          VALUES (?,?,?,?,?,?,?,?,?,?)
         `).run(
           projectId,
           tag.assigned_cm_type,
@@ -427,7 +464,8 @@ async function promoteToProject(db, importId, projectId) {
           folderId,
           instSO++,
           'imported',
-          JSON.stringify([])
+          JSON.stringify([]),
+          true
         );
         instancesCreated++;
       }

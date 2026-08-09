@@ -1318,6 +1318,7 @@ async function ensureSchema() {
 
   await addColumnIfMissing('instance_ios', 'signal_type', 'signal_type TEXT');
   await addColumnIfMissing('instance_ios', 'required', 'required BOOLEAN NOT NULL DEFAULT TRUE');
+  await addColumnIfMissing('instance_ios', 'cascade_status', `cascade_status TEXT CHECK(cascade_status IN ('cascaded_from_parent'))')`);
 
   // Migration: add source column to project_instances.
   await addColumnIfMissing('project_instances', 'source', `source TEXT NOT NULL DEFAULT 'manual'`);
@@ -1433,6 +1434,15 @@ async function ensureSchema() {
   } catch (e) {
     console.warn('[DB] Migration: failed to fix NULL updated_at in projects:', e.message);
   }
+
+  // ── Migration: Add reconciliation columns to project_instances ──────────────
+  await addColumnIfMissing('project_instances', 'is_imported', 'is_imported BOOLEAN NOT NULL DEFAULT FALSE');
+  await addColumnIfMissing('project_instances', 'is_generated', 'is_generated BOOLEAN NOT NULL DEFAULT FALSE');
+  await addColumnIfMissing('project_instances', 'reconciliation_status', `reconciliation_status TEXT NOT NULL DEFAULT 'PENDING'`);
+  await addColumnIfMissing('project_instances', 'accepted_at', 'accepted_at TIMESTAMPTZ');
+  await addColumnIfMissing('project_instances', 'accepted_by', 'accepted_by TEXT');
+  await addColumnIfMissing('project_instances', 'last_reconciled_at', 'last_reconciled_at TIMESTAMPTZ');
+  await rawRun(`CREATE INDEX IF NOT EXISTS idx_pi_recon_status ON project_instances(project_id, reconciliation_status)`);
 
   console.log('[DB] Schema ready');
 }

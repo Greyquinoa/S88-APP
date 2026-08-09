@@ -557,14 +557,16 @@ function TabUpload({ projectId, imports, onImported, onSelectImport, onDeleteImp
 // ═══════════════════════════════════════════════════════════════════════════════
 // TAB 2 — COLUMN MAPPING
 // ═══════════════════════════════════════════════════════════════════════════════
-const INTERNAL_FIELDS = ['instrument_tag', 'function_val', 'hierarchy', 'assignment'];
+const INTERNAL_FIELDS = ['tag_name', 'instrument_tag', 'function_val', 'hierarchy', 'assignment'];
 const INTERNAL_FIELD_LABELS = {
+  tag_name:        'Signal Tag',
   instrument_tag:  'Instrument Tag',
   function_val:    'Function',
   hierarchy:       'Hierarchy',
   assignment:      'AS Assignment',
 };
 const INTERNAL_FIELD_DESCRIPTIONS = {
+  tag_name:        'Full signal tag (e.g., XV001_GSH) — must be unique; duplicates are flagged',
   instrument_tag:  'CM identity — groups IO rows into one instance',
   function_val:    'Maps to CM type for instance creation',
   hierarchy:       'Full path (e.g., Area/Cell/Unit) — determines folder structure',
@@ -842,7 +844,12 @@ function TabColumnMap({ importId, columnMaps, onColumnMapsChange, cmtProfiles, a
 // Helper: fuzzy-match column name to internal field using similarity scoring
 function suggestColumnMapping(columnName) {
   const ALIASES = {
-    instrument_tag: ['instrument', 'instrumenttag', 'instrument_tag', 'cm_tag', 'cmtag', 'device', 'device_tag', 'tag_id', 'kks', 'tag', 'tagname'],
+    // 'tag'/'tagname' belong to tag_name (the full signal tag, e.g. XV001_GSH).
+    // The CM identity column is usually named "Tag CM" / "Instrument", which
+    // scores higher against instrument_tag's own aliases.
+    // No bare 'signal' alias — it fuzzy-matches "Signal_Type" and would hijack the column.
+    tag_name:       ['tag', 'tagname', 'tag_name', 'signaltag', 'signal_tag', 'iotag', 'io_tag'],
+    instrument_tag: ['instrument', 'instrumenttag', 'instrument_tag', 'tagcm', 'tag_cm', 'cm_tag', 'cmtag', 'device', 'device_tag', 'tag_id', 'kks'],
     function_val:   ['function', 'func', 'type', 'instrument_type', 'iotype', 'category'],
     hierarchy:      ['hierarchy', 'path', 'location', 'hierarchy_path', 'plant_path', 'structure', 'plant_structure', 'plant_hierarchy'],
     assignment:     ['assignment', 'as', 'as_assignment', 'controller', 'plc', 'cpu', 'station', 'as01', 'as_station'],
@@ -1481,6 +1488,7 @@ function TabReview({ importId, projectId, cmtProfiles, compositeCmTypes = [], on
   const [filter, setFilter]     = useState('all');
   const [search, setSearch]     = useState('');
   const [busy, setBusy]         = useState(false);
+  const [validationReport, setValidationReport] = useState(null);
 
   const load = useCallback(async (page = 1) => {
     if (!importId) return;
@@ -1496,6 +1504,14 @@ function TabReview({ importId, projectId, cmtProfiles, compositeCmTypes = [], on
   }, [importId, filter, search]);
 
   useEffect(() => { load(1); }, [load]);
+
+  // Load validation report on mount/importId change
+  useEffect(() => {
+    if (!importId) { setValidationReport(null); return; }
+    getIOValidationReport(importId)
+      .then(r => setValidationReport(r))
+      .catch(e => console.warn('Failed to load validation report:', e.message));
+  }, [importId]);
 
   const override = useCallback(async (tag, field, value) => {
     try {
@@ -1609,11 +1625,28 @@ function TabReview({ importId, projectId, cmtProfiles, compositeCmTypes = [], on
     p.data.assignment_status === 'unresolved' ? { background: '#FFFBEB' } : undefined,
   []);
 
+  // Extract duplicate errors from validation report
+  const duplicateErrors = validationReport?.logs?.filter(l => l.rule_code === 'VAL-002') || [];
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
       <PanelHeading
         title="Review assignments"
         subtitle="Check the CM type assigned to each instrument, override where needed, then promote to the project." />
+
+      {duplicateErrors.length > 0 && (
+        <div style={{
+          background: '#FEE2E2', border: '1px solid #FCA5A5', borderRadius: 8, padding: '12px 16px',
+          marginBottom: 12, fontSize: 13, color: '#7F1D1D', lineHeight: 1.5,
+        }}>
+          <strong>❌ {duplicateErrors.length} duplicate signal tag{duplicateErrors.length !== 1 ? 's' : ''} found — fix before promoting:</strong>
+          <ul style={{ margin: '8px 0 0 20px', paddingLeft: 0 }}>
+            {duplicateErrors.map((e, i) => (
+              <li key={i} style={{ marginBottom: 4 }}>{e.message}</li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       <div className="ig-root" style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0,
           border: '1px solid rgba(28,27,25,0.08)', borderRadius: '22px',

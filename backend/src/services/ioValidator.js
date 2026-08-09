@@ -23,6 +23,7 @@ async function validateTags(db, importId) {
     for (const tag of tags) {
       const flags = [];
       const identity = (tag.instrument_tag || tag.tag_name || '').trim();
+      const tagName = (tag.tag_name || '').trim();
 
       // VAL-001: no usable identity
       if (!identity) {
@@ -31,15 +32,16 @@ async function validateTags(db, importId) {
         await insertLog.run(importId, tag.id, 'VAL-001', 'error', msg);
         counts.error++;
       } else {
-        // VAL-002: true duplicate = same instrument_tag + same function_val + same hierarchy
-        // (multiple IO rows per instrument is normal — only flag identical rows)
-        const dedupKey = `${identity.toUpperCase()}::${(tag.function_val || '').toUpperCase()}::${(tag.hierarchy || '').toUpperCase()}`;
-        if (seenKeys.has(dedupKey)) {
-          const msg = `Row ${tag.row_number}: duplicate IO row for instrument "${identity}" with function "${tag.function_val || ''}"`;
-          flags.push({ code: 'VAL-002', severity: 'warning', message: msg });
-          await insertLog.run(importId, tag.id, 'VAL-002', 'warning', msg);
-          counts.warning++;
-        } else {
+        // VAL-002: duplicate tag_name (full signal tag must be unique within import)
+        // instrument_tag can repeat (e.g. XV001 has XV001_GSH, XV001_GSL, XV001_out)
+        // but tag_name must be unique
+        const dedupKey = tagName.toUpperCase();
+        if (dedupKey && seenKeys.has(dedupKey)) {
+          const msg = `Row ${tag.row_number}: duplicate tag "${tagName}" — signal tags must be unique`;
+          flags.push({ code: 'VAL-002', severity: 'error', message: msg });
+          await insertLog.run(importId, tag.id, 'VAL-002', 'error', msg);
+          counts.error++;
+        } else if (dedupKey) {
           seenKeys.set(dedupKey, tag.id);
         }
       }

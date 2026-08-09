@@ -115,6 +115,19 @@ router.post('/', async (req, res) => {
       const row = await db.prepare(`SELECT id FROM projects WHERE name = ?`).get(name);
       const projectId = row.id;
 
+      // Reconciliation state is owned by the server (set by IO import / unit type
+      // expansion, and by manual accept), never round-tripped through the client.
+      // This endpoint wipes and reinserts every instance, so snapshot that state by
+      // instance name and restore it below — otherwise any save (autosave, "Generate
+      // Connections") silently resets every row to not-imported/not-generated.
+      const priorRecon = new Map(
+        (await db.prepare(`
+          SELECT instance_name, is_imported, is_generated, reconciliation_status,
+                 accepted_at, accepted_by, last_reconciled_at
+          FROM project_instances WHERE project_id = ?
+        `).all(projectId)).map(r => [r.instance_name, r])
+      );
+
       await db.prepare(`DELETE FROM project_instances         WHERE project_id = ?`).run(projectId);
       await db.prepare(`DELETE FROM project_cmt_profiles      WHERE project_id = ?`).run(projectId);
       await db.prepare(`DELETE FROM project_user_projects     WHERE project_id = ?`).run(projectId);
@@ -158,17 +171,24 @@ router.post('/', async (req, res) => {
       }
 
       const insInst = db.prepare(`
-        INSERT INTO project_instances (project_id, cm_type, instance_name, sampling_time, user_project, folder_id, role_assignments, sort_order, composite_group_id, composite_id, member_idx, source, connections)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO project_instances (project_id, cm_type, instance_name, sampling_time, user_project, folder_id, role_assignments, sort_order, composite_group_id, composite_id, member_idx, source, connections,
+          is_imported, is_generated, reconciliation_status, accepted_at, accepted_by, last_reconciled_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       `);
       for (let idx = 0; idx < instances.length; idx++) {
         const i = instances[idx];
         const folderDbId = i.folder_client_id != null ? folderIdMap[i.folder_client_id] ?? null : null;
+        // Carry forward reconciliation state for a row that already existed under
+        // this name; a genuinely new instance starts unreconciled.
+        const rec = priorRecon.get(i.instance_name);
         await insInst.run(projectId, i.cm_type, i.instance_name, i.sampling_time || '1000',
           i.user_project || null, folderDbId,
           JSON.stringify(i.role_assignments || {}), idx,
           i.composite_group_id ?? null, i.composite_id ?? null, i.member_idx ?? null,
-          i.source || 'manual', JSON.stringify(i.connections || []));
+          i.source || 'manual', JSON.stringify(i.connections || []),
+          rec?.is_imported ?? false, rec?.is_generated ?? false,
+          rec?.reconciliation_status ?? 'PENDING',
+          rec?.accepted_at ?? null, rec?.accepted_by ?? null, rec?.last_reconciled_at ?? null);
       }
 
       const insProf = db.prepare(`

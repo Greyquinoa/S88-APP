@@ -17,6 +17,7 @@ export default function UnitTypeSpirograph({
   compositeCmTypes = [],
   compDetails = {},
   cmtProfiles = [],
+  unitLevelConnections = [],
   onClose
 }) {
   const canvasRef = useRef(null);
@@ -39,8 +40,12 @@ export default function UnitTypeSpirograph({
     //    composite; targetAlias + targetMemberIdx point at a sub-member of a
     //    *different* unit-type member (resolved by alias). For the collapsed
     //    view we only need the member-level (alias) endpoints.
+    //  - unitLevelConnections are stored separately and are unit-level
+    //    interconnections between members and the __UNIT__ (unit controller).
     const nodes = [];
     const edges = [];
+    const unitConnEdges = []; // Unit-level connections (highlighted separately)
+
 
     const libTypeOf = (cmTypeName) =>
       cmtProfiles.find(p => p.id === cmTypeName)?.libType || '';
@@ -91,11 +96,22 @@ export default function UnitTypeSpirograph({
       });
     });
 
+    // Unit-level connections — member-to-member interconnections (separate from role assignments)
+    (unitLevelConnections || []).forEach(conn => {
+      if (conn.from_alias && conn.to_alias) {
+        const fromId = nodeIdByAlias.get(conn.from_alias);
+        const toId = nodeIdByAlias.get(conn.to_alias);
+        if (fromId != null && toId != null) {
+          unitConnEdges.push({ from: fromId, to: toId, label: `${conn.from_var_name}→${conn.to_var_name}` });
+        }
+      }
+    });
+
     // Draw the spirograph only if we have nodes
     if (nodes.length > 0) {
-      drawSpirograph(canvasRef.current, nodes, edges, hoveredNodeId, setHoveredNodeId, setInfoText);
+      drawSpirograph(canvasRef.current, nodes, edges, unitConnEdges, hoveredNodeId, setHoveredNodeId, setInfoText);
     }
-  }, [members, compDetails, cmtProfiles, hoveredNodeId]);
+  }, [members, compDetails, cmtProfiles, unitLevelConnections, hoveredNodeId]);
 
   // Canvas mouse move handler for hover detection
   const handleCanvasMouseMove = (e) => {
@@ -218,9 +234,14 @@ export default function UnitTypeSpirograph({
                 { color: '#5B4FD6', label: 'EPH – equipment phase' },
                 { color: '#0A8F6A', label: 'EM – equipment module' },
                 { color: '#C04B1A', label: 'CM – control module' },
+                { color: '#E91E63', label: 'Unit connection' },
               ].map((item, i) => (
                 <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', color: 'var(--color-text-secondary)', fontWeight: 500 }}>
-                  <div style={{ width: '9px', height: '9px', borderRadius: '2px', background: item.color }} />
+                  {i < 3 ? (
+                    <div style={{ width: '9px', height: '9px', borderRadius: '2px', background: item.color }} />
+                  ) : (
+                    <div style={{ width: '9px', height: '2px', background: item.color }} />
+                  )}
                   {item.label}
                 </div>
               ))}
@@ -234,8 +255,9 @@ export default function UnitTypeSpirograph({
 
 /**
  * Draw the spirograph canvas with nodes arranged in a circle.
+ * Unit-level connections are highlighted in a distinct color (magenta/pink).
  */
-function drawSpirograph(canvas, nodes, edges, hoveredNodeId, setHoveredNodeId, setInfoText) {
+function drawSpirograph(canvas, nodes, edges, unitConnEdges, hoveredNodeId, setHoveredNodeId, setInfoText) {
   if (!canvas || !canvas.parentElement) return;
 
   // Full-bleed: canvas fills its parent rectangle exactly (no card, no cap).
@@ -302,7 +324,7 @@ function drawSpirograph(canvas, nodes, edges, hoveredNodeId, setHoveredNodeId, s
     ctx.stroke();
     ctx.setLineDash([]);
 
-    // Draw edges
+    // Draw regular role-assignment edges
     edges.forEach(e => {
       const na = byId(e.a);
       const nb = byId(e.b);
@@ -323,13 +345,46 @@ function drawSpirograph(canvas, nodes, edges, hoveredNodeId, setHoveredNodeId, s
       ctx.stroke();
     });
 
-    // Draw nodes
+    // Draw unit-level connection edges in distinct magenta color (curved, dashed)
+    unitConnEdges.forEach(e => {
+      const na = byId(e.from);
+      const nb = byId(e.to);
+      if (!na || !nb) return;
+
+      // Use same curved path as role assignments
+      const c1x = cx + (na.x - cx) * 0.22;
+      const c1y = cy + (na.y - cy) * 0.22;
+      const c2x = cx + (nb.x - cx) * 0.22;
+      const c2y = cy + (nb.y - cy) * 0.22;
+
+      const unitConnColor = '#E91E63'; // Magenta for unit connections
+      const hl = hoveredNodeId && (e.from === hoveredNodeId || e.to === hoveredNodeId);
+
+      // Draw curved dashed line for unit connections
+      ctx.beginPath();
+      ctx.moveTo(na.x, na.y);
+      ctx.bezierCurveTo(c1x, c1y, c2x, c2y, nb.x, nb.y);
+      ctx.strokeStyle = hl ? unitConnColor : unitConnColor + '44';
+      ctx.lineWidth = hl ? 2.5 : 1.2;
+      ctx.setLineDash([5, 4]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    });
+
+    // Draw nodes (members only)
     nodes.forEach(n => {
-      const connectedIds = hoveredNodeId
-        ? edges
-            .filter(e => e.a === hoveredNodeId || e.b === hoveredNodeId)
-            .map(e => e.a === hoveredNodeId ? e.b : e.a)
-        : [];
+      let connectedIds = [];
+      if (hoveredNodeId) {
+        connectedIds = edges
+          .filter(e => e.a === hoveredNodeId || e.b === hoveredNodeId)
+          .map(e => e.a === hoveredNodeId ? e.b : e.a);
+        // Also include unit-level connections
+        const unitConns = unitConnEdges.filter(e => e.from === n.id || e.to === n.id);
+        if (unitConns.length > 0 && hoveredNodeId === n.id) {
+          const unitConnectedIds = unitConns.map(e => e.from === n.id ? e.to : e.from);
+          connectedIds = [...connectedIds, ...unitConnectedIds];
+        }
+      }
       const hl = hoveredNodeId && (n.id === hoveredNodeId || connectedIds.includes(n.id));
 
       const [c, s, bg] = col[n.type];
@@ -398,6 +453,7 @@ function drawSpirograph(canvas, nodes, edges, hoveredNodeId, setHoveredNodeId, s
     let found = null;
     let minDist = Infinity;
 
+    // Check hover on member nodes
     nodes.forEach(n => {
       const d = Math.hypot(n.x - mx, n.y - my);
       if (d < NR * 2.3 && d < minDist) {
@@ -411,14 +467,24 @@ function drawSpirograph(canvas, nodes, edges, hoveredNodeId, setHoveredNodeId, s
       if (found) {
         const n = byId(found);
         if (n) {
-          const connectedNames = edges
+          // Role assignment connections
+          const roleConnNames = edges
             .filter(e => e.a === found || e.b === found)
             .map(e => byId(e.a === found ? e.b : e.a))
             .filter(Boolean)
             .map(n => n.label);
+          // Unit-level connections (shown differently in info)
+          const unitConnNames = unitConnEdges
+            .filter(e => e.from === found || e.to === found)
+            .map(e => {
+              const other = byId(e.from === found ? e.to : e.from);
+              return other ? `${other.label}(unit-level)` : '';
+            })
+            .filter(Boolean);
+          const allConns = [...roleConnNames, ...unitConnNames];
           setInfoText(
             `${n.label} (${n.type}) → ${
-              connectedNames.join(', ') || 'no connections'
+              allConns.join(', ') || 'no connections'
             }`
           );
         }

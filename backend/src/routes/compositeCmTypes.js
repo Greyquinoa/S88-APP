@@ -235,7 +235,8 @@ async function _insertConnections(db, compId, connections) {
         i,
       );
     } else if (type === 'io_connection') {
-      // IO Connection: encode block_name, prefix, suffix, dtype, required in static_value as JSON
+      // IO Connection: encode block_name, prefix, suffix, dtype, required, childBlocks in static_value as JSON
+      const childBlocks = c.childBlocks && Array.isArray(c.childBlocks) ? c.childBlocks : [];
       await stmt.run(
         compId,
         -1,
@@ -249,6 +250,7 @@ async function _insertConnections(db, compId, connections) {
           suffix: c.suffix || '',
           dtype: c.dtype || '',
           required: c.required ? 1 : 0,
+          childBlocks,
         }),
         i,
       );
