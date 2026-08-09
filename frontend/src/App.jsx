@@ -1989,6 +1989,16 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
   // Child block editing: index of the IO rule being edited for child blocks
   const [editingIoRuleIdx, setEditingIoRuleIdx] = useState(null);
 
+  // Load IO rules when child block editor modal opens (ensure blocks are fetched)
+  useEffect(() => {
+    if (editingIoRuleIdx !== null && editing?.members) {
+      const memberIdx = editing.connections[editingIoRuleIdx]?.to_member_idx;
+      if (memberIdx !== undefined && editing.members[memberIdx]) {
+        loadIoRulesForMembers([editing.members[memberIdx]]);
+      }
+    }
+  }, [editingIoRuleIdx, editing?.members, editing?.connections]);
+
   // Column-name suggestions for derived Value connections, sourced from the most
   // recently uploaded IO import across all projects (this panel has no single project
   // in scope). Column names are stored as free strings, so this only seeds the
@@ -3241,8 +3251,12 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                           const ioRule = editing.connections[editingIoRuleIdx];
                           const memberIdx = ioRule.to_member_idx;
                           const member = editing.members[memberIdx];
-                          const cmTypeProfile = member ? cmtProfiles.find(p => p.name === member.cm_type_name) : null;
-                          const memberBlocks = (cmTypeProfile?.subBlocks || []).filter(b => b.name !== ioRule.block_name);
+                          const cmTypeName = member?.cm_type_name;
+                          // Try ioRulesCache first (has all blocks including non-valid), then cmtProfiles
+                          const cachedRules = ioRulesCache[cmTypeName];
+                          const cmTypeProfile = cmtProfiles.find(p => p.name === cmTypeName);
+                          const allBlocks = cachedRules?.blocks || cmTypeProfile?.subBlocks || [];
+                          const memberBlocks = allBlocks.filter(b => b.name !== ioRule.block_name);
                           const currentChildBlocks = ioRule.childBlocks || [];
 
                           return (
