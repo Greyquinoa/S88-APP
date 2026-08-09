@@ -3305,13 +3305,14 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                                           onChange={e => {
                                             setEditing(prev => {
                                               const newConnections = [...prev.connections];
+                                              const rule = newConnections[editingIoRuleIdx];
+                                              if (!rule.childBlocks) rule.childBlocks = [];
                                               if (e.target.checked) {
-                                                if (!newConnections[editingIoRuleIdx].childBlocks.includes(block.name)) {
-                                                  newConnections[editingIoRuleIdx].childBlocks.push(block.name);
+                                                if (!rule.childBlocks.includes(block.name)) {
+                                                  rule.childBlocks.push(block.name);
                                                 }
                                               } else {
-                                                newConnections[editingIoRuleIdx].childBlocks =
-                                                  newConnections[editingIoRuleIdx].childBlocks.filter(n => n !== block.name);
+                                                rule.childBlocks = rule.childBlocks.filter(n => n !== block.name);
                                               }
                                               return { ...prev, connections: newConnections };
                                             });
