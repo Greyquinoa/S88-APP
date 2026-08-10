@@ -587,13 +587,13 @@ body::-webkit-scrollbar {
 }
 
 .conditional-checkbox-input:hover + .conditional-checkbox-label {
-  border-color: #10B981;
-  background: #F0FFF9;
+  border-color: #FF9800;
+  background: #FFF3E0;
 }
 
 .conditional-checkbox-input:checked + .conditional-checkbox-label {
-  border-color: #10B981;
-  background: #10B981;
+  border-color: #FF9800;
+  background: #FF9800;
 }
 
 .conditional-checkmark {
