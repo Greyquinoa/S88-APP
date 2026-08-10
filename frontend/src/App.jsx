@@ -4173,26 +4173,40 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
     } catch { setConnStatus({}); }
   }
 
-  const tabInstances = instances.filter(i => {
-    const p = cmtProfiles.find(x => x.id === i.profileId);
-    return p?.libType === libType;
-  });
+  const tabInstances = useMemo(
+    () => instances.filter(i => {
+      const p = cmtProfiles.find(x => x.id === i.profileId);
+      return p?.libType === libType;
+    }),
+    [instances, cmtProfiles, libType]
+  );
 
-  // Load exported blocks count for each instance.
-  async function loadExportedBlocksCount() {
-    if (!savedProjectId || !tabInstances.length) { setExportedBlocksCount({}); return; }
-    try {
-      const counts = {};
-      for (const inst of tabInstances) {
-        const result = await getExportedBlocks(savedProjectId, inst.instanceName);
-        counts[inst.instanceName] = (result.exported_blocks || []).length;
-      }
-      setExportedBlocksCount(counts);
-    } catch { setExportedBlocksCount({}); }
-  }
+  // Names of the instances whose block counts we need, as a stable string. The
+  // effect below must not depend on the tabInstances array itself: it is rebuilt
+  // on every render, so using it as a dependency re-runs the fetch → setState →
+  // render → new array cycle forever and the counts never settle.
+  const tabInstanceNamesKey = tabInstances.map(i => i.instanceName).join(' ');
 
   useEffect(() => { loadConnStatus(); }, [savedProjectId]); // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(() => { loadExportedBlocksCount(); }, [savedProjectId, tabInstances]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Exported-block counts for the grid's Blocks column, one request per instance.
+  useEffect(() => {
+    const names = tabInstanceNamesKey ? tabInstanceNamesKey.split(' ') : [];
+    if (!savedProjectId || !names.length) { setExportedBlocksCount({}); return; }
+    let cancelled = false;
+    (async () => {
+      const settled = await Promise.allSettled(
+        names.map(n => getExportedBlocks(savedProjectId, n))
+      );
+      if (cancelled) return;
+      const counts = {};
+      settled.forEach((r, idx) => {
+        if (r.status === 'fulfilled') counts[names[idx]] = (r.value.exported_blocks || []).length;
+      });
+      setExportedBlocksCount(counts);
+    })();
+    return () => { cancelled = true; };
+  }, [savedProjectId, tabInstanceNamesKey]); // eslint-disable-line react-hooks/exhaustive-deps
   const showRolePane = libType === "EquipmentModule" || libType === "EquipmentPhase";
 
   const selectedInst = showRolePane ? tabInstances.find(i => i.id === selectedId) : null;
