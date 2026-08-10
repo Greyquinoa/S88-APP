@@ -5303,12 +5303,12 @@ function BlockRow({ block, on, required, onToggle, onToggleConditional }) {
           </label>
         </div>
       )}
-      <div className={`toggle-container ${isConditional || on ? "checked" : ""}`}
+      <div className={`toggle-container ${on && !isConditional ? "checked" : ""}`}
         style={{ opacity: required || isConditional ? 0.5 : 1, pointerEvents: required || isConditional ? "none" : "auto", flexShrink: 0, cursor: required || isConditional ? "default" : "pointer" }}
         onClick={required || isConditional ? undefined : onToggle}>
         <div className="toggle-button"></div>
       </div>
-      <div style={{ flex: 1, minWidth: 0, opacity: on || isConditional ? 1 : 0.55, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+      <div style={{ flex: 1, minWidth: 0, opacity: on ? 1 : 0.55, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <div style={{ minWidth: 0 }}>
           <span style={{ fontSize: 12, fontFamily: "var(--font-sans)", fontWeight: 500,
               color: on ? "#1C1B19" : "var(--color-text-secondary)" }}>{block.name}</span>
@@ -5318,7 +5318,7 @@ function BlockRow({ block, on, required, onToggle, onToggleConditional }) {
           {block.vars?.length || 0}v
         </span>
       </div>
-      <div style={{ display: "flex", gap: 6, opacity: on || isConditional ? 1 : 0.55, flexShrink: 0 }}>
+      <div style={{ display: "flex", gap: 6, opacity: on ? 1 : 0.55, flexShrink: 0 }}>
         <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 6,
             background: required ? "#DBEAFE" : "#F3F4F6",
             color: required ? "#1D4ED8" : "#6B7280", fontWeight: 500 }}>
