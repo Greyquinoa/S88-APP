@@ -5272,10 +5272,13 @@ function BlockRow({ block, on, required, onToggle, onToggleConditional }) {
 
   const handleConditionalToggle = async (e) => {
     e.stopPropagation();
-    if (togglingConditional) return;
+    if (togglingConditional || !onToggleConditional) return;
     setTogglingConditional(true);
     try {
-      await onToggleConditional?.(block.id, !isConditional);
+      await onToggleConditional(block.id, !isConditional);
+    } catch (err) {
+      console.error('Failed to toggle conditional:', err);
+      alert(`Error: ${err.message}`);
     } finally {
       setTogglingConditional(false);
     }
