@@ -5304,7 +5304,8 @@ function BlockRow({ block, on, required, onToggle, onToggleConditional }) {
         </div>
       )}
       <div className={`toggle-container ${on ? "checked" : ""}`}
-        style={{ opacity: required ? 0.5 : 1, pointerEvents: "none", flexShrink: 0 }} onClick={required ? undefined : onToggle}>
+        style={{ opacity: required ? 0.5 : 1, pointerEvents: required ? "none" : "auto", flexShrink: 0, cursor: required ? "default" : "pointer" }}
+        onClick={required ? undefined : onToggle}>
         <div className="toggle-button"></div>
       </div>
       <div style={{ flex: 1, minWidth: 0, opacity: on ? 1 : 0.55, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
