@@ -3276,7 +3276,7 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                           const cmTypeName = member?.cm_type_name;
                           // Try ioRulesCache first (has all blocks including non-valid), then cmtProfiles
                           const cachedRules = ioRulesCache[cmTypeName];
-                          const cmTypeProfile = cmtProfiles.find(p => p.name === cmTypeName);
+                          const cmTypeProfile = cmtProfiles.find(p => p.cmType === cmTypeName);
                           const allBlocks = cachedRules?.blocks || cmTypeProfile?.subBlocks || [];
                           const conditionalBlocks = allBlocks.filter(b => b.isConditional);
                           const memberBlocks = allBlocks.filter(b => b.name !== ioRule.block_name && b.isConditional);

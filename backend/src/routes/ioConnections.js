@@ -28,13 +28,19 @@ router.get('/cm-type/:cmTypeId', async (req, res) => {
       ORDER BY sort_order, id
     `).all(resolvedId);
 
-    // Return block+var options so the frontend can build dropdowns
-    const blocks = await db.prepare(`
-      SELECT b.id, b.name
+    // Return block+var options so the frontend can build dropdowns.
+    // is_conditional is needed by the composite child-block selector, which
+    // only offers blocks the library has marked conditional.
+    const blockRows = await db.prepare(`
+      SELECT b.id, b.name, b.comment, b.is_conditional
       FROM lib_blocks b
       WHERE b.cm_type_id = ?
       ORDER BY b.sort_order, b.id
     `).all(resolvedId);
+    const blocks = blockRows.map(b => ({
+      id: b.id, name: b.name, comment: b.comment,
+      isConditional: !!b.is_conditional,
+    }));
 
     const vars = await db.prepare(`
       SELECT v.id, v.name, v.dir, v.dtype, v.vtype, v.is_valid, b.name AS block_name
