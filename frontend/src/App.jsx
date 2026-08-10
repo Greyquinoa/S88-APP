@@ -5285,15 +5285,9 @@ function BlockRow({ block, on, required, onToggle, onToggleConditional }) {
   };
 
   return (
-    <div onClick={required || isConditional ? undefined : onToggle}
-      style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 0",
+    <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 0",
         borderBottom: isConditional ? "2px solid #FF9800" : "1px solid rgba(28,27,25,0.08)",
-        background: "#FFFFFF",
-        cursor: (required || isConditional) ? "default" : "pointer" }}>
-      <div className={`toggle-container ${on ? "checked" : ""}`}
-        style={{ opacity: (required || isConditional) ? 0.5 : 1, pointerEvents: "none", flexShrink: 0 }}>
-        <div className="toggle-button"></div>
-      </div>
+        background: "#FFFFFF" }}>
       <div style={{ flex: 1, minWidth: 0, opacity: on ? 1 : 0.55, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <div style={{ minWidth: 0 }}>
           <span style={{ fontSize: 12, fontFamily: "var(--font-sans)", fontWeight: 500,
@@ -5304,7 +5298,7 @@ function BlockRow({ block, on, required, onToggle, onToggleConditional }) {
           {block.vars?.length || 0}v
         </span>
       </div>
-      <div style={{ display: "flex", gap: 6, flexShrink: 0, alignItems: "center" }}>
+      <div style={{ display: "flex", gap: 8, flexShrink: 0, alignItems: "center" }}>
         {!required && (
           <div className="conditional-checkbox-container" title={isConditional ? "Block is conditional (child block)" : "Mark as conditional (child block)"}>
             <input
@@ -5320,6 +5314,9 @@ function BlockRow({ block, on, required, onToggle, onToggleConditional }) {
             </label>
           </div>
         )}
+        <div className={`toggle-container ${on ? "checked" : ""}`} style={{ opacity: required ? 0.5 : 1, pointerEvents: required ? "none" : "auto", flexShrink: 0 }} onClick={required ? undefined : onToggle}>
+          <div className="toggle-button"></div>
+        </div>
         <div style={{ display: "flex", gap: 6, opacity: on ? 1 : 0.55 }}>
           <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 6,
               background: required ? "#DBEAFE" : "#F3F4F6",
