@@ -97,32 +97,14 @@ function DeleteCellRenderer(props: { data: InstanceRow; context: { onDelete: (id
   );
 }
 
-// ── Map-signals button cell renderer ──────────────────────────────────────────
-
-function MapSignalsCellRenderer(props: { data: InstanceRow; context: { onMapSignals?: (id: string) => void } }) {
-  if (!props.context.onMapSignals) return null;
-  return (
-    <button
-      className="ig-delete-btn"
-      title="Map signals to variables"
-      onClick={(e) => {
-        e.stopPropagation();
-        props.context.onMapSignals!(props.data.id);
-      }}
-    >
-      <i className="ti ti-plug-connected" aria-hidden="true" />
-      <span className="ig-delete-sr">Map signals</span>
-    </button>
-  );
-}
-
 // ── Connection-status cell renderer ──────────────────────────────────────────
 // Shows how many of an instance's dummy IO signals were matched to hardware by
 // "Generate Connections": green = all bound, amber = some, orange = none, "—" =
 // the instance has no IO rules (nothing to reconcile).
+// Clicking on this badge opens the Parameters modal.
 function ConnStatusCellRenderer(props: {
   data: InstanceRow;
-  context: { connStatusByInstance?: Record<string, { real: number; dummy: number; total: number }> };
+  context: { connStatusByInstance?: Record<string, { real: number; dummy: number; total: number }>; onMapSignals?: (id: string) => void };
 }) {
   const st = props.context.connStatusByInstance?.[props.data.instanceName];
   if (!st || st.total === 0) {
@@ -133,17 +115,22 @@ function ConnStatusCellRenderer(props: {
   const bg = allReal ? "#DCFCE7" : noneReal ? "#FFEDD5" : "#FEF9C3";
   const fg = allReal ? "#166534" : noneReal ? "#9A3412" : "#854D0E";
   return (
-    <span
-      title={`${st.real} of ${st.total} dummy IO signal(s) bound to hardware · ${st.dummy} unmatched`}
+    <button
+      onClick={(e) => {
+        e.stopPropagation();
+        props.context.onMapSignals?.(props.data.id);
+      }}
+      title={`${st.real} of ${st.total} dummy IO signal(s) bound to hardware · ${st.dummy} unmatched · Click to open Parameters`}
       style={{
         display: "inline-flex", alignItems: "center", gap: 4,
         background: bg, color: fg, fontSize: 11, fontWeight: 600,
         padding: "2px 8px", borderRadius: 10, whiteSpace: "nowrap",
+        border: "none", cursor: "pointer", fontFamily: "inherit",
       }}
     >
       <i className={`ti ${allReal ? "ti-plug-connected" : "ti-plug-connected-x"}`} aria-hidden="true" />
       {st.real}/{st.total}
-    </span>
+    </button>
   );
 }
 
@@ -434,21 +421,6 @@ export default function InstancesGrid({
         hide: !connStatusByInstance,
         cellRenderer: ConnStatusCellRenderer,
         cellStyle: { display: "flex", alignItems: "center", justifyContent: "center" },
-        suppressHeaderMenuButton: true,
-      },
-      {
-        headerName: "",
-        colId: "mapSignals",
-        sortable: false,
-        filter: false,
-        resizable: false,
-        editable: false,
-        width: 48,
-        maxWidth: 48,
-        pinned: "right" as const,
-        hide: !onMapSignals,
-        cellRenderer: MapSignalsCellRenderer,
-        cellStyle: { display: "flex", alignItems: "center", justifyContent: "center", padding: 0 },
         suppressHeaderMenuButton: true,
       },
       {
