@@ -5311,7 +5311,11 @@ function BlockRow({ block, on, required, onToggle, onToggleConditional }) {
       <div style={{ flex: 1, minWidth: 0, opacity: on ? 1 : 0.55, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <div style={{ minWidth: 0 }}>
           <span style={{ fontSize: 12, fontFamily: "var(--font-sans)", fontWeight: 500,
-              color: on ? "#1C1B19" : "var(--color-text-secondary)" }}>{block.name}</span>
+              color: on ? "#1C1B19" : "var(--color-text-secondary)",
+              background: isConditional ? "#FFF3E0" : "transparent",
+              padding: isConditional ? "2px 6px" : "0",
+              borderRadius: isConditional ? "4px" : "0",
+              border: isConditional ? "1px solid #FFD699" : "none" }}>{block.name}</span>
           {block.comment && <span style={{ fontSize: 11, color: "#6B6862", marginLeft: 6 }}>{block.comment}</span>}
         </div>
         <span style={{ fontSize: 11, color: "var(--color-text-secondary)", whiteSpace: "nowrap", marginLeft: 12 }}>
