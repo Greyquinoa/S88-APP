@@ -4156,6 +4156,7 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
   const [exportPreview, setExportPreview] = useState(null); // instance for export preview { projectId, instanceName, cmTypeName }
   const [connResult, setConnResult] = useState(null); // last "Generate Connections" outcome
   const [connStatus, setConnStatus] = useState({});   // instanceName → { real, dummy, total }
+  const [exportedBlocksCount, setExportedBlocksCount] = useState({});   // instanceName → block count
 
   // Load per-instance reconciliation counts for the grid's Connections column.
   async function loadConnStatus() {
@@ -4171,7 +4172,22 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
         setConnStatus(byInst);
     } catch { setConnStatus({}); }
   }
+
+  // Load exported blocks count for each instance.
+  async function loadExportedBlocksCount() {
+    if (!savedProjectId) { setExportedBlocksCount({}); return; }
+    try {
+      const counts = {};
+      for (const inst of tabInstances) {
+        const result = await getExportedBlocks(savedProjectId, inst.instanceName);
+        counts[inst.instanceName] = (result.exported_blocks || []).length;
+      }
+      setExportedBlocksCount(counts);
+    } catch { setExportedBlocksCount({}); }
+  }
+
   useEffect(() => { loadConnStatus(); }, [savedProjectId]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { loadExportedBlocksCount(); }, [savedProjectId, instances]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const tabInstances = instances.filter(i => {
     const p = cmtProfiles.find(x => x.id === i.profileId);
@@ -4284,6 +4300,7 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
               }
             } : undefined}
             connStatusByInstance={savedProjectId ? connStatus : undefined}
+            exportedBlocksCountByInstance={savedProjectId ? exportedBlocksCount : undefined}
             reconciliationDataByInstance={savedProjectId ? reconData : undefined}
             onViewExportedBlocks={savedProjectId ? (id) => {
               const inst = tabInstances.find(i => i.id === id);

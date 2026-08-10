@@ -71,6 +71,9 @@ interface InstancesGridProps {
   connStatusByInstance?: Record<string, { real: number; dummy: number; total: number }>;
   /** Per-instance reconciliation status keyed by instanceName. When provided, a
    *  "Status" column shows the reconciliation state (OK, IMPORTED_OK, DUMMY, etc.) */
+  /** Per-instance exported blocks count keyed by instanceName. When provided, shows
+   *  the count of blocks that will be emitted in XML after cascade and optional filtering. */
+  exportedBlocksCountByInstance?: Record<string, number>;
   reconciliationDataByInstance?: Record<string, {
     status: 'OK' | 'IMPORTED_OK' | 'DUMMY' | 'DUMMY_ACCEPTED' | 'ERROR' | 'PENDING';
     isImported: boolean;
@@ -180,6 +183,23 @@ function ExportPreviewCellRenderer(props: {
   );
 }
 
+// ── Exported blocks count cell renderer ────────────────────────────────────────
+// Display the count of exported blocks for an instance.
+function ExportedBlocksCountRenderer(props: {
+  data: InstanceRow;
+  context: { exportedBlocksCountByInstance?: Record<string, number> };
+}) {
+  const count = props.context.exportedBlocksCountByInstance?.[props.data.instanceName];
+  if (!count) {
+    return <span style={{ color: "#9CA3AF", fontSize: 12 }}>—</span>;
+  }
+  return (
+    <span style={{ fontSize: 12, fontWeight: 600, color: "#0F766E" }}>
+      {count}
+    </span>
+  );
+}
+
 // ── Imported checkbox cell renderer ──────────────────────────────────────────
 
 function ImportedCheckboxRenderer(props: { data: InstanceRow }) {
@@ -249,6 +269,7 @@ export default function InstancesGrid({
   onViewExportedBlocks,
   onGenerateConnections,
   connStatusByInstance,
+  exportedBlocksCountByInstance,
   reconciliationDataByInstance,
 }: InstancesGridProps) {
   const gridRef = useRef<AgGridReact<InstanceRow>>(null);
@@ -471,6 +492,20 @@ export default function InstancesGrid({
         suppressHeaderMenuButton: true,
       },
       {
+        headerName: "Blocks",
+        colId: "exportedBlocksCount",
+        editable: false,
+        sortable: true,
+        filter: false,
+        floatingFilter: false,
+        resizable: true,
+        minWidth: 80,
+        flex: 0.6,
+        cellRenderer: ExportedBlocksCountRenderer,
+        cellStyle: { display: "flex", alignItems: "center", justifyContent: "center" },
+        suppressHeaderMenuButton: true,
+      },
+      {
         headerName: "",
         colId: "exportPreview",
         sortable: false,
@@ -499,7 +534,7 @@ export default function InstancesGrid({
         suppressHeaderMenuButton: true,
       },
     ],
-    [typeValues, userProjectValues, folderValues, folderLabels, cmtProfiles, folderOptions.length, onMapSignals, onViewExportedBlocks, folderLabels, connStatusByInstance, reconciliationDataByInstance]
+    [typeValues, userProjectValues, folderValues, folderLabels, cmtProfiles, folderOptions.length, onMapSignals, onViewExportedBlocks, folderLabels, connStatusByInstance, exportedBlocksCountByInstance, reconciliationDataByInstance]
   );
 
   // Detect duplicate instance names for cell styling
@@ -527,8 +562,8 @@ export default function InstancesGrid({
   );
 
   const context = useMemo(
-    () => ({ onDelete: onRowDelete, duplicateNames, onMapSignals, onViewExportedBlocks, connStatusByInstance, reconciliationDataByInstance }),
-    [onRowDelete, duplicateNames, onMapSignals, onViewExportedBlocks, connStatusByInstance, reconciliationDataByInstance]
+    () => ({ onDelete: onRowDelete, duplicateNames, onMapSignals, onViewExportedBlocks, connStatusByInstance, exportedBlocksCountByInstance, reconciliationDataByInstance }),
+    [onRowDelete, duplicateNames, onMapSignals, onViewExportedBlocks, connStatusByInstance, exportedBlocksCountByInstance, reconciliationDataByInstance]
   );
 
   const defaultColDef = useMemo<ColDef>(
