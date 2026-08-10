@@ -152,4 +152,96 @@ router.get('/matrix-override/:projectId', async (req, res) => {
   } catch (e) { err(res, 500, e.message); }
 });
 
+// ── GET /api/connections/:projectId/:instanceName/exported-blocks ──────────────
+// List blocks that are exported (emitted in XML) for an instance.
+// Returns blocks that passed cascade + optional filters.
+router.get('/:projectId/:instanceName/exported-blocks', async (req, res) => {
+  try {
+    const db = getDb();
+    const projectId = parseInt(req.params.projectId, 10);
+    const instanceName = (req.params.instanceName || '').trim();
+
+    if (!instanceName) return err(res, 400, 'instanceName required');
+
+    // Fetch the instance and its CM type
+    const inst = await db.prepare(
+      `SELECT i.id, i.profile_id, c.id AS cm_type_id
+       FROM project_instances i
+       JOIN lib_cm_types c ON c.name = i.profile_id
+       WHERE i.project_id = ? AND i.name = ?`
+    ).get(projectId, instanceName);
+    if (!inst) return err(res, 404, 'Instance not found');
+
+    // Fetch all blocks in the CM type
+    const blocks = await db.prepare(
+      `SELECT id, name, optional FROM lib_blocks WHERE cm_type_id = ? ORDER BY sort_order`
+    ).all(inst.cm_type_id);
+
+    // Fetch instance_ios to determine which blocks have real pins
+    const ios = await db.prepare(
+      `SELECT DISTINCT block_name, status, required FROM instance_ios
+       WHERE project_id = ? AND instance_name = ?`
+    ).all(projectId, instanceName);
+
+    // Fetch instance connections to check cascade status
+    const connRow = await db.prepare(
+      `SELECT connections FROM project_instances WHERE id = ?`
+    ).get(inst.id);
+    const connections = connRow?.connections ? JSON.parse(connRow.connections) : [];
+
+    // Build childToParents map from connections
+    const childToParents = {};
+    connections.forEach(c => {
+      if (c.conn_type === 'io_connection' && c.childBlocks) {
+        c.childBlocks.forEach(child => {
+          childToParents[child] = childToParents[child] || [];
+          if (!childToParents[child].includes(c.block_name)) {
+            childToParents[child].push(c.block_name);
+          }
+        });
+      }
+    });
+
+    // Compute omitted blocks (required-unmatched)
+    const omittedByRule = new Set();
+    ios.forEach(io => {
+      if (io.required && io.status === 'dummy') {
+        omittedByRule.add(io.block_name);
+      }
+    });
+
+    // Cascade: if all parents are omitted, child is cascaded
+    const cascadedBlocks = new Set();
+    let changed = true;
+    while (changed) {
+      changed = false;
+      Object.entries(childToParents).forEach(([child, parents]) => {
+        if (!cascadedBlocks.has(child) && parents.every(p => omittedByRule.has(p) || cascadedBlocks.has(p))) {
+          cascadedBlocks.add(child);
+          changed = true;
+        }
+      });
+    }
+
+    // Build exported list: blocks that are NOT omitted and NOT cascaded
+    const exported = blocks
+      .filter(b => !omittedByRule.has(b.name) && !cascadedBlocks.has(b.name))
+      .map(b => {
+        const ioEntry = ios.find(io => io.block_name === b.name);
+        return {
+          block_name: b.name,
+          optional: !!b.optional,
+          status: ioEntry?.status || 'unknown',
+          var_count: 0, // Could fetch from lib_variables if needed
+        };
+      });
+
+    res.json({
+      instance_name: instanceName,
+      exported_blocks: exported,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (e) { err(res, 500, e.message); }
+});
+
 module.exports = router;

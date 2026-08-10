@@ -686,6 +686,9 @@ export async function getMappableSignals(projectId, { q = '', type = '', limit =
 export async function generateConnections(projectId) {
   return request('POST', `/connections/project/${projectId}/generate`);
 }
+export async function getExportedBlocks(projectId, instanceName) {
+  return request('GET', `/connections/${projectId}/${encodeURIComponent(instanceName)}/exported-blocks`);
+}
 export async function getConnectionIOs(projectId, status) {
   const qs = status ? `?status=${encodeURIComponent(status)}` : '';
   return request('GET', `/connections/project/${projectId}${qs}`);

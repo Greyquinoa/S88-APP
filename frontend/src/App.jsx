@@ -28,6 +28,7 @@ import ReconciliationOverviewModal from "./ReconciliationOverviewModal.jsx";
 import StepHWConfig from "./StepHWConfig.jsx";
 import InstancesGrid from "./InstancesGrid.tsx";
 import SignalMappingModal from "./SignalMappingModal.jsx";
+import ExportPreviewModal from "./ExportPreviewModal.jsx";
 import UnitConnectionsEditor from "./UnitConnectionsEditor.jsx";
 import LibraryImportReview from "./LibraryImportReview.jsx";
 import UnitTypeImportModal from "./UnitTypeImportModal.jsx";
@@ -4146,6 +4147,7 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
     reconData, setReconData, reconModal, setReconModal, reconSummary, setReconSummary }) {
   const [selectedId, setSelectedId] = useState(null);
   const [mapInst, setMapInst] = useState(null);   // instance whose signal-mapping modal is open
+  const [exportPreview, setExportPreview] = useState(null); // instance for export preview { projectId, instanceName, cmTypeName }
   const [connResult, setConnResult] = useState(null); // last "Generate Connections" outcome
   const [connStatus, setConnStatus] = useState({});   // instanceName → { real, dummy, total }
 
@@ -4277,6 +4279,16 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
             } : undefined}
             connStatusByInstance={savedProjectId ? connStatus : undefined}
             reconciliationDataByInstance={savedProjectId ? reconData : undefined}
+            onViewExportedBlocks={savedProjectId ? (id) => {
+              const inst = tabInstances.find(i => i.id === id);
+              if (inst) {
+                setExportPreview({
+                  projectId: savedProjectId,
+                  instanceName: inst.name,
+                  cmTypeName: inst.profileId
+                });
+              }
+            } : undefined}
           />
         </div>
 
@@ -4301,6 +4313,19 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
                 ));
               }
               setMapInst(null);
+            }}
+          />
+        )}
+
+        {exportPreview && (
+          <ExportPreviewModal
+            projectId={exportPreview.projectId}
+            instanceName={exportPreview.instanceName}
+            cmTypeName={exportPreview.cmTypeName}
+            onClose={() => setExportPreview(null)}
+            onOpenParameters={() => {
+              setMapInst(instances.find(i => i.name === exportPreview.instanceName && i.projectId === exportPreview.projectId) || null);
+              setExportPreview(null);
             }}
           />
         )}
