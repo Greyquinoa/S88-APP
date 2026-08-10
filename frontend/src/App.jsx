@@ -768,6 +768,18 @@ export default function App() {
                     b.id === blockId ? { ...b, isConditional } : b
                   )};
                 }));
+                // Also update ioRulesCache so child block selector sees the change
+                setIoRulesCache(prev => {
+                  const updated = { ...prev };
+                  Object.keys(updated).forEach(cmTypeName => {
+                    if (updated[cmTypeName]?.blocks) {
+                      updated[cmTypeName].blocks = updated[cmTypeName].blocks.map(b =>
+                        b.id === blockId ? { ...b, isConditional } : b
+                      );
+                    }
+                  });
+                  return updated;
+                });
               }}
               onVarDefaultChange={(cmTypeName, varId, newVal) => {
                 setProfiles(prev => prev.map(p => {
