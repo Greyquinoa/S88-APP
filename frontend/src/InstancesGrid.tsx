@@ -71,9 +71,6 @@ interface InstancesGridProps {
   connStatusByInstance?: Record<string, { real: number; dummy: number; total: number }>;
   /** Per-instance reconciliation status keyed by instanceName. When provided, a
    *  "Status" column shows the reconciliation state (OK, IMPORTED_OK, DUMMY, etc.) */
-  /** Per-instance exported blocks count keyed by instanceName. When provided, shows
-   *  the count of blocks that will be emitted in XML after cascade and optional filtering. */
-  exportedBlocksCountByInstance?: Record<string, number>;
   reconciliationDataByInstance?: Record<string, {
     status: 'OK' | 'IMPORTED_OK' | 'DUMMY' | 'DUMMY_ACCEPTED' | 'ERROR' | 'PENDING';
     isImported: boolean;
@@ -158,36 +155,28 @@ function ConnStatusCellRenderer(props: {
   );
 }
 
-// ── Exported blocks count cell renderer ────────────────────────────────────────
-// Display the count of exported blocks with a preview icon below.
-function ExportedBlocksCountRenderer(props: {
+// ── Export preview cell renderer ────────────────────────────────────────────────
+// Button to view exported blocks for an instance.
+function ExportPreviewCellRenderer(props: {
   data: InstanceRow;
-  context: { exportedBlocksCountByInstance?: Record<string, number>; onViewExportedBlocks?: (id: string) => void };
+  context: { onViewExportedBlocks?: (id: string) => void };
 }) {
-  const count = props.context.exportedBlocksCountByInstance?.[props.data.instanceName];
-  if (!count) {
-    return <span style={{ color: "#9CA3AF", fontSize: 12 }}>—</span>;
-  }
+  if (!props.context.onViewExportedBlocks) return null;
   return (
-    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}>
-      <span style={{ fontSize: 12, fontWeight: 600, color: "#0F766E" }}>
-        {count}
-      </span>
-      <button
-        onClick={(e) => {
-          e.stopPropagation();
-          props.context.onViewExportedBlocks?.(props.data.id);
-        }}
-        title="View exported blocks"
-        style={{
-          border: "none", background: "transparent", cursor: "pointer",
-          color: "#059669", fontSize: 14, padding: "2px 4px", display: "flex",
-          alignItems: "center", justifyContent: "center"
-        }}
-      >
-        <i className="ti ti-layout-list" aria-hidden="true" />
-      </button>
-    </div>
+    <button
+      onClick={(e) => {
+        e.stopPropagation();
+        props.context.onViewExportedBlocks!(props.data.id);
+      }}
+      title="View exported blocks"
+      style={{
+        border: "none", background: "transparent", cursor: "pointer",
+        color: "#059669", fontSize: 14, padding: "2px 4px", display: "flex",
+        alignItems: "center", justifyContent: "center"
+      }}
+    >
+      <i className="ti ti-layout-list" aria-hidden="true" />
+    </button>
   );
 }
 
@@ -260,7 +249,6 @@ export default function InstancesGrid({
   onViewExportedBlocks,
   onGenerateConnections,
   connStatusByInstance,
-  exportedBlocksCountByInstance,
   reconciliationDataByInstance,
 }: InstancesGridProps) {
   const gridRef = useRef<AgGridReact<InstanceRow>>(null);
@@ -484,15 +472,15 @@ export default function InstancesGrid({
       },
       {
         headerName: "Blocks",
-        colId: "exportedBlocksCount",
-        editable: false,
-        sortable: true,
+        colId: "exportPreview",
+        sortable: false,
         filter: false,
         floatingFilter: false,
         resizable: true,
+        editable: false,
         minWidth: 80,
         flex: 0.6,
-        cellRenderer: ExportedBlocksCountRenderer,
+        cellRenderer: ExportPreviewCellRenderer,
         cellStyle: { display: "flex", alignItems: "center", justifyContent: "center" },
         suppressHeaderMenuButton: true,
       },
@@ -511,7 +499,7 @@ export default function InstancesGrid({
         suppressHeaderMenuButton: true,
       },
     ],
-    [typeValues, userProjectValues, folderValues, folderLabels, cmtProfiles, folderOptions.length, onMapSignals, onViewExportedBlocks, folderLabels, connStatusByInstance, exportedBlocksCountByInstance, reconciliationDataByInstance]
+    [typeValues, userProjectValues, folderValues, folderLabels, cmtProfiles, folderOptions.length, onMapSignals, onViewExportedBlocks, folderLabels, connStatusByInstance, reconciliationDataByInstance]
   );
 
   // Detect duplicate instance names for cell styling
@@ -539,8 +527,8 @@ export default function InstancesGrid({
   );
 
   const context = useMemo(
-    () => ({ onDelete: onRowDelete, duplicateNames, onMapSignals, onViewExportedBlocks, connStatusByInstance, exportedBlocksCountByInstance, reconciliationDataByInstance }),
-    [onRowDelete, duplicateNames, onMapSignals, onViewExportedBlocks, connStatusByInstance, exportedBlocksCountByInstance, reconciliationDataByInstance]
+    () => ({ onDelete: onRowDelete, duplicateNames, onMapSignals, onViewExportedBlocks, connStatusByInstance, reconciliationDataByInstance }),
+    [onRowDelete, duplicateNames, onMapSignals, onViewExportedBlocks, connStatusByInstance, reconciliationDataByInstance]
   );
 
   const defaultColDef = useMemo<ColDef>(
