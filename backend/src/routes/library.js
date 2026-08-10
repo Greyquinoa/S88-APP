@@ -491,7 +491,7 @@ router.get('/:name/blocks', async (req, res) => {
       roles: roles.map(r => r.role),
       roleKindMap,
       subBlocks: blocks.map(b => ({
-        id: b.id, name: b.name, comment: b.comment, optional: !!b.optional,
+        id: b.id, name: b.name, comment: b.comment, optional: !!b.optional, isConditional: !!b.is_conditional,
         vars: varsByBlock[b.id] || [],
         msgs: msgsByBlock[b.id] || [],
       })),
@@ -528,6 +528,26 @@ router.put('/:name/block-prefs', async (req, res) => {
         enabled_blocks = excluded.enabled_blocks,
         updated_at = NOW()
     `).run(req.params.name, JSON.stringify(enabledBlocks));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── PATCH /api/lib-blocks/:blockId/conditional — Toggle conditional flag on a block ──
+router.patch('/block/:blockId/conditional', async (req, res) => {
+  try {
+    const db = getDb();
+    const { isConditional } = req.body || {};
+
+    const block = await db.prepare('SELECT id FROM lib_blocks WHERE id = ?').get(req.params.blockId);
+    if (!block) return res.status(404).json({ error: 'Block not found' });
+
+    await db.prepare('UPDATE lib_blocks SET is_conditional = ? WHERE id = ?').run(
+      isConditional ? 1 : 0,
+      req.params.blockId
+    );
+
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });

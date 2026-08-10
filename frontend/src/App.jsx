@@ -5,7 +5,7 @@ import { AllCommunityModule, ModuleRegistry, themeQuartz } from "ag-grid-communi
 ModuleRegistry.registerModules([AllCommunityModule]);
 import {
   getLibraryStatus, previewLibraryUpload, computeLibraryDiff, importLibrary,
-  getCmTypes, getCmTypeBlocks, getCmTypeBlockPrefs, saveCmTypeBlockPrefs, patchVarDefault, patchVarValid,
+  getCmTypes, getCmTypeBlocks, getCmTypeBlockPrefs, saveCmTypeBlockPrefs, patchVarDefault, patchVarValid, toggleBlockConditional,
   generateXML, generateXMLStream, getHistory,
   listProjects, getProject, saveProject, deleteProject,
   deleteCmType,
@@ -760,6 +760,15 @@ export default function App() {
               cmtProfiles={cmtProfiles} ensureLoaded={ensureBlocksLoaded} toggleBlock={toggleBlock}
               onDelete={handleDeleteCmType}
               onCompositesChange={loadCompositeCmTypesList}
+              onToggleConditional={async (blockId, isConditional) => {
+                await toggleBlockConditional(blockId, isConditional);
+                setProfiles(prev => prev.map(p => {
+                  if (!p.subBlocks) return p;
+                  return { ...p, subBlocks: p.subBlocks.map(b =>
+                    b.id === blockId ? { ...b, isConditional } : b
+                  )};
+                }));
+              }}
               onVarDefaultChange={(cmTypeName, varId, newVal) => {
                 setProfiles(prev => prev.map(p => {
                   if (p.id !== cmTypeName || !p.subBlocks) return p;
@@ -1307,7 +1316,7 @@ const LIBRARY_SUBTABS = [
   { key: "commands",  label: "Mode Commands"        },
 ];
 
-function StepLibrary({ libStatus, loading, onUpload, cmtProfiles, ensureLoaded, toggleBlock, onDelete, onVarDefaultChange, onVarValidChange, onCompositesChange, valveCommands, onValveCommandsChange }) {
+function StepLibrary({ libStatus, loading, onUpload, cmtProfiles, ensureLoaded, toggleBlock, onDelete, onVarDefaultChange, onVarValidChange, onCompositesChange, onToggleConditional, valveCommands, onValveCommandsChange }) {
   const [libSubTab, setLibSubTab] = useState("upload");
 
   return (
@@ -1337,6 +1346,7 @@ function StepLibrary({ libStatus, loading, onUpload, cmtProfiles, ensureLoaded, 
           <CmtPanel
             cmtProfiles={cmtProfiles} ensureLoaded={ensureLoaded}
             toggleBlock={toggleBlock} onDelete={onDelete}
+            onToggleConditional={onToggleConditional}
             onVarDefaultChange={onVarDefaultChange}
             onVarValidChange={onVarValidChange} />
         )}
@@ -1404,7 +1414,7 @@ const DETAIL_TABS = [
   { key: "outputs", label: "Outputs" },
 ];
 
-function CmtPanel({ cmtProfiles, ensureLoaded, toggleBlock, onDelete, onVarDefaultChange, onVarValidChange }) {
+function CmtPanel({ cmtProfiles, ensureLoaded, toggleBlock, onDelete, onVarDefaultChange, onVarValidChange, onToggleConditional }) {
   const [search, setSearch]         = useState("");
   const [libTab, setLibTab]         = useState("all");
   const [selected, setSelected]     = useState(cmtProfiles[0]?.id || "");
@@ -1596,11 +1606,11 @@ function CmtPanel({ cmtProfiles, ensureLoaded, toggleBlock, onDelete, onVarDefau
                         {profile.comment}{profile.samplingTime ? ` · ${profile.samplingTime} ms` : ""}
                       </div>
                       <SLabel text={`Required (${reqBlocks.length})`} />
-                      {reqBlocks.map(b => <BlockRow key={b.name} block={b} on={true} required={true} onToggle={() => {}} />)}
+                      {reqBlocks.map(b => <BlockRow key={b.name} block={b} on={true} required={true} onToggle={() => {}} onToggleConditional={onToggleConditional} />)}
                       <SLabel text={`Optional (${optBlocks.length})`} top />
                       {optBlocks.map(b => (
                         <BlockRow key={b.name} block={b} on={profile.enabledBlocks?.includes(b.name)}
-                          required={false} onToggle={() => toggleBlock(profile.id, b.name)} />
+                          required={false} onToggle={() => toggleBlock(profile.id, b.name)} onToggleConditional={onToggleConditional} />
                       ))}
                     </>
                   )}
@@ -3256,7 +3266,8 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                           const cachedRules = ioRulesCache[cmTypeName];
                           const cmTypeProfile = cmtProfiles.find(p => p.name === cmTypeName);
                           const allBlocks = cachedRules?.blocks || cmTypeProfile?.subBlocks || [];
-                          const memberBlocks = allBlocks.filter(b => b.name !== ioRule.block_name);
+                          const conditionalBlocks = allBlocks.filter(b => b.isConditional);
+                          const memberBlocks = allBlocks.filter(b => b.name !== ioRule.block_name && b.isConditional);
                           const currentChildBlocks = ioRule.childBlocks || [];
 
                           return (
@@ -3291,7 +3302,9 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                                     borderTop: "1px solid var(--color-border-tertiary)", paddingTop: 12 }}>
                                   {memberBlocks.length === 0 ? (
                                     <div style={{ fontSize: 12, color: "var(--color-text-secondary)", padding: "8px 0" }}>
-                                      No other blocks in this CM type.
+                                      {conditionalBlocks.length === 0
+                                        ? "No blocks marked as conditional in this CM type. Mark blocks as conditional in Library → Type Configuration."
+                                        : "No other conditional blocks in this CM type."}
                                     </div>
                                   ) : (
                                     memberBlocks.map(block => (
@@ -5253,13 +5266,29 @@ function SLabel({ text, top }) {
     textTransform: "uppercase", letterSpacing: "0.14em", margin: `${top ? "1.5rem" : 0} 0 12px` }}>{text}</div>;
 }
 
-function BlockRow({ block, on, required, onToggle }) {
+function BlockRow({ block, on, required, onToggle, onToggleConditional }) {
+  const isConditional = block.isConditional;
+  const [togglingConditional, setTogglingConditional] = React.useState(false);
+
+  const handleConditionalToggle = async (e) => {
+    e.stopPropagation();
+    if (togglingConditional) return;
+    setTogglingConditional(true);
+    try {
+      await onToggleConditional?.(block.id, !isConditional);
+    } finally {
+      setTogglingConditional(false);
+    }
+  };
+
   return (
-    <div onClick={required ? undefined : onToggle}
+    <div onClick={required || isConditional ? undefined : onToggle}
       style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 0",
-        borderBottom: "1px solid rgba(28,27,25,0.08)", background: "#FFFFFF",
-        cursor: required ? "default" : "pointer" }}>
-      <div className={`toggle-container ${on ? "checked" : ""}`} style={{ opacity: required ? 0.5 : 1, pointerEvents: "none", flexShrink: 0 }}>
+        borderBottom: isConditional ? "2px solid #FF9800" : "1px solid rgba(28,27,25,0.08)",
+        background: "#FFFFFF",
+        cursor: (required || isConditional) ? "default" : "pointer" }}>
+      <div className={`toggle-container ${on ? "checked" : ""}`}
+        style={{ opacity: (required || isConditional) ? 0.5 : 1, pointerEvents: "none", flexShrink: 0 }}>
         <div className="toggle-button"></div>
       </div>
       <div style={{ flex: 1, minWidth: 0, opacity: on ? 1 : 0.55 }}>
@@ -5267,14 +5296,38 @@ function BlockRow({ block, on, required, onToggle }) {
             color: on ? "#1C1B19" : "var(--color-text-secondary)" }}>{block.name}</span>
         {block.comment && <span style={{ fontSize: 11, color: "#6B6862", marginLeft: 6 }}>{block.comment}</span>}
       </div>
-      <div style={{ display: "flex", gap: 6, flexShrink: 0, opacity: on ? 1 : 0.55 }}>
-        <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 6,
-            background: required ? "#DBEAFE" : "#F3F4F6",
-            color: required ? "#1D4ED8" : "#6B7280", fontWeight: 500 }}>
-          {required ? "req" : "opt"}
-        </span>
-        {block.msgs?.length > 0 && <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 6, background: "#FEF3C7", color: "#92400E", fontWeight: 500 }}>{block.msgs.length}msg</span>}
-        <span style={{ fontSize: 10, color: "#6B6862" }}>{block.vars?.length || 0}v</span>
+      <div style={{ display: "flex", gap: 6, flexShrink: 0, alignItems: "center" }}>
+        <button
+          onClick={handleConditionalToggle}
+          disabled={togglingConditional}
+          title={isConditional ? "This block is conditional (remove to use as optional)" : "Mark as conditional (child block)"}
+          style={{
+            padding: "4px 8px",
+            borderRadius: 4,
+            border: isConditional ? "2px solid #FF9800" : "1px solid #E5E7EB",
+            background: isConditional ? "#FFF3E0" : "#F9FAFB",
+            color: isConditional ? "#FF9800" : "#6B7280",
+            fontSize: 10,
+            fontWeight: 500,
+            cursor: togglingConditional ? "wait" : "pointer",
+            transition: "all 0.2s",
+            flexShrink: 0,
+            display: "flex",
+            alignItems: "center",
+            gap: 4,
+          }}>
+          <i className="ti ti-git-branch" style={{ fontSize: 9 }} />
+          {isConditional ? "Conditional" : "Make Conditional"}
+        </button>
+        <div style={{ display: "flex", gap: 6, opacity: on ? 1 : 0.55 }}>
+          <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 6,
+              background: required ? "#DBEAFE" : "#F3F4F6",
+              color: required ? "#1D4ED8" : "#6B7280", fontWeight: 500 }}>
+            {required ? "req" : "opt"}
+          </span>
+          {block.msgs?.length > 0 && <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 6, background: "#FEF3C7", color: "#92400E", fontWeight: 500 }}>{block.msgs.length}msg</span>}
+          <span style={{ fontSize: 10, color: "#6B6862" }}>{block.vars?.length || 0}v</span>
+        </div>
       </div>
     </div>
   );

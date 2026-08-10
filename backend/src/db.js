@@ -1320,6 +1320,9 @@ async function ensureSchema() {
   await addColumnIfMissing('instance_ios', 'required', 'required BOOLEAN NOT NULL DEFAULT TRUE');
   await addColumnIfMissing('instance_ios', 'cascade_status', `cascade_status TEXT CHECK(cascade_status IN ('cascaded_from_parent'))`);
 
+  // Migration: add is_conditional flag to lib_blocks for conditional block marking
+  await addColumnIfMissing('lib_blocks', 'is_conditional', 'is_conditional INT NOT NULL DEFAULT 0');
+
   // Migration: add source column to project_instances.
   await addColumnIfMissing('project_instances', 'source', `source TEXT NOT NULL DEFAULT 'manual'`);
 
