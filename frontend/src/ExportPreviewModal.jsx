@@ -111,16 +111,6 @@ export default function ExportPreviewModal({ projectId, instanceName, cmTypeName
               Refresh
             </button>
           )}
-          {onOpenParameters && (
-            <button onClick={onOpenParameters}
-              style={{
-                padding: "6px 12px", borderRadius: "var(--border-radius-md)",
-                border: "none", background: "var(--color-accent)", color: "white",
-                cursor: "pointer", fontSize: 12, fontWeight: 600
-              }}>
-              Open Parameters
-            </button>
-          )}
           <button onClick={onClose}
             style={{
               padding: "6px 12px", borderRadius: "var(--border-radius-md)",
