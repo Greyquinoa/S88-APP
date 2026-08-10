@@ -6,6 +6,7 @@ const { getDb } = require('../db');
 const { parseCfg, parseCfgDevices } = require('../services/cfgParser');
 const { parseHwExcel, parseRawExcelRows, suggestColumnMappingByLevenshtein }  = require('../services/hwExcelParser');
 const { allocateAddresses, findTemplate, defaultIdentifiers } = require('../services/hwAddressEngine');
+const { buildAllocatedStations } = require('../services/slotAddressMap');
 const { generateCfg, hexToIp } = require('../services/cfgGenerator');
 const { parseCfgForCatalogue } = require('../services/cfgCatalogueParser');
 const { parseMrpConfig } = require('../services/mrpCfgParser');
@@ -1673,56 +1674,11 @@ router.get('/imports/:id/preview-addresses', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id, 10);
-    const hwImport = await db.prepare('SELECT id, baseline_cfg FROM hw_imports WHERE id=?').get(importId);
+    const hwImport = await db.prepare('SELECT id FROM hw_imports WHERE id=?').get(importId);
     if (!hwImport) return err(res, 404, 'HW import not found');
 
-    const signals = await db.prepare(
-      `SELECT station_address, station_name, ip_address, router_address, subsystem_no,
-              slot, module_order_no, pip_no, pa_profile
-       FROM hw_signals
-       WHERE hw_import_id=? AND module_order_no != 'PLACEHOLDER'
-       ORDER BY station_address, slot`
-    ).all(importId);
-
-    const tplRows    = await db.prepare('SELECT * FROM hw_module_templates').all();
-    const templateMap = new Map(tplRows.map(t => [t.order_no, t]));
-
-    // Load per-subslot PA profile assignments
-    const subslotRows = await db.prepare(
-      'SELECT station_address, slot, subslot_no, pa_profile FROM hw_slot_subslots WHERE hw_import_id=? ORDER BY station_address, slot, subslot_no'
-    ).all(importId);
-    const subslotMap = new Map();
-    for (const r of subslotRows) {
-      const key = `${r.station_address}:${r.slot}`;
-      if (!subslotMap.has(key)) subslotMap.set(key, []);
-      subslotMap.get(key).push({ subslotNo: r.subslot_no, paProfile: r.pa_profile || null });
-    }
-
-    const stations = new Map();
-    for (const sig of signals) {
-      const addr = sig.station_address;
-      if (!stations.has(addr)) {
-        stations.set(addr, { address: addr, name: sig.station_name, ip: sig.ip_address,
-          routerAddress: sig.router_address || null, subsystemNo: sig.subsystem_no, slots: new Map() });
-      }
-      if (!stations.get(addr).slots.has(sig.slot)) {
-        stations.get(addr).slots.set(sig.slot, {
-          slot: sig.slot, orderNo: sig.module_order_no, pipNo: sig.pip_no != null ? sig.pip_no : null,
-          paProfile: sig.pa_profile || null,
-          subslots: subslotMap.get(`${addr}:${sig.slot}`) || [],
-          channels: [],
-        });
-      }
-    }
-
-    let maxIn = -1, maxOut = -1;
-    if (hwImport.baseline_cfg) {
-      const parsed = parseCfg(hwImport.baseline_cfg);
-      maxIn  = parsed.existingAddresses.maxInput;
-      maxOut = parsed.existingAddresses.maxOutput;
-    }
-
-    allocateAddresses(stations, templateMap, maxIn, maxOut);
+    // Same allocation the IOTag/CFG export paths use — see services/slotAddressMap.js.
+    const stations = await buildAllocatedStations(db, importId);
 
     // Return flat map: { "<stationAddr>:<slot>": { inputAddr, outputAddr, subslotAddrs? } }
     const result = {};

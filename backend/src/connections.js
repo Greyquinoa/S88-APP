@@ -20,6 +20,7 @@
 
 const { latestHwImportId } = require('./signalMappings');
 const { findTemplate, defaultIdentifiers } = require('./services/hwAddressEngine');
+const { loadSlotAddressBases, baseForSignal } = require('./services/slotAddressMap');
 
 // Parse a project_instances.connections JSON column into rule objects.
 function parseConnections(raw) {
@@ -219,22 +220,28 @@ function resolveHwIdentifier(templateMap, moduleOrderNo, signalType) {
 }
 
 // Convert hw_signal (channel, signalType) to the PCS7 process-image address.
-// Each card's start address is 0 (the DI/DO start byte is the card's own address 0),
-// so the byte offset is purely derived from the channel index within the card.
-// For digital signals: channel 0-7 → byte 0, channel 8-15 → byte 1, etc.
-// For analog signals (16-bit, 2 bytes per channel): byte = channel * 2.
+// The address is the card's allocated base byte plus the channel's offset within
+// the card:
+//   For digital signals: channel 0-7 → +0, channel 8-15 → +1, etc.
+//   For analog signals (16-bit, 2 bytes per channel): +channel * 2.
+//
+// `slotBase` is the slot's start byte from hwAddressEngine.allocateAddresses() —
+// the same allocation CFG SYMBOL generation uses, so both exports agree. It
+// defaults to 0, which reproduces the legacy channel-only behaviour for callers
+// that have no allocation available (and for slots the allocator left unassigned).
 //
 // `identifier` is the catalogue-resolved prefix (I/Q/IW/QW). When supplied it is used
 // verbatim — this is the single source of truth, matching CFG SYMBOL generation.
 // When omitted, the prefix is inferred from the signal direction/kind (legacy fallback).
-function hwSignalToAddr(station, slot, channel, signalType, identifier) {
+function hwSignalToAddr(station, slot, channel, signalType, identifier, slotBase = 0) {
   if (station == null || slot == null || channel == null) return null;
   const isOutput = signalType && /^(AO|DO|Q|BO)$/i.test(signalType);
   const isAnalog = signalType && /^(AI|AO)$/i.test(signalType);
   const prefix = identifier || ((isOutput ? 'Q' : 'I') + (isAnalog ? 'W' : ''));
-  const byte = isAnalog ? channel * 2 : Math.floor(channel / 8);
+  const base = Number.isFinite(slotBase) ? slotBase : 0;
+  const byte = base + (isAnalog ? channel * 2 : Math.floor(channel / 8));
   const bit  = isAnalog ? 0 : channel % 8;
-  // Analog addresses use word syntax (omit bit): "IW 0", "QW 4"
+  // Analog addresses use word syntax (omit bit): "IW 512", "QW 516"
   if (isAnalog) return `${prefix} ${byte}`;
   return `${prefix} ${byte}.${bit}`;
 }
@@ -257,13 +264,18 @@ async function loadConnectionIOsForProject(db, projectId) {
   // Card catalogue for identifier resolution (same source as CFG generation).
   const templateRows = await db.prepare('SELECT order_no, signal_type, in_identifier, out_identifier FROM hw_module_templates').all();
   const templateMap = new Map(templateRows.map(t => [t.order_no, t]));
+  // Per-slot base addresses from the same allocator CFG generation uses, so an
+  // analog card reports "IW 512" here and in the CFG rather than "IW 0".
+  const slotBases = await loadSlotAddressBases(db, await latestHwImportId(db, projectId));
   const out = {};
   for (const r of rows) {
     // Hardware signal_type is authoritative for direction; fall back to the rule's.
     const sigType = r.hw_signal_type || r.signal_type;
     const ident   = resolveHwIdentifier(templateMap, r.hw_module_order_no, sigType);
+    const isOut   = sigType && /^(AO|DO|Q|BO)$/i.test(sigType);
     const ioAddress = (r.status === 'real')
-      ? hwSignalToAddr(r.station_address, r.slot, r.channel, sigType, ident)
+      ? hwSignalToAddr(r.station_address, r.slot, r.channel, sigType, ident,
+          baseForSignal(slotBases, r.station_address, r.slot, isOut))
       : null;
     (out[r.instance_name] ||= {})[`${r.block_name}.${r.var_name}`] = {
       tag:             r.signal_name,

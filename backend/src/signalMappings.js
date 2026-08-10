@@ -48,6 +48,7 @@ async function latestHwImportId(db, projectId) {
 // Joins hw_signals via hw_signal_id so IOTag generation gets the hardware address.
 async function loadMappingsForProject(db, projectId) {
   const { hwSignalToAddr, resolveHwIdentifier } = require('./connections');
+  const { loadSlotAddressBases, baseForSignal } = require('./services/slotAddressMap');
   const rows = await db.prepare(
     `SELECT sm.instance_name, sm.block_name, sm.var_name, sm.signal_tag, sm.var_dtype,
             sm.signal_type, hw.station_address, hw.slot, hw.channel, hw.description,
@@ -60,13 +61,18 @@ async function loadMappingsForProject(db, projectId) {
   // output pin yields "Q"/"QW" instead of the input default "I".
   const templateRows = await db.prepare('SELECT order_no, signal_type, in_identifier, out_identifier FROM hw_module_templates').all();
   const templateMap = new Map(templateRows.map(t => [t.order_no, t]));
+  // Per-slot base addresses from the same allocator CFG generation uses, so an
+  // analog card reports "IW 512" here and in the CFG rather than "IW 0".
+  const slotBases = await loadSlotAddressBases(db, await latestHwImportId(db, projectId));
   const out = {};
   for (const r of rows) {
     // Hardware signal_type is authoritative for direction; fall back to the mapping's.
     const sigType = r.hw_signal_type || r.signal_type;
+    const isOut   = sigType && /^(AO|DO|Q|BO)$/i.test(sigType);
     const ioAddress = (r.station_address != null && r.slot != null && r.channel != null)
       ? hwSignalToAddr(r.station_address, r.slot, r.channel, sigType,
-          resolveHwIdentifier(templateMap, r.hw_module_order_no, sigType))
+          resolveHwIdentifier(templateMap, r.hw_module_order_no, sigType),
+          baseForSignal(slotBases, r.station_address, r.slot, isOut))
       : null;
     (out[r.instance_name] ||= {})[`${r.block_name}.${r.var_name}`] = {
       tag:        r.signal_tag,
