@@ -5288,6 +5288,25 @@ function BlockRow({ block, on, required, onToggle, onToggleConditional }) {
     <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 0",
         borderBottom: isConditional ? "2px solid #FF9800" : "1px solid rgba(28,27,25,0.08)",
         background: "#FFFFFF" }}>
+      {!required && (
+        <div className="conditional-checkbox-container" title={isConditional ? "Block is conditional (child block)" : "Mark as conditional (child block)"} style={{ flexShrink: 0 }}>
+          <input
+            type="checkbox"
+            className="conditional-checkbox-input"
+            id={`conditional-${block.id}`}
+            checked={isConditional}
+            onChange={handleConditionalToggle}
+            disabled={togglingConditional}
+          />
+          <label htmlFor={`conditional-${block.id}`} className="conditional-checkbox-label">
+            <div className="conditional-checkmark"></div>
+          </label>
+        </div>
+      )}
+      <div className={`toggle-container ${on ? "checked" : ""}`}
+        style={{ opacity: required ? 0.5 : 1, pointerEvents: "none", flexShrink: 0 }} onClick={required ? undefined : onToggle}>
+        <div className="toggle-button"></div>
+      </div>
       <div style={{ flex: 1, minWidth: 0, opacity: on ? 1 : 0.55, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <div style={{ minWidth: 0 }}>
           <span style={{ fontSize: 12, fontFamily: "var(--font-sans)", fontWeight: 500,
@@ -5298,33 +5317,13 @@ function BlockRow({ block, on, required, onToggle, onToggleConditional }) {
           {block.vars?.length || 0}v
         </span>
       </div>
-      <div style={{ display: "flex", gap: 8, flexShrink: 0, alignItems: "center" }}>
-        {!required && (
-          <div className="conditional-checkbox-container" title={isConditional ? "Block is conditional (child block)" : "Mark as conditional (child block)"}>
-            <input
-              type="checkbox"
-              className="conditional-checkbox-input"
-              id={`conditional-${block.id}`}
-              checked={isConditional}
-              onChange={handleConditionalToggle}
-              disabled={togglingConditional}
-            />
-            <label htmlFor={`conditional-${block.id}`} className="conditional-checkbox-label">
-              <div className="conditional-checkmark"></div>
-            </label>
-          </div>
-        )}
-        <div className={`toggle-container ${on ? "checked" : ""}`} style={{ opacity: required ? 0.5 : 1, pointerEvents: required ? "none" : "auto", flexShrink: 0 }} onClick={required ? undefined : onToggle}>
-          <div className="toggle-button"></div>
-        </div>
-        <div style={{ display: "flex", gap: 6, opacity: on ? 1 : 0.55 }}>
-          <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 6,
-              background: required ? "#DBEAFE" : "#F3F4F6",
-              color: required ? "#1D4ED8" : "#6B7280", fontWeight: 500 }}>
-            {required ? "req" : "opt"}
-          </span>
-          {block.msgs?.length > 0 && <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 6, background: "#FEF3C7", color: "#92400E", fontWeight: 500 }}>{block.msgs.length}msg</span>}
-        </div>
+      <div style={{ display: "flex", gap: 6, opacity: on ? 1 : 0.55, flexShrink: 0 }}>
+        <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 6,
+            background: required ? "#DBEAFE" : "#F3F4F6",
+            color: required ? "#1D4ED8" : "#6B7280", fontWeight: 500 }}>
+          {required ? "req" : "opt"}
+        </span>
+        {block.msgs?.length > 0 && <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 6, background: "#FEF3C7", color: "#92400E", fontWeight: 500 }}>{block.msgs.length}msg</span>}
       </div>
     </div>
   );
