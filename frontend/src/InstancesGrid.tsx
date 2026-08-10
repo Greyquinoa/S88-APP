@@ -158,45 +158,36 @@ function ConnStatusCellRenderer(props: {
   );
 }
 
-// ── Export preview cell renderer ────────────────────────────────────────────────
-// Button to view exported blocks for an instance.
-function ExportPreviewCellRenderer(props: {
-  data: InstanceRow;
-  context: { onViewExportedBlocks?: (id: string) => void };
-}) {
-  if (!props.context.onViewExportedBlocks) return null;
-  return (
-    <button
-      onClick={(e) => {
-        e.stopPropagation();
-        props.context.onViewExportedBlocks!(props.data.id);
-      }}
-      title="View exported blocks"
-      style={{
-        border: "none", background: "transparent", cursor: "pointer",
-        color: "#059669", fontSize: 14, padding: "2px 4px", display: "flex",
-        alignItems: "center", justifyContent: "center"
-      }}
-    >
-      <i className="ti ti-layout-list" aria-hidden="true" />
-    </button>
-  );
-}
-
 // ── Exported blocks count cell renderer ────────────────────────────────────────
-// Display the count of exported blocks for an instance.
+// Display the count of exported blocks with a preview icon below.
 function ExportedBlocksCountRenderer(props: {
   data: InstanceRow;
-  context: { exportedBlocksCountByInstance?: Record<string, number> };
+  context: { exportedBlocksCountByInstance?: Record<string, number>; onViewExportedBlocks?: (id: string) => void };
 }) {
   const count = props.context.exportedBlocksCountByInstance?.[props.data.instanceName];
   if (!count) {
     return <span style={{ color: "#9CA3AF", fontSize: 12 }}>—</span>;
   }
   return (
-    <span style={{ fontSize: 12, fontWeight: 600, color: "#0F766E" }}>
-      {count}
-    </span>
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}>
+      <span style={{ fontSize: 12, fontWeight: 600, color: "#0F766E" }}>
+        {count}
+      </span>
+      <button
+        onClick={(e) => {
+          e.stopPropagation();
+          props.context.onViewExportedBlocks?.(props.data.id);
+        }}
+        title="View exported blocks"
+        style={{
+          border: "none", background: "transparent", cursor: "pointer",
+          color: "#059669", fontSize: 14, padding: "2px 4px", display: "flex",
+          alignItems: "center", justifyContent: "center"
+        }}
+      >
+        <i className="ti ti-layout-list" aria-hidden="true" />
+      </button>
+    </div>
   );
 }
 
@@ -503,20 +494,6 @@ export default function InstancesGrid({
         flex: 0.6,
         cellRenderer: ExportedBlocksCountRenderer,
         cellStyle: { display: "flex", alignItems: "center", justifyContent: "center" },
-        suppressHeaderMenuButton: true,
-      },
-      {
-        headerName: "",
-        colId: "exportPreview",
-        sortable: false,
-        filter: false,
-        resizable: false,
-        editable: false,
-        width: 48,
-        maxWidth: 48,
-        pinned: "right" as const,
-        cellRenderer: ExportPreviewCellRenderer,
-        cellStyle: { display: "flex", alignItems: "center", justifyContent: "center", padding: 0 },
         suppressHeaderMenuButton: true,
       },
       {
