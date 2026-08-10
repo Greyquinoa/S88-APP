@@ -8,6 +8,11 @@ export default function ExportPreviewModal({ projectId, instanceName, cmTypeName
   const [timestamp, setTimestamp] = useState('');
 
   useEffect(() => {
+    if (!projectId || !instanceName) {
+      setLoading(false);
+      setError('Instance not resolved — cannot load exported blocks.');
+      return;
+    }
     loadExportedBlocks();
   }, [projectId, instanceName]);
 
@@ -82,9 +87,11 @@ export default function ExportPreviewModal({ projectId, instanceName, cmTypeName
                     <span style={{ fontSize: 12, fontFamily: "var(--font-mono)", fontWeight: 600, color: "#0F766E", flex: 1 }}>
                       {block.block_name}
                     </span>
-                    <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4,
-                      background: block.status === 'real' ? "#DCFCE7" : "#FEE2E2",
-                      color: block.status === 'real' ? "#166534" : "#991B1B", fontWeight: 500 }}>
+                    <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, fontWeight: 500,
+                      background: block.status === 'real' ? "#DCFCE7"
+                                : block.status === 'dummy' ? "#FEE2E2" : "#F3F4F6",
+                      color: block.status === 'real' ? "#166534"
+                           : block.status === 'dummy' ? "#991B1B" : "#6B7280" }}>
                       {block.status}
                     </span>
                     {block.optional && (

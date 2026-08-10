@@ -177,69 +177,53 @@ router.get('/:projectId/:instanceName/exported-blocks', async (req, res) => {
       `SELECT id, name, optional FROM lib_blocks WHERE cm_type_id = ? ORDER BY sort_order`
     ).all(inst.cm_type_id);
 
-    // Fetch instance_ios to determine which blocks have real pins
+    // Reconciled IO state. cascade_status is written by reconcileConnections() —
+    // read it rather than recomputing the cascade, so this preview can't drift
+    // from what the exporter actually does.
     const ios = await db.prepare(
-      `SELECT DISTINCT block_name, status, required FROM instance_ios
+      `SELECT DISTINCT block_name, status, required, cascade_status FROM instance_ios
        WHERE project_id = ? AND instance_name = ?`
     ).all(projectId, instanceName);
 
-    // Fetch instance connections to check cascade status
-    let connections = [];
-    try {
-      const connRow = await db.prepare(
-        `SELECT connections FROM project_instances WHERE id = ?`
-      ).get(inst.id);
-      if (connRow?.connections) {
-        connections = JSON.parse(connRow.connections);
-      }
-    } catch (e) {
-      // connections column may not exist yet; skip cascade logic
+    // Enabled-block set, resolved exactly as routes/generate.js does it: the
+    // per-user library preference first, then the project profile, with any
+    // non-empty list winning. project_cmt_profiles is briefly empty mid-save,
+    // so neither source alone is reliable.
+    let enabledBlocks = [];
+    for (const row of [
+      await db.prepare(
+        `SELECT enabled_blocks FROM user_cm_block_prefs WHERE cm_type_name = ?`
+      ).get(inst.cm_type),
+      await db.prepare(
+        `SELECT enabled_blocks FROM project_cmt_profiles WHERE project_id = ? AND cm_type = ?`
+      ).get(projectId, inst.cm_type),
+    ]) {
+      let list = [];
+      try { list = JSON.parse(row?.enabled_blocks || '[]'); } catch { list = []; }
+      if (Array.isArray(list) && list.length) enabledBlocks = list;
     }
 
-    // Build childToParents map from connections
-    const childToParents = {};
-    connections.forEach(c => {
-      if (c.conn_type === 'io_connection' && c.childBlocks) {
-        c.childBlocks.forEach(child => {
-          childToParents[child] = childToParents[child] || [];
-          if (!childToParents[child].includes(c.block_name)) {
-            childToParents[child].push(c.block_name);
-          }
-        });
-      }
-    });
+    // A block drops out for one of two reasons, mirroring xmlGenerator.js:
+    //   - optional and not switched on for this CM type
+    //   - omitted by reconciliation (required pins unmatched, or cascaded off a
+    //     parent that was itself omitted)
+    const omitted = new Set(
+      ios.filter(io => io.cascade_status || (io.required && io.status === 'dummy'))
+         .map(io => io.block_name)
+    );
 
-    // Compute omitted blocks (required-unmatched)
-    const omittedByRule = new Set();
-    ios.forEach(io => {
-      if (io.required && io.status === 'dummy') {
-        omittedByRule.add(io.block_name);
-      }
-    });
-
-    // Cascade: if all parents are omitted, child is cascaded
-    const cascadedBlocks = new Set();
-    let changed = true;
-    while (changed) {
-      changed = false;
-      Object.entries(childToParents).forEach(([child, parents]) => {
-        if (!cascadedBlocks.has(child) && parents.every(p => omittedByRule.has(p) || cascadedBlocks.has(p))) {
-          cascadedBlocks.add(child);
-          changed = true;
-        }
-      });
-    }
-
-    // Build exported list: blocks that are NOT omitted and NOT cascaded
     const exported = blocks
-      .filter(b => !omittedByRule.has(b.name) && !cascadedBlocks.has(b.name))
+      .filter(b => !b.optional || enabledBlocks.includes(b.name))
+      .filter(b => !omitted.has(b.name))
       .map(b => {
         const ioEntry = ios.find(io => io.block_name === b.name);
         return {
           block_name: b.name,
           optional: !!b.optional,
-          status: ioEntry?.status || 'unknown',
-          var_count: 0, // Could fetch from lib_variables if needed
+          // No IO rule means no hardware binding — the block is emitted
+          // unconditionally rather than being of unknown status.
+          status: ioEntry?.status || 'unconditional',
+          var_count: 0,
         };
       });
 

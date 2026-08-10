@@ -560,9 +560,14 @@ export default function App() {
       if (!userProjects.length) throw new Error("Define at least one user project");
       if (instances.some(i => !i.userProject)) throw new Error("Every instance must be assigned to a user project");
 
-      // Build the payload — enabledBlocks must be loaded for each used CM type
+      // Build the payload — enabledBlocks must be loaded for each used CM type.
+      // Keep each ensureBlocksLoaded() result: it calls setProfiles(), but that
+      // update is not visible to the `cmtProfiles` captured by this closure, so
+      // reading state below would yield the pre-load value and send an empty
+      // enabledBlocks — which drops every optional block from the export.
       const usedTypes = [...new Set(instances.map(i => i.profileId))];
-      for (const t of usedTypes) await ensureBlocksLoaded(t);
+      const loadedProfiles = {};
+      for (const t of usedTypes) loadedProfiles[t] = await ensureBlocksLoaded(t);
 
       // Folder ids must be DB-resolved (`db…` prefix) before generate — the backend
       // looks them up in the persisted hierarchy. If any `cf…` is still pending,
@@ -574,7 +579,8 @@ export default function App() {
       );
 
       const payload = instances.map(inst => {
-        const profile = cmtProfiles.find(p => p.id === inst.profileId);
+        const profile = loadedProfiles[inst.profileId]
+          ?? cmtProfiles.find(p => p.id === inst.profileId);
         return {
           cmType:           inst.profileId,
           instanceName:     inst.instanceName,
@@ -4284,7 +4290,7 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
               if (inst) {
                 setExportPreview({
                   projectId: savedProjectId,
-                  instanceName: inst.name,
+                  instanceName: inst.instanceName,
                   cmTypeName: inst.profileId
                 });
               }
@@ -4324,7 +4330,7 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
             cmTypeName={exportPreview.cmTypeName}
             onClose={() => setExportPreview(null)}
             onOpenParameters={() => {
-              setMapInst(instances.find(i => i.name === exportPreview.instanceName && i.projectId === exportPreview.projectId) || null);
+              setMapInst(tabInstances.find(i => i.instanceName === exportPreview.instanceName) || null);
               setExportPreview(null);
             }}
           />
