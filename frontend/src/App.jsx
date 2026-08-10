@@ -3160,6 +3160,12 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                                     padding: "5px 10px", background: "#F0FDFA",
                                     border: "0.5px solid #99F6E4", borderRadius: "var(--border-radius-md)" }}>
                                   <TagIO />
+                                  <button onClick={() => setEditingIoRuleIdx(ci)}
+                                    title="Edit child blocks"
+                                    style={{ border: "none", background: "transparent", cursor: "pointer",
+                                      color: "#7C3AED", fontSize: 14, padding: "2px 4px", flexShrink: 0 }}>
+                                    <i className="ti ti-edit" />
+                                  </button>
                                   <span style={{ fontSize: 11, fontFamily: "var(--font-mono)", color: "var(--color-text-secondary)", flexShrink: 0 }}>
                                     [{c.to_member_idx}] {toM.cm_type_name}
                                   </span>
@@ -3187,12 +3193,6 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                                     </span>
                                   )}
                                   <div style={{ flex: 1 }} />
-                                  <button onClick={() => setEditingIoRuleIdx(ci)}
-                                    title="Edit child blocks"
-                                    style={{ border: "none", background: "transparent", cursor: "pointer",
-                                      color: "#7C3AED", fontSize: 14, padding: "2px 4px" }}>
-                                    <i className="ti ti-edit" />
-                                  </button>
                                   <button onClick={() => handleDeleteIoRule(ci)}
                                     style={{ border: "none", background: "transparent", cursor: "pointer",
                                       color: "#DC2626", fontSize: 14, padding: "2px 4px" }}>
