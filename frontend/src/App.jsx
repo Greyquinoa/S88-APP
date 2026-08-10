@@ -3166,14 +3166,14 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                                       color: "#7C3AED", fontSize: 14, padding: "2px 4px", flexShrink: 0 }}>
                                     <i className="ti ti-edit" />
                                   </button>
-                                  <span style={{ fontSize: 11, fontFamily: "var(--font-mono)", color: "var(--color-text-secondary)", flexShrink: 0 }}>
+                                  <span style={{ fontSize: 12, fontFamily: "var(--font-mono)", color: "var(--color-text-secondary)", flexShrink: 0 }}>
                                     [{c.to_member_idx}] {toM.cm_type_name}
                                   </span>
-                                  <span style={{ fontSize: 11, fontFamily: "var(--font-mono)" }}>
+                                  <span style={{ fontSize: 12, fontFamily: "var(--font-mono)" }}>
                                     {c.block_name}·{c.to_var_name}
                                   </span>
                                   <i className="ti ti-arrow-right" style={{ color: "var(--color-text-secondary)", fontSize: 13 }} />
-                                  <span style={{ fontSize: 11, fontFamily: "var(--font-mono)", fontWeight: 600, color: "#0F766E" }}>
+                                  <span style={{ fontSize: 12, fontFamily: "var(--font-mono)", fontWeight: 600, color: "#0F766E" }}>
                                     {c.prefix || ""}<span style={{ color: "#9CA3AF" }}>&lt;tag&gt;</span>{c.suffix || ""}
                                   </span>
                                   {c.dtype && (
@@ -3216,7 +3216,7 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                                   <TagVAL />
                                   {derived ? (
                                     <>
-                                      <span style={{ fontSize: 11, fontFamily: "var(--font-mono)", fontWeight: 600, color: "#854D0E" }}>
+                                      <span style={{ fontSize: 12, fontFamily: "var(--font-mono)", fontWeight: 600, color: "#854D0E" }}>
                                         {c.prefix || ""}<span style={{ color: "#9CA3AF" }}>&lt;tag&gt;</span>{c.suffix || ""}
                                       </span>
                                       <span style={{ padding: "0 5px", borderRadius: 3, fontSize: 10, fontWeight: 700,
@@ -3225,13 +3225,13 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                                       </span>
                                     </>
                                   ) : (
-                                    <span style={{ fontSize: 11, fontFamily: "var(--font-mono)", fontWeight: 600, color: "#854D0E" }}>
+                                    <span style={{ fontSize: 12, fontFamily: "var(--font-mono)", fontWeight: 600, color: "#854D0E" }}>
                                       {c.static_value}
                                     </span>
                                   )}
                                   <i className="ti ti-arrow-right" style={{ color: "var(--color-text-secondary)", fontSize: 13 }} />
                                   <TagIN />
-                                  <span style={{ fontSize: 11, fontFamily: "var(--font-mono)" }}>{toLabel}</span>
+                                  <span style={{ fontSize: 12, fontFamily: "var(--font-mono)" }}>{toLabel}</span>
                                   <div style={{ flex: 1 }} />
                                   <button onClick={() => removeConnection(ci)}
                                     style={{ border: "none", background: "transparent", cursor: "pointer",
@@ -3251,10 +3251,10 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
                                   padding: "5px 10px", background: "var(--color-background-secondary)",
                                   border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-md)" }}>
                                 <TagOUT />
-                                <span style={{ fontSize: 11, fontFamily: "var(--font-mono)" }}>{fromLabel}</span>
+                                <span style={{ fontSize: 12, fontFamily: "var(--font-mono)" }}>{fromLabel}</span>
                                 <i className="ti ti-arrow-right" style={{ color: "var(--color-text-secondary)", fontSize: 13 }} />
                                 <TagIN />
-                                <span style={{ fontSize: 11, fontFamily: "var(--font-mono)" }}>{toLabel}</span>
+                                <span style={{ fontSize: 12, fontFamily: "var(--font-mono)" }}>{toLabel}</span>
                                 <div style={{ flex: 1 }} />
                                 <button onClick={() => removeConnection(ci)}
                                   style={{ border: "none", background: "transparent", cursor: "pointer",
