@@ -109,9 +109,28 @@ function ConnStatusCellRenderer(props: {
   context: { connStatusByInstance?: Record<string, { real: number; dummy: number; total: number }>; onMapSignals?: (id: string) => void };
 }) {
   const st = props.context.connStatusByInstance?.[props.data.instanceName];
-  if (!st || st.total === 0) {
-    return <span style={{ color: "#9CA3AF", fontSize: 12 }}>—</span>;
+  const hasConnections = st && st.total > 0;
+
+  if (!hasConnections) {
+    // No IO connections, but user can still open Parameters to view static variables
+    return (
+      <button
+        onClick={(e) => {
+          e.stopPropagation();
+          props.context.onMapSignals?.(props.data.id);
+        }}
+        title="View parameters (no IO connections)"
+        style={{
+          display: "inline-flex", alignItems: "center", justifyContent: "center",
+          background: "transparent", border: "none", cursor: "pointer",
+          color: "#6B7280", fontSize: 14, padding: "2px 4px",
+        }}
+      >
+        <i className="ti ti-settings" aria-hidden="true" />
+      </button>
+    );
   }
+
   const allReal = st.real === st.total;
   const noneReal = st.real === 0;
   const bg = allReal ? "#DCFCE7" : noneReal ? "#FFEDD5" : "#FEF9C3";
@@ -122,7 +141,7 @@ function ConnStatusCellRenderer(props: {
         e.stopPropagation();
         props.context.onMapSignals?.(props.data.id);
       }}
-      title={`${st.real} of ${st.total} dummy IO signal(s) bound to hardware · ${st.dummy} unmatched · Click to open Parameters`}
+      title={`${st.real} of ${st.total} IO signal(s) bound to hardware · ${st.dummy} unmatched · Click to open Parameters`}
       style={{
         display: "inline-flex", alignItems: "center", gap: 4,
         background: bg, color: fg, fontSize: 11, fontWeight: 600,
