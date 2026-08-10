@@ -4173,9 +4173,14 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
     } catch { setConnStatus({}); }
   }
 
+  const tabInstances = instances.filter(i => {
+    const p = cmtProfiles.find(x => x.id === i.profileId);
+    return p?.libType === libType;
+  });
+
   // Load exported blocks count for each instance.
   async function loadExportedBlocksCount() {
-    if (!savedProjectId) { setExportedBlocksCount({}); return; }
+    if (!savedProjectId || !tabInstances.length) { setExportedBlocksCount({}); return; }
     try {
       const counts = {};
       for (const inst of tabInstances) {
@@ -4187,12 +4192,7 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
   }
 
   useEffect(() => { loadConnStatus(); }, [savedProjectId]); // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(() => { loadExportedBlocksCount(); }, [savedProjectId, instances]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const tabInstances = instances.filter(i => {
-    const p = cmtProfiles.find(x => x.id === i.profileId);
-    return p?.libType === libType;
-  });
+  useEffect(() => { loadExportedBlocksCount(); }, [savedProjectId, tabInstances]); // eslint-disable-line react-hooks/exhaustive-deps
   const showRolePane = libType === "EquipmentModule" || libType === "EquipmentPhase";
 
   const selectedInst = showRolePane ? tabInstances.find(i => i.id === selectedId) : null;
