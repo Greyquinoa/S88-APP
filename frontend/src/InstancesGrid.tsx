@@ -60,6 +60,8 @@ interface InstancesGridProps {
   selectedId?: string | null;
   /** Called when the map-signals action is clicked — opens the signal mapping modal */
   onMapSignals?: (id: string) => void;
+  /** Called when "View Exported Blocks" is clicked — opens export preview modal */
+  onViewExportedBlocks?: (id: string) => void;
   /** Called when "Generate Connections" is clicked — reconciles dummy IOs to hardware.
    *  May return a Promise; the button shows a busy state until it resolves. */
   onGenerateConnections?: () => void | Promise<void>;
@@ -134,6 +136,31 @@ function ConnStatusCellRenderer(props: {
   );
 }
 
+// ── Export preview cell renderer ────────────────────────────────────────────────
+// Button to view exported blocks for an instance.
+function ExportPreviewCellRenderer(props: {
+  data: InstanceRow;
+  context: { onViewExportedBlocks?: (id: string) => void };
+}) {
+  if (!props.context.onViewExportedBlocks) return null;
+  return (
+    <button
+      onClick={(e) => {
+        e.stopPropagation();
+        props.context.onViewExportedBlocks!(props.data.id);
+      }}
+      title="View exported blocks"
+      style={{
+        border: "none", background: "transparent", cursor: "pointer",
+        color: "#059669", fontSize: 14, padding: "2px 4px", display: "flex",
+        alignItems: "center", justifyContent: "center"
+      }}
+    >
+      <i className="ti ti-layout-list" aria-hidden="true" />
+    </button>
+  );
+}
+
 // ── Imported checkbox cell renderer ──────────────────────────────────────────
 
 function ImportedCheckboxRenderer(props: { data: InstanceRow }) {
@@ -200,6 +227,7 @@ export default function InstancesGrid({
   onRowSelect,
   selectedId,
   onMapSignals,
+  onViewExportedBlocks,
   onGenerateConnections,
   connStatusByInstance,
   reconciliationDataByInstance,
@@ -425,6 +453,20 @@ export default function InstancesGrid({
       },
       {
         headerName: "",
+        colId: "exportPreview",
+        sortable: false,
+        filter: false,
+        resizable: false,
+        editable: false,
+        width: 48,
+        maxWidth: 48,
+        pinned: "right" as const,
+        cellRenderer: ExportPreviewCellRenderer,
+        cellStyle: { display: "flex", alignItems: "center", justifyContent: "center", padding: 0 },
+        suppressHeaderMenuButton: true,
+      },
+      {
+        headerName: "",
         field: "id",
         sortable: false,
         filter: false,
@@ -438,7 +480,7 @@ export default function InstancesGrid({
         suppressHeaderMenuButton: true,
       },
     ],
-    [typeValues, userProjectValues, folderValues, folderLabels, cmtProfiles, folderOptions.length, onMapSignals, folderLabels, connStatusByInstance, reconciliationDataByInstance]
+    [typeValues, userProjectValues, folderValues, folderLabels, cmtProfiles, folderOptions.length, onMapSignals, onViewExportedBlocks, folderLabels, connStatusByInstance, reconciliationDataByInstance]
   );
 
   // Detect duplicate instance names for cell styling
@@ -466,8 +508,8 @@ export default function InstancesGrid({
   );
 
   const context = useMemo(
-    () => ({ onDelete: onRowDelete, duplicateNames, onMapSignals, connStatusByInstance, reconciliationDataByInstance }),
-    [onRowDelete, duplicateNames, onMapSignals, connStatusByInstance, reconciliationDataByInstance]
+    () => ({ onDelete: onRowDelete, duplicateNames, onMapSignals, onViewExportedBlocks, connStatusByInstance, reconciliationDataByInstance }),
+    [onRowDelete, duplicateNames, onMapSignals, onViewExportedBlocks, connStatusByInstance, reconciliationDataByInstance]
   );
 
   const defaultColDef = useMemo<ColDef>(
