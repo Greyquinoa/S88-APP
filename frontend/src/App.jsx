@@ -5294,10 +5294,15 @@ function BlockRow({ block, on, required, onToggle, onToggleConditional }) {
         style={{ opacity: (required || isConditional) ? 0.5 : 1, pointerEvents: "none", flexShrink: 0 }}>
         <div className="toggle-button"></div>
       </div>
-      <div style={{ flex: 1, minWidth: 0, opacity: on ? 1 : 0.55 }}>
-        <span style={{ fontSize: 12, fontFamily: "var(--font-sans)", fontWeight: 500,
-            color: on ? "#1C1B19" : "var(--color-text-secondary)" }}>{block.name}</span>
-        {block.comment && <span style={{ fontSize: 11, color: "#6B6862", marginLeft: 6 }}>{block.comment}</span>}
+      <div style={{ flex: 1, minWidth: 0, opacity: on ? 1 : 0.55, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ minWidth: 0 }}>
+          <span style={{ fontSize: 12, fontFamily: "var(--font-sans)", fontWeight: 500,
+              color: on ? "#1C1B19" : "var(--color-text-secondary)" }}>{block.name}</span>
+          {block.comment && <span style={{ fontSize: 11, color: "#6B6862", marginLeft: 6 }}>{block.comment}</span>}
+        </div>
+        <span style={{ fontSize: 11, color: "var(--color-text-secondary)", whiteSpace: "nowrap", marginLeft: 12 }}>
+          {block.vars?.length || 0}v
+        </span>
       </div>
       <div style={{ display: "flex", gap: 6, flexShrink: 0, alignItems: "center" }}>
         {!required && (
@@ -5331,7 +5336,6 @@ function BlockRow({ block, on, required, onToggle, onToggleConditional }) {
             {required ? "req" : "opt"}
           </span>
           {block.msgs?.length > 0 && <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 6, background: "#FEF3C7", color: "#92400E", fontWeight: 500 }}>{block.msgs.length}msg</span>}
-          <span style={{ fontSize: 10, color: "#6B6862" }}>{block.vars?.length || 0}v</span>
         </div>
       </div>
     </div>
