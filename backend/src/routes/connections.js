@@ -165,10 +165,10 @@ router.get('/:projectId/:instanceName/exported-blocks', async (req, res) => {
 
     // Fetch the instance and its CM type
     const inst = await db.prepare(
-      `SELECT i.id, i.profile_id, c.id AS cm_type_id
+      `SELECT i.id, i.cm_type, c.id AS cm_type_id
        FROM project_instances i
-       JOIN lib_cm_types c ON c.name = i.profile_id
-       WHERE i.project_id = ? AND i.name = ?`
+       JOIN lib_cm_types c ON c.name = i.cm_type
+       WHERE i.project_id = ? AND i.instance_name = ?`
     ).get(projectId, instanceName);
     if (!inst) return err(res, 404, 'Instance not found');
 
@@ -184,10 +184,17 @@ router.get('/:projectId/:instanceName/exported-blocks', async (req, res) => {
     ).all(projectId, instanceName);
 
     // Fetch instance connections to check cascade status
-    const connRow = await db.prepare(
-      `SELECT connections FROM project_instances WHERE id = ?`
-    ).get(inst.id);
-    const connections = connRow?.connections ? JSON.parse(connRow.connections) : [];
+    let connections = [];
+    try {
+      const connRow = await db.prepare(
+        `SELECT connections FROM project_instances WHERE id = ?`
+      ).get(inst.id);
+      if (connRow?.connections) {
+        connections = JSON.parse(connRow.connections);
+      }
+    } catch (e) {
+      // connections column may not exist yet; skip cascade logic
+    }
 
     // Build childToParents map from connections
     const childToParents = {};
