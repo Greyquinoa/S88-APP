@@ -80,7 +80,7 @@ export async function patchVarValid(cmTypeName, varId, isValid) {
   return request('PATCH', `/cm-types/${encodeURIComponent(cmTypeName)}/vars/${varId}`, { is_valid: isValid });
 }
 export async function toggleBlockConditional(blockId, isConditional) {
-  return request('PATCH', `/lib-blocks/${blockId}/conditional`, { isConditional });
+  return request('PATCH', `/cm-types/block/${blockId}/conditional`, { isConditional });
 }
 
 // ── Generate ──────────────────────────────────────────────────────────────────
