@@ -553,3 +553,69 @@ body::-webkit-scrollbar {
     box-shadow: inset 0 0 2px rgba(0, 0, 0, 0.2);
   }
 }
+
+/* Conditional block checkbox */
+.conditional-checkbox-container {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.conditional-checkbox-input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+  cursor: pointer;
+}
+
+.conditional-checkbox-label {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  cursor: pointer;
+  border: 2px solid #E5E7EB;
+  border-radius: 50%;
+  transition: all 0.3s ease;
+  background: #F9FAFB;
+}
+
+.conditional-checkbox-input:hover + .conditional-checkbox-label {
+  border-color: #00D084;
+  background: #F0FFF9;
+}
+
+.conditional-checkbox-input:checked + .conditional-checkbox-label {
+  border-color: #00D084;
+  background: #00D084;
+  box-shadow: 0 0 8px rgba(0, 208, 132, 0.4);
+}
+
+.conditional-checkmark {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.conditional-checkmark::after {
+  content: '';
+  position: absolute;
+  width: 6px;
+  height: 10px;
+  border: solid white;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg) scale(0);
+  transition: transform 0.3s ease;
+}
+
+.conditional-checkbox-input:checked + .conditional-checkbox-label .conditional-checkmark::after {
+  transform: rotate(45deg) scale(1);
+}

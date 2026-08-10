@@ -5306,28 +5306,19 @@ function BlockRow({ block, on, required, onToggle, onToggleConditional }) {
       </div>
       <div style={{ display: "flex", gap: 6, flexShrink: 0, alignItems: "center" }}>
         {!required && (
-          <button
-            onClick={handleConditionalToggle}
-            disabled={togglingConditional}
-            title={isConditional ? "This block is conditional (remove to use as optional)" : "Mark as conditional (child block)"}
-            style={{
-              padding: "4px 8px",
-              borderRadius: 4,
-              border: isConditional ? "2px solid #FF9800" : "1px solid #E5E7EB",
-              background: isConditional ? "#FFF3E0" : "#F9FAFB",
-              color: isConditional ? "#FF9800" : "#6B7280",
-              fontSize: 10,
-              fontWeight: 500,
-              cursor: togglingConditional ? "wait" : "pointer",
-              transition: "all 0.2s",
-              flexShrink: 0,
-              display: "flex",
-              alignItems: "center",
-              gap: 4,
-            }}>
-            <i className="ti ti-git-branch" style={{ fontSize: 9 }} />
-            {isConditional ? "Conditional" : "Make Conditional"}
-          </button>
+          <div className="conditional-checkbox-container" title={isConditional ? "Block is conditional (child block)" : "Mark as conditional (child block)"}>
+            <input
+              type="checkbox"
+              className="conditional-checkbox-input"
+              id={`conditional-${block.id}`}
+              checked={isConditional}
+              onChange={handleConditionalToggle}
+              disabled={togglingConditional}
+            />
+            <label htmlFor={`conditional-${block.id}`} className="conditional-checkbox-label">
+              <div className="conditional-checkmark"></div>
+            </label>
+          </div>
         )}
         <div style={{ display: "flex", gap: 6, opacity: on ? 1 : 0.55 }}>
           <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 6,
