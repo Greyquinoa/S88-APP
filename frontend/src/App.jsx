@@ -5308,21 +5308,17 @@ function BlockRow({ block, on, required, onToggle, onToggleConditional }) {
         onClick={required || isConditional ? undefined : onToggle}>
         <div className="toggle-button"></div>
       </div>
-      <div style={{ flex: 1, minWidth: 0, opacity: on ? 1 : 0.55, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+      <div style={{ flex: 1, minWidth: 0, opacity: isConditional || on ? 1 : 0.55, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <div style={{ minWidth: 0 }}>
           <span style={{ fontSize: 12, fontFamily: "var(--font-sans)", fontWeight: 500,
-              color: on ? "#1C1B19" : "var(--color-text-secondary)",
-              background: isConditional ? "#FFF3E0" : "transparent",
-              padding: isConditional ? "2px 6px" : "0",
-              borderRadius: isConditional ? "4px" : "0",
-              border: isConditional ? "1px solid #FFD699" : "none" }}>{block.name}</span>
+              color: isConditional || on ? "#1C1B19" : "var(--color-text-secondary)" }}>{block.name}</span>
           {block.comment && <span style={{ fontSize: 11, color: "#6B6862", marginLeft: 6 }}>{block.comment}</span>}
         </div>
         <span style={{ fontSize: 11, color: "var(--color-text-secondary)", whiteSpace: "nowrap", marginLeft: 12 }}>
           {block.vars?.length || 0}v
         </span>
       </div>
-      <div style={{ display: "flex", gap: 6, opacity: on ? 1 : 0.55, flexShrink: 0 }}>
+      <div style={{ display: "flex", gap: 6, opacity: isConditional || on ? 1 : 0.55, flexShrink: 0 }}>
         <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 6,
             background: required ? "#DBEAFE" : "#F3F4F6",
             color: required ? "#1D4ED8" : "#6B7280", fontWeight: 500 }}>
