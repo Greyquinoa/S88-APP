@@ -327,13 +327,8 @@ export default function SignalMappingModal({ projectId, instance, profile, compo
       const [, varName] = key.split(".");
       m[varName] = true;
     }
-    // Also include variables with IO connection rules (they have dummy signal names)
-    for (const key of Object.keys(dummyByKey)) {
-      const [, varName] = key.split(".");
-      m[varName] = true;
-    }
     return m;
-  }, [connIoByKey, dummyByKey]);
+  }, [connIoByKey]);
 
   function setVarSignal(blockName, varName, tag) {
     const key = `${blockName}.${varName}`;
@@ -586,9 +581,8 @@ export default function SignalMappingModal({ projectId, instance, profile, compo
             </div>
           ) : (
             activeBlocks.map(blk => {
-              // Variables can have both IO and Value connections simultaneously
               const ioVars = (blk.vars || []).filter(v => connTypeByVar[v.name] === 'io_connection' || hasSignalMappingByVar[v.name] || hasConnReconByVar[v.name]);
-              const valueVars = (blk.vars || []).filter(v => connTypeByVar[v.name] === 'value');
+              const valueVars = (blk.vars || []).filter(v => connTypeByVar[v.name] === 'value' && !hasSignalMappingByVar[v.name] && !hasConnReconByVar[v.name]);
               const interconnectVars = (blk.vars || []).filter(v => connTypeByVar[v.name] === 'interconnection');
               const unassignedVars = (blk.vars || []).filter(v => !connTypeByVar[v.name] && !hasSignalMappingByVar[v.name] && !hasConnReconByVar[v.name]);
 
