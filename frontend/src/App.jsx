@@ -775,18 +775,6 @@ export default function App() {
                     b.id === blockId ? { ...b, isConditional } : b
                   )};
                 }));
-                // Also update ioRulesCache so child block selector sees the change
-                setIoRulesCache(prev => {
-                  const updated = { ...prev };
-                  Object.keys(updated).forEach(cmTypeName => {
-                    if (updated[cmTypeName]?.blocks) {
-                      updated[cmTypeName].blocks = updated[cmTypeName].blocks.map(b =>
-                        b.id === blockId ? { ...b, isConditional } : b
-                      );
-                    }
-                  });
-                  return updated;
-                });
               }}
               onVarDefaultChange={(cmTypeName, varId, newVal) => {
                 setProfiles(prev => prev.map(p => {
@@ -4156,7 +4144,6 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
   const [exportPreview, setExportPreview] = useState(null); // instance for export preview { projectId, instanceName, cmTypeName }
   const [connResult, setConnResult] = useState(null); // last "Generate Connections" outcome
   const [connStatus, setConnStatus] = useState({});   // instanceName → { real, dummy, total }
-  const [exportedBlocksCount, setExportedBlocksCount] = useState({});   // instanceName → block count
 
   // Load per-instance reconciliation counts for the grid's Connections column.
   async function loadConnStatus() {
@@ -4172,41 +4159,12 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
         setConnStatus(byInst);
     } catch { setConnStatus({}); }
   }
-
-  const tabInstances = useMemo(
-    () => instances.filter(i => {
-      const p = cmtProfiles.find(x => x.id === i.profileId);
-      return p?.libType === libType;
-    }),
-    [instances, cmtProfiles, libType]
-  );
-
-  // Names of the instances whose block counts we need, as a stable string. The
-  // effect below must not depend on the tabInstances array itself: it is rebuilt
-  // on every render, so using it as a dependency re-runs the fetch → setState →
-  // render → new array cycle forever and the counts never settle.
-  const tabInstanceNamesKey = tabInstances.map(i => i.instanceName).join(' ');
-
   useEffect(() => { loadConnStatus(); }, [savedProjectId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Exported-block counts for the grid's Blocks column, one request per instance.
-  useEffect(() => {
-    const names = tabInstanceNamesKey ? tabInstanceNamesKey.split(' ') : [];
-    if (!savedProjectId || !names.length) { setExportedBlocksCount({}); return; }
-    let cancelled = false;
-    (async () => {
-      const settled = await Promise.allSettled(
-        names.map(n => getExportedBlocks(savedProjectId, n))
-      );
-      if (cancelled) return;
-      const counts = {};
-      settled.forEach((r, idx) => {
-        if (r.status === 'fulfilled') counts[names[idx]] = (r.value.exported_blocks || []).length;
-      });
-      setExportedBlocksCount(counts);
-    })();
-    return () => { cancelled = true; };
-  }, [savedProjectId, tabInstanceNamesKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  const tabInstances = instances.filter(i => {
+    const p = cmtProfiles.find(x => x.id === i.profileId);
+    return p?.libType === libType;
+  });
   const showRolePane = libType === "EquipmentModule" || libType === "EquipmentPhase";
 
   const selectedInst = showRolePane ? tabInstances.find(i => i.id === selectedId) : null;
@@ -4286,7 +4244,9 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
               // modal receives the stale object with no connections and the DUMMY
               // badge / derived signal name never appear.
               let openInst = inst;
-              if (inst._needsConnections && inst.compositeId != null && inst.memberIdx != null) {
+              // Always re-hydrate composite member connections when opening Parameters modal,
+              // so that any new IO rules added to the composite type are picked up
+              if (inst.compositeId != null && inst.memberIdx != null) {
                 try {
                   const detail = await getCompositeCmType(inst.compositeId);
                   const connections = extractMemberConnections(detail, inst.memberIdx);
@@ -4314,7 +4274,6 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
               }
             } : undefined}
             connStatusByInstance={savedProjectId ? connStatus : undefined}
-            exportedBlocksCountByInstance={savedProjectId ? exportedBlocksCount : undefined}
             reconciliationDataByInstance={savedProjectId ? reconData : undefined}
             onViewExportedBlocks={savedProjectId ? (id) => {
               const inst = tabInstances.find(i => i.id === id);

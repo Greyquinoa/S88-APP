@@ -119,10 +119,11 @@ function resolveIdentifier(tpl, dir, hasTaggedChannels, warnings, ctx) {
  *   LOCAL_OUT_ADDRESSES
  *     ADDRESS  ...
  *   SYMBOL  I , <byteOfs>, "<tag>", "<desc>"
- *   SYMBOL  Q , <byteOfs>, "<tag>", "<desc>"
+ *   SYMBOL  O , <byteOfs>, "<tag>", "<desc>"
  *
- * The output identifier ("Q", "QW", …) comes from the card catalogue, not a
- * hardcoded value — ET200SP DO cards need "Q" where this used to emit "O".
+ * SYMBOL identifiers are always "I" (input) or "O" (output) regardless of the
+ * module's signal type or catalogue definition. Catalogue definitions are used for
+ * XML generation only.
  */
 function buildAddressLines(tpl, slot, warnings, ctx) {
   const channels = slot.channels ? [...slot.channels.values()] : [];
@@ -135,18 +136,16 @@ function buildAddressLines(tpl, slot, warnings, ctx) {
   if (tpl && tpl.input_bytes > 0 && slot.inputAddr != null && tpl.in_addr_fmt) {
     const fields = patchPip(fillAddrFmt(tpl.in_addr_fmt, slot.inputAddr), pipNo);
     addrLines.push('LOCAL_IN_ADDRESSES', `  ADDRESS  ${fields}`);
-    // MIXED (DIQ8): only DI channels → input identifier; pass totalBytes=0 so byteOfs=0 for all (bit-packed)
+    // MIXED (DIQ8): only DI channels → input uses "I"; pass totalBytes=0 so byteOfs=0 for all (bit-packed)
     const inChannels = isMixed ? channels.filter(c => c.signalType === 'DI') : channels;
-    const inIdent = resolveIdentifier(tpl, 'in', inChannels.some(c => c.tag), warnings, ctx);
-    symbolLines.push(...buildSymbolLines(inIdent, inChannels, isMixed ? 0 : tpl.input_bytes, isMixed ? 1 : (tpl.channel_count || 0)));
+    symbolLines.push(...buildSymbolLines('I', inChannels, isMixed ? 0 : tpl.input_bytes, isMixed ? 1 : (tpl.channel_count || 0)));
   }
   if (tpl && tpl.output_bytes > 0 && slot.outputAddr != null && tpl.out_addr_fmt) {
     const fields = patchPip(fillAddrFmt(tpl.out_addr_fmt, slot.outputAddr), pipNo);
     addrLines.push('LOCAL_OUT_ADDRESSES', `  ADDRESS  ${fields}`);
-    // MIXED (DIQ8): only DO channels → output identifier (catalogue-driven, e.g. "Q")
+    // MIXED (DIQ8): only DO channels → output always uses "O"
     const outChannels = isMixed ? channels.filter(c => c.signalType === 'DO') : channels;
-    const outIdent = resolveIdentifier(tpl, 'out', outChannels.some(c => c.tag), warnings, ctx);
-    symbolLines.push(...buildSymbolLines(outIdent, outChannels, isMixed ? 0 : tpl.output_bytes, isMixed ? 1 : (tpl.channel_count || 0)));
+    symbolLines.push(...buildSymbolLines('O', outChannels, isMixed ? 0 : tpl.output_bytes, isMixed ? 1 : (tpl.channel_count || 0)));
   }
 
   // All address blocks first, then all SYMBOL lines — PCS7 requires this order
@@ -493,22 +492,20 @@ async function renderCfuPa(station, templateMap, ioNo, diag, warnings, autoSlotC
           channels:   ch ? [ch] : [],
         }, warnings, { addr, slot: slotNo, order: slot.orderNo });
       } else if (ssInAddr != null) {
-        // GSD-path fallback: construct ADDRESS line directly. Identifiers come from
-        // the card catalogue when a template exists, else the PA defaults (I / Q).
+        // GSD-path fallback: construct ADDRESS line directly.
+        // SYMBOL identifiers are always "I" (input) or "O" (output).
         const ch = channelsBySubslot.get(fi);
-        const inIdent = resolveIdentifier(tpl, 'in', !!(ch && ch.tag), warnings, { addr, slot: slotNo, order: slot.orderNo });
         ssAddressLines = [
           'LOCAL_IN_ADDRESSES',
           `  ADDRESS  ${ssInAddr}, 0, ${perSubslotBytes}, 0, ${pipNo}, 0`,
         ];
         if (ch && ch.tag) {
-          ssAddressLines.push(`SYMBOL  ${inIdent} , 0, "${ch.tag}", "${ch.desc || ''}"`);
+          ssAddressLines.push(`SYMBOL  I , 0, "${ch.tag}", "${ch.desc || ''}"`);
         }
         if (perSubslotOutBytes > 0 && ssOutAddr != null) {
-          const outIdent = resolveIdentifier(tpl, 'out', !!(ch && ch.tag), warnings, { addr, slot: slotNo, order: slot.orderNo });
           ssAddressLines.push('LOCAL_OUT_ADDRESSES', `  ADDRESS  ${ssOutAddr}, 0, ${perSubslotOutBytes}, 0, ${pipNo}, 0`);
           if (ch && ch.tag) {
-            ssAddressLines.push(`SYMBOL  ${outIdent} , 0, "${ch.tag}", "${ch.desc || ''}"`);
+            ssAddressLines.push(`SYMBOL  O , 0, "${ch.tag}", "${ch.desc || ''}"`);
           }
         }
       } else {

@@ -52,6 +52,41 @@ async function runGeneration(db, body, onProgress) {
           `SELECT instance_name FROM project_instances WHERE project_id = ? AND reconciliation_status = 'DUMMY'`
         ).all(proj.id);
         excludedDummies = dummyRows.map(r => r.instance_name);
+
+        // Safety net: enabledBlocks is client-supplied, and an empty list silently
+        // drops every optional block from the export. The saved profile is the
+        // authoritative answer, so backfill from it whenever the client sent
+        // nothing for a CM type. An explicit non-empty list from the client still
+        // wins (that is a deliberate per-generation choice).
+        // Two sources, lowest priority first: the per-user library preference is
+        // long-lived, while project_cmt_profiles is rewritten (delete + re-insert)
+        // on every project save and is briefly empty mid-save — so it must not be
+        // the only source.
+        const savedByCmType = {};
+        const prefRows = await db.prepare(
+          `SELECT cm_type_name AS cm_type, enabled_blocks FROM user_cm_block_prefs`
+        ).all();
+        const profRows = await db.prepare(
+          `SELECT cm_type, enabled_blocks FROM project_cmt_profiles WHERE project_id = ?`
+        ).all(proj.id);
+        for (const r of [...prefRows, ...profRows]) {
+          let list = [];
+          try { list = JSON.parse(r.enabled_blocks || '[]'); } catch { list = []; }
+          if (Array.isArray(list) && list.length) savedByCmType[r.cm_type] = list;
+        }
+        if (Object.keys(savedByCmType).length) {
+          instances = instances.map(inst => {
+            if (Array.isArray(inst.enabledBlocks) && inst.enabledBlocks.length) return inst;
+            const saved = savedByCmType[inst.cmType];
+            if (!saved) return inst;
+            console.warn(
+              `[generate] enabledBlocks missing for ${inst.instanceName} (${inst.cmType}) — ` +
+              `falling back to saved project profile (${saved.length} blocks)`
+            );
+            return { ...inst, enabledBlocks: saved };
+          });
+        }
+
         hierarchy = await db.prepare(`
           SELECT id, parent_id, name, s88_type, sort_order
           FROM project_hierarchy_folders
