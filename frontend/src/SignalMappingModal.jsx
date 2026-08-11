@@ -586,8 +586,9 @@ export default function SignalMappingModal({ projectId, instance, profile, compo
             </div>
           ) : (
             activeBlocks.map(blk => {
+              // Variables can have both IO and Value connections simultaneously
               const ioVars = (blk.vars || []).filter(v => connTypeByVar[v.name] === 'io_connection' || hasSignalMappingByVar[v.name] || hasConnReconByVar[v.name]);
-              const valueVars = (blk.vars || []).filter(v => connTypeByVar[v.name] === 'value' && !hasSignalMappingByVar[v.name] && !hasConnReconByVar[v.name]);
+              const valueVars = (blk.vars || []).filter(v => connTypeByVar[v.name] === 'value');
               const interconnectVars = (blk.vars || []).filter(v => connTypeByVar[v.name] === 'interconnection');
               const unassignedVars = (blk.vars || []).filter(v => !connTypeByVar[v.name] && !hasSignalMappingByVar[v.name] && !hasConnReconByVar[v.name]);
 
