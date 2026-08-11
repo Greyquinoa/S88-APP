@@ -327,8 +327,13 @@ export default function SignalMappingModal({ projectId, instance, profile, compo
       const [, varName] = key.split(".");
       m[varName] = true;
     }
+    // Also include variables with IO connection rules (they have dummy signal names)
+    for (const key of Object.keys(dummyByKey)) {
+      const [, varName] = key.split(".");
+      m[varName] = true;
+    }
     return m;
-  }, [connIoByKey]);
+  }, [connIoByKey, dummyByKey]);
 
   function setVarSignal(blockName, varName, tag) {
     const key = `${blockName}.${varName}`;
