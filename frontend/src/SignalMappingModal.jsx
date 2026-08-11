@@ -165,8 +165,24 @@ export default function SignalMappingModal({ projectId, instance, profile, compo
       [...unmatchedBlocks].filter(b => !realBlocks.has(b))
     );
 
+    // Blocks that carry a connection for this instance must stay visible even when
+    // they are optional-and-not-enabled: an IO rule targets a specific block (e.g.
+    // CM_TRANS "PV"·PV_In), and dropping that block would hide a pin that is bound
+    // to hardware and does get exported. Sources mirror the ones the rows use:
+    // instance IO rules, reconciliation results, and saved signal mappings.
+    const connectedBlocks = new Set();
+    for (const conn of (instance.connections || [])) {
+      if (conn.target_block) connectedBlocks.add(conn.target_block);
+    }
+    for (const io of Object.values(connIoByKey)) {
+      if (io.block_name) connectedBlocks.add(io.block_name);
+    }
+    for (const key of Object.keys(mapping)) {
+      connectedBlocks.add(key.slice(0, key.indexOf('.')));
+    }
+
     return blocks
-      .filter(b => !b.optional || enabledBlocks.includes(b.name))
+      .filter(b => !b.optional || enabledBlocks.includes(b.name) || connectedBlocks.has(b.name))
       .filter(b => {
         // Hide cascaded child blocks: if this block is a child AND all its parents are omitted, hide it
         const parents = childToParents[b.name] || [];
@@ -180,7 +196,7 @@ export default function SignalMappingModal({ projectId, instance, profile, compo
         vars: (blk.vars || []).filter(v => v.isValid),  // Silent filter: only valid variables (backend returns camelCase)
       }))
       .filter(blk => blk.vars.length > 0);  // Hide blocks with no valid variables
-  }, [profile, enabledBlocks, instance.connections, connIoByKey]);
+  }, [profile, enabledBlocks, instance.connections, connIoByKey, mapping]);
 
   // Load existing mappings and values on open.
   useEffect(() => {
