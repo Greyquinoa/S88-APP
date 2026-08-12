@@ -636,7 +636,10 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
             ioListRef={ioListRef}
             onBaselineChange={async (e) => { await handleBaselineUpload(e); await loadControllers(); }}
             onIoListChange={handleIoListUpload}
-            onBaselineBtn={() => baselineRef.current.click()}
+            onBaselineBtn={() => {
+              baselineRef.current.value = "";  // Allow re-uploading same filename
+              baselineRef.current.click();
+            }}
             onIoListBtn={() => {
               if (!importId) { setError("Upload a baseline CFG first."); return; }
               ioListRef.current.click();
@@ -2070,13 +2073,14 @@ function ImportPanel({
 
       <div style={{ display: "flex", gap: 24, marginBottom: 24, flexWrap: "wrap" }}>
         <UploadCard
-          label="1. Baseline PCS7 CFG"
+          label="1. PCS7 CFG"
           ok={baselineOk} okLabel="✓ Loaded"
-          btnLabel={baselineOk ? "Replace CFG" : "Upload .cfg"}
+          btnLabel={baselineOk ? "Upload / Update CFG" : "Upload .cfg"}
           onBtn={onBaselineBtn}
           accept=".cfg"
           inputRef={baselineRef}
           onChange={onBaselineChange}
+          disabled={!!loading}
         />
         <UploadCard
           label="2. HW IO List (Excel)"
@@ -2086,71 +2090,22 @@ function ImportPanel({
           accept=".xlsx,.xlsm,.xls"
           inputRef={ioListRef}
           onChange={onIoListChange}
-          disabled={!importId}
+          disabled={!importId || !!loading}
         />
-      </div>
-
-      {/* Divider with OR label */}
-      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
-        <div style={{ flex: 1, height: 1, background: "var(--color-border-tertiary, #e5e7eb)" }} />
-        <span style={{ fontSize: 12, color: "var(--color-text-secondary, #6b7280)", fontWeight: 500 }}>OR</span>
-        <div style={{ flex: 1, height: 1, background: "var(--color-border-tertiary, #e5e7eb)" }} />
-      </div>
-
-      {/* Import from CFG option */}
-      <div style={{
-        display: "flex", alignItems: "center", gap: 16,
-        padding: "14px 18px",
-        background: baselineOk ? "var(--color-background-secondary, #f5f5f5)" : "#f9fafb",
-        border: `1px solid ${baselineOk ? "var(--color-border-secondary, rgba(0,0,0,.2))" : "#e5e7eb"}`,
-        borderRadius: "var(--border-radius-lg, 12px)",
-        opacity: baselineOk ? 1 : 0.5,
-      }}>
-        <div style={{ flex: 1 }}>
-          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 3, color: "var(--color-text-primary, #1a1a1a)" }}>
-            2. Import device list from CFG
-          </div>
-          <div style={{ fontSize: 12, color: "var(--color-text-secondary, #6b7280)", lineHeight: 1.5 }}>
-            Select a previously generated CFG file to restore station, module, IP,
-            PIP, POTENTIAL_GROUP and tag data — no Excel sheet needed.
-            {!baselineOk && " Upload a baseline CFG first."}
-          </div>
-        </div>
-        <input
-          ref={cfgBackfillRef}
-          type="file"
-          accept=".cfg"
-          style={{ display: "none" }}
-          onChange={onCfgBackfillChange}
-        />
-        <button
-          onClick={onBackfillFromCfg}
-          disabled={!baselineOk || !!loading}
-          style={{
-            ...btnStyle,
-            background: baselineOk ? "#0C447C" : "#e5e7eb",
-            color: baselineOk ? "#fff" : "#9ca3af",
-            border: "none",
-            padding: "8px 18px",
-            fontSize: 13,
-            flexShrink: 0,
-            opacity: !baselineOk || !!loading ? 0.6 : 1,
-            cursor: !baselineOk || !!loading ? "not-allowed" : "pointer",
-          }}
-        >
-          {loading && loading.includes("Reading") ? "Reading…" : "Select & Import CFG"}
-        </button>
       </div>
 
       {ioListInfo && (
         <div style={{ marginTop: 20, fontSize: 13, color: "#444",
                       background: "#f5fff5", border: "1px solid #9d9", borderRadius: 6, padding: "8px 14px" }}>
-          Device data imported — <strong>{ioListInfo.stationCount}</strong> station{ioListInfo.stationCount !== 1 ? "s" : ""},{" "}
-          <strong>{ioListInfo.signalCount}</strong> slot{ioListInfo.signalCount !== 1 ? "s" : ""}.{" "}
-          <span style={{ color: "#2255cc", cursor: "pointer", textDecoration: "underline" }}
-                onClick={() => {}}>
-            Switch to Configuration tab to review and generate.
-          </span>
+          <div>
+            Device data imported from this CFG — <strong>{ioListInfo.stationCount}</strong> station{ioListInfo.stationCount !== 1 ? "s" : ""},{" "}
+            <strong>{ioListInfo.signalCount}</strong> slot{ioListInfo.signalCount !== 1 ? "s" : ""}.
+          </div>
+          {ioListInfo.skipped && ioListInfo.skipped.length > 0 && (
+            <div style={{ marginTop: 6, fontSize: 12, color: "#666" }}>
+              Skipped {ioListInfo.skipped.length} existing station{ioListInfo.skipped.length !== 1 ? "s" : ""}: {ioListInfo.skipped.join(", ")}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -4314,7 +4269,18 @@ function UploadCard({ label, ok, okLabel, btnLabel, onBtn, accept, inputRef, onC
                   borderRadius: 8, padding: "14px 16px" }}>
       <label style={{ fontWeight: 700, display: "block", marginBottom: 8, fontSize: 14 }}>{label}</label>
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-        <button onClick={onBtn} style={{ ...btnStyle, opacity: disabled ? 0.5 : 1 }}>{btnLabel}</button>
+        <button
+          onClick={onBtn}
+          disabled={disabled}
+          style={{
+            ...btnStyle,
+            opacity: disabled ? 0.6 : 1,
+            cursor: disabled ? "not-allowed" : "pointer",
+            pointerEvents: disabled ? "none" : "auto",
+          }}
+        >
+          {btnLabel}
+        </button>
         {ok && <span style={{ color: "#2a8", fontWeight: 700, fontSize: 13 }}>{okLabel}</span>}
         <input type="file" accept={accept} ref={inputRef} onChange={onChange} style={{ display: "none" }} />
       </div>
