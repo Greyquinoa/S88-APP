@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import MRPTopologyView from "./MRPTopologyView.jsx";
 import HwImportReview from "./HwImportReview.jsx";
 import HwColumnMappingPanel from "./HwColumnMappingPanel.jsx";
@@ -39,7 +39,7 @@ function paramVisible(p) {
 
 export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwMappingConsumed }) {
   const [hwTab,        setHwTab]        = useState("import");
-  const [importId,     setImportId]     = useState(null);
+  const [imports,      setImports]      = useState([]);    // all imports for the project; used to derive importId
   const [baselineOk,   setBaselineOk]   = useState(false);
   const [baselineInfo, setBaselineInfo] = useState(null);
   const [ioListOk,     setIoListOk]     = useState(false);
@@ -83,6 +83,17 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
   const [excelHeaders, setExcelHeaders] = useState([]);
   const [selectedColumns, setSelectedColumns] = useState(new Set());
 
+  // ── Derived state: importId from selectedId ──────────────────────────────
+  // Legacy fallback: if no import matches the selected controller and exactly
+  // one import has hw_controller_id=NULL, use it (pre-migration data).
+  const importId = useMemo(() => {
+    const matched = imports.find(i => i.hw_controller_id === selectedId);
+    if (matched) return matched.id;
+    if (selectedId === null) return null;
+    const legacyImport = imports.find(i => i.hw_controller_id === null);
+    return legacyImport && imports.filter(i => i.hw_controller_id === null).length === 1 ? legacyImport.id : null;
+  }, [imports, selectedId]);
+
   // Slot ↔ Subslot compatibility map
   const [slotCompat, setSlotCompat] = useState([]); // [{ id, slot_order_no, subslot_order_no, is_default }]
   const reloadSlotCompat = () => listSlotCompat().then(setSlotCompat).catch(() => {});
@@ -100,12 +111,17 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
     listHwSignalTypes().then(setSigTypes).catch(() => {});
   }, []);
 
-  const loadControllers = async () => {
+  const loadControllers = async (preferId) => {
     if (!projectId) return;
     try {
       const data = await listHwControllers(projectId);
       setControllers(data);
-      if (data.length > 0 && !selectedId) setSelectedId(data[0].id);
+      // Select: preferred controller, else first, else stay null
+      if (preferId && data.some(c => c.id === preferId)) {
+        setSelectedId(preferId);
+      } else if (data.length > 0 && !selectedId) {
+        setSelectedId(data[0].id);
+      }
     } catch {}
   };
 
@@ -116,23 +132,46 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
     listHwFieldbuses(selectedId).then(setFieldbuses).catch(() => setFieldbuses([]));
   }, [selectedId]);
 
+  // ── Reset stale per-controller state when controller changes ──────────────
   useEffect(() => {
-    if (!projectId) return;
+    setSelectedAddrs(new Set());
+    setEditing(null);
+    setEditVal("");
+    setAddingStation(false);
+    setAddingSlot(null);
+    setGenWarnings([]);
+    setConflictRows(null);
+    setIoListInfo(null);
+    setExcelFile(null);
+    setExcelHeaders([]);
+    setSelectedColumns(new Set());
+    setError("");
+  }, [selectedId]);
+
+  // ── Load imports for the project; derive state from selectedId ────────────
+  useEffect(() => {
+    if (!projectId) { setImports([]); return; }
     setError("");
     listHwImports(projectId)
       .then(rows => {
-        if (rows.length > 0) {
-          const latest = rows[0];
-          setImportId(latest.id);
-          setBaselineOk(true);
-          if (latest.baseline_info) setBaselineInfo(latest.baseline_info);
-          if (latest.status === "ready" || latest.status === "generated") setIoListOk(true);
-          loadStations(latest.id);
-          loadCfgs(latest.id);
-        }
+        setImports(rows);
+        // Don't set selectedId here — let the controller list drive it via loadControllers
       })
-      .catch(() => {});
+      .catch(() => { setImports([]); });
   }, [projectId]);
+
+  // ── Load stations/cfgs when importId changes ────────────────────────────
+  useEffect(() => {
+    if (!importId) { setStations([]); setCfgs([]); setBaselineOk(false); setIoListOk(false); return; }
+    const imp = imports.find(i => i.id === importId);
+    if (imp) {
+      setBaselineOk(true);
+      if (imp.baseline_info) setBaselineInfo(imp.baseline_info);
+      if (imp.status === "ready" || imp.status === "generated") setIoListOk(true);
+      loadStations(importId);
+      loadCfgs(importId);
+    }
+  }, [importId, imports]);
 
   // Unified import handoff: when the IO Import screen sends hardware mappings,
   // rows have already been ingested into hw_excel_raw by App.jsx. Run the mapped
@@ -156,7 +195,7 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
         }
         const data = await previewHwMapped(hwId, columnMap);
         if (cancelled) return;
-        setImportId(hwId);
+        // importId is already set via the derivation; just set the display state
         setBaselineOk(true);
         setExcelHeaders([]);       // headers came from IO sheet; not needed here
         setHwTab("import");
@@ -172,7 +211,7 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
     })();
 
     return () => { cancelled = true; };
-  }, [pendingHwMapping, importId]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [pendingHwMapping]);
 
   async function loadStations(id) {
     try {
@@ -197,7 +236,10 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
     setError("");
     try {
       const result = await uploadHwBaseline(projectId, file);
-      setImportId(result.importId);
+      // Refresh imports list and select the newly created controller
+      const rows = await listHwImports(projectId);
+      setImports(rows);
+      await loadControllers();
       setBaselineOk(true);
       setBaselineInfo(result);
     } catch (err) { setError(err.message); }
@@ -704,6 +746,7 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
 
             {hwTab === "mrp" && (
               <MrpPanel
+                key={importId}
                 importId={importId}
                 fieldbuses={fieldbuses}
                 stations={stations}
@@ -714,6 +757,7 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
 
             {hwTab === "config" && (
               <ConfigurationPanel
+                key={importId}
                 importId={importId}
                 baselineOk={baselineOk}
                 baselineInfo={baselineInfo}
