@@ -141,6 +141,16 @@ async function executeWorkflow(db, { importId, projectId, functionMapId }, onPro
       'SELECT id FROM hw_imports WHERE project_id = ? ORDER BY id DESC LIMIT 1'
     ).get(projectId);
 
+    // Warn if multiple controllers exist — multi-controller workflow is not yet automated
+    const controllerCount = await db.prepare(
+      'SELECT COUNT(*) AS cnt FROM hw_controllers WHERE project_id = ?'
+    ).get(projectId);
+    if (controllerCount && controllerCount.cnt > 1) {
+      report(32, 'hardware',
+        `WARNING: This project has ${controllerCount.cnt} controllers. XML generation currently covers only the latest import. ` +
+        'See plan for multi-controller fan-out.');
+    }
+
     if (!hwImport) {
       report(38, 'hardware', 'No hardware import found for this project — skipping hardware sync');
     } else if (!hardwareColumnMap || Object.keys(hardwareColumnMap).length === 0) {

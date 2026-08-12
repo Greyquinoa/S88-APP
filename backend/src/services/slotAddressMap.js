@@ -123,4 +123,39 @@ function baseForSignal(bases, stationAddr, slot, isOutput) {
   return base != null ? base : 0;
 }
 
-module.exports = { buildAllocatedStations, loadSlotAddressBases, baseForSignal };
+/**
+ * Load slot address bases for all imports of a project.
+ * Returns a Map<importId, Map<"addr:slot", {inputAddr,outputAddr,subslotAddrs}>>.
+ * Station addresses are unique per import, so keying by import prevents collisions.
+ */
+async function loadSlotAddressBasesByImport(db, projectId) {
+  const basesByImport = new Map();
+  // Load all imports for this project
+  const imports = await db.prepare(
+    'SELECT id FROM hw_imports WHERE project_id = ?'
+  ).all(projectId);
+  // Build bases per import
+  for (const imp of imports) {
+    const bases = await loadSlotAddressBases(db, imp.id);
+    basesByImport.set(imp.id, bases);
+  }
+  return basesByImport;
+}
+
+/**
+ * Get the base byte for one signal, looking up via its hw_import_id.
+ * Returns 0 when missing (preserving prior behavior).
+ */
+function baseForSignalIn(basesByImport, importId, stationAddr, slot, isOutput) {
+  if (!basesByImport || !importId) return 0;
+  const bases = basesByImport.get(importId);
+  return baseForSignal(bases, stationAddr, slot, isOutput);
+}
+
+module.exports = {
+  buildAllocatedStations,
+  loadSlotAddressBases,
+  baseForSignal,
+  loadSlotAddressBasesByImport,
+  baseForSignalIn,
+};

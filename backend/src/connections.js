@@ -20,7 +20,7 @@
 
 const { latestHwImportId } = require('./signalMappings');
 const { findTemplate, defaultIdentifiers } = require('./services/hwAddressEngine');
-const { loadSlotAddressBases, baseForSignal } = require('./services/slotAddressMap');
+const { loadSlotAddressBases, baseForSignal, loadSlotAddressBasesByImport, baseForSignalIn } = require('./services/slotAddressMap');
 
 // Parse a project_instances.connections JSON column into rule objects.
 function parseConnections(raw) {
@@ -76,18 +76,22 @@ function cascadeBlockOmissions(omitBlocksSet, childBlockMap) {
 // Rebuilds instance_ios for one project. Returns a summary:
 //   { importId, total, real, dummy, conflicts: [...], warnings: [...] }
 async function reconcileConnections(db, projectId) {
-  const importId = await latestHwImportId(db, projectId);
+  const { loadSlotAddressBasesByImport, baseForSignalIn } = require('./services/slotAddressMap');
 
-  // Hardware symbol lookup, keyed by lowercase tag for case-insensitive matching.
-  // Deterministic order means a duplicate tag binds to the first by station/slot/channel.
-  const hwMap = new Map();  // tag_lower -> { id, signal_type, station_address, slot, channel, count, tag_orig }
-  if (importId) {
+  // Hardware symbol lookup from ALL project imports, keyed by lowercase tag.
+  // Deterministic order: hw_import_id, then station/slot/channel, so duplicate tags
+  // across controllers are both reported with their full context.
+  const hwMap = new Map();  // tag_lower -> { id, signal_type, station_address, slot, channel, count, tag_orig, hw_import_id, controller_name }
+  {
     const rows = await db.prepare(
-      `SELECT id, tag, signal_type, station_address, slot, channel
-       FROM hw_signals
-       WHERE hw_import_id = ? AND tag IS NOT NULL AND tag != ''
-       ORDER BY station_address, slot, channel, id`
-    ).all(importId);
+      `SELECT s.id, s.tag, s.signal_type, s.station_address, s.slot, s.channel,
+              s.hw_import_id, c.T16_Controller_TagName AS controller_name
+       FROM hw_signals s
+       JOIN hw_imports i ON s.hw_import_id = i.id
+       LEFT JOIN hw_controllers c ON i.hw_controller_id = c.id
+       WHERE i.project_id = ? AND s.tag IS NOT NULL AND s.tag != ''
+       ORDER BY s.hw_import_id, s.station_address, s.slot, s.channel, s.id`
+    ).all(projectId);
     for (const r of rows) {
       const tagLower = r.tag.toLowerCase();
       const existing = hwMap.get(tagLower);
@@ -96,9 +100,14 @@ async function reconcileConnections(db, projectId) {
         id: r.id, signal_type: r.signal_type,
         station_address: r.station_address, slot: r.slot, channel: r.channel, count: 1,
         tag_orig: r.tag,
+        hw_import_id: r.hw_import_id,
+        controller_name: r.controller_name || '(no controller)',
       });
     }
   }
+
+  // Load address bases keyed by import for per-signal resolution
+  const basesByImport = await loadSlotAddressBasesByImport(db, projectId);
 
   const instRows = await db.prepare(
     `SELECT instance_name, connections FROM project_instances WHERE project_id = ?`
@@ -256,7 +265,7 @@ async function loadConnectionIOsForProject(db, projectId) {
   const rows = await db.prepare(
     `SELECT io.instance_name, io.block_name, io.var_name, io.signal_name, io.signal_type,
             io.required, io.status, io.cascade_status, hw.station_address, hw.slot, hw.channel, hw.description,
-            hw.module_order_no AS hw_module_order_no, hw.signal_type AS hw_signal_type
+            hw.module_order_no AS hw_module_order_no, hw.signal_type AS hw_signal_type, hw.hw_import_id
      FROM instance_ios io
      LEFT JOIN hw_signals hw ON io.hw_signal_id = hw.id
      WHERE io.project_id = ?`
@@ -264,9 +273,8 @@ async function loadConnectionIOsForProject(db, projectId) {
   // Card catalogue for identifier resolution (same source as CFG generation).
   const templateRows = await db.prepare('SELECT order_no, signal_type, in_identifier, out_identifier, default_datatype FROM hw_module_templates').all();
   const templateMap = new Map(templateRows.map(t => [t.order_no, t]));
-  // Per-slot base addresses from the same allocator CFG generation uses, so an
-  // analog card reports "IW 512" here and in the CFG rather than "IW 0".
-  const slotBases = await loadSlotAddressBases(db, await latestHwImportId(db, projectId));
+  // Per-slot base addresses keyed by import to avoid collisions across controllers
+  const basesByImport = await loadSlotAddressBasesByImport(db, projectId);
   const out = {};
   for (const r of rows) {
     // Hardware signal_type is authoritative for direction; fall back to the rule's.
@@ -275,7 +283,7 @@ async function loadConnectionIOsForProject(db, projectId) {
     const isOut   = sigType && /^(AO|DO|Q|BO)$/i.test(sigType);
     const ioAddress = (r.status === 'real')
       ? hwSignalToAddr(r.station_address, r.slot, r.channel, sigType, ident,
-          baseForSignal(slotBases, r.station_address, r.slot, isOut))
+          baseForSignalIn(basesByImport, r.hw_import_id, r.station_address, r.slot, isOut))
       : null;
     // IOTag datatype comes from the hardware card, not the signal: the catalogue
     // entry for the module carries default_datatype. Null leaves the emitter's

@@ -35,35 +35,42 @@ router.get('/project/:projectId', async (req, res) => {
   }
 });
 
-// ── GET /api/signal-mappings/project/:projectId/signals?q=&type=&limit= ───────
-// Candidate signals from the project's latest hw_import. Server-side LIKE filter
-// + hard LIMIT so the picker never loads the full set (scales to 50k+ signals).
+// ── GET /api/signal-mappings/project/:projectId/signals?q=&type=&limit=&controllerId= ──
+// Candidate signals from the project's hw_imports (all controllers, or filtered to one).
+// Server-side LIKE filter + hard LIMIT so the picker never loads the full set.
 router.get('/project/:projectId/signals', async (req, res) => {
   try {
     const db        = getDb();
     const projectId = parseInt(req.params.projectId, 10);
-    const importId  = await latestHwImportId(db, projectId);
-    if (!importId) return res.json({ importId: null, signals: [] });
+    const controllerId = req.query.controllerId ? parseInt(req.query.controllerId, 10) : null;
 
     const q     = (req.query.q || '').trim();
     const type  = (req.query.type || '').trim();
     const limit = Math.min(parseInt(req.query.limit || '200', 10), 500);
 
-    const where = ['hw_import_id = ?', "tag IS NOT NULL", "tag != ''"];
-    const vals  = [importId];
-    if (q)    { where.push('tag LIKE ?');      vals.push(`%${q}%`); }
-    if (type) { where.push('signal_type = ?'); vals.push(type); }
-    vals.push(limit);
+    // Build WHERE clause: all project imports, optionally filtered to one controller
+    const whereImports = controllerId
+      ? ['i.project_id = ?', 'i.hw_controller_id = ?']
+      : ['i.project_id = ?'];
+    const valsImports = controllerId ? [projectId, controllerId] : [projectId];
+
+    const whereSig = ["s.tag IS NOT NULL", "s.tag != ''"];
+    if (q)    { whereSig.push('s.tag LIKE ?');         valsImports.push(`%${q}%`); }
+    if (type) { whereSig.push('s.signal_type = ?');    valsImports.push(type); }
+    valsImports.push(limit);
 
     const signals = await db.prepare(
-      `SELECT id, tag, signal_type, description, station_address, slot, channel
-       FROM hw_signals
-       WHERE ${where.join(' AND ')}
-       ORDER BY tag
+      `SELECT s.id, s.tag, s.signal_type, s.description, s.station_address, s.slot, s.channel,
+              s.hw_import_id, c.T16_Controller_TagName AS controller_name
+       FROM hw_signals s
+       JOIN hw_imports i ON s.hw_import_id = i.id
+       LEFT JOIN hw_controllers c ON i.hw_controller_id = c.id
+       WHERE ${whereImports.join(' AND ')} AND ${whereSig.join(' AND ')}
+       ORDER BY s.tag
        LIMIT ?`
-    ).all(...vals);
+    ).all(...valsImports);
 
-    res.json({ importId, signals });
+    res.json({ signals });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
