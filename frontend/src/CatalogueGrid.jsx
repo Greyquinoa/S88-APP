@@ -682,6 +682,7 @@ function ConfigureModal({ data, templates, compatBySlot, compatBySubslot, onAssi
   const [outputBytes, setOutputBytes] = React.useState(data.output_bytes || 0);
   const [inIdentifier, setInIdentifier] = React.useState(data.in_identifier || '');
   const [outIdentifier, setOutIdentifier] = React.useState(data.out_identifier || '');
+  const [defaultDatatype, setDefaultDatatype] = React.useState(data.default_datatype || '');
 
   const isStation = data.hw_category === 'station';
   const isSlot = data.hw_category === 'slot';
@@ -710,6 +711,10 @@ function ConfigureModal({ data, templates, compatBySlot, compatBySubslot, onAssi
       const numValue = parseInt(value, 10);
       if (isNaN(numValue) || numValue < 0) return;
       patch[field] = numValue;
+    } else if (field === 'default_datatype') {
+      // PCS7 datatypes are case-sensitive PascalCase ("Word", not "WORD"), unlike
+      // the SYMBOL-line identifiers below.
+      patch[field] = value.trim() || null;
     } else {
       patch[field] = value.trim().toUpperCase() || null;
     }
@@ -963,6 +968,32 @@ function ConfigureModal({ data, templates, compatBySlot, compatBySubslot, onAssi
                         }}
                       />
                     </div>
+                  </div>
+
+                  {/* Row 4: Default DataType (full width) */}
+                  <div>
+                    <label style={{ fontSize: '12px', fontWeight: 600, color: '#6b7280', display: 'block', marginBottom: '6px' }}>Default DataType</label>
+                    <input
+                      type="text"
+                      value={defaultDatatype}
+                      onChange={e => setDefaultDatatype(e.target.value)}
+                      onBlur={e => handleFieldChange('default_datatype', e.target.value)}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') handleFieldChange('default_datatype', e.target.value);
+                        if (e.key === 'Escape') setDefaultDatatype(data.default_datatype || '');
+                      }}
+                      placeholder="e.g. Real, Int, Bool, Word, DoubleInt"
+                      title="Default PCS7 datatype for IOTags from this module. Examples: Bool, Real, Int, Word, DoubleInt, DoubleWord, DWord. Leave blank to use fallback (Bool)."
+                      style={{
+                        width: '100%',
+                        padding: '8px 8px',
+                        fontSize: '14px',
+                        border: '1px solid #d1d5db',
+                        borderRadius: '6px',
+                        fontWeight: 500,
+                        fontFamily: 'ui-monospace, monospace',
+                      }}
+                    />
                   </div>
                 </div>
               </div>

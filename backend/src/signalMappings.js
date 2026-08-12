@@ -46,15 +46,18 @@ async function latestHwImportId(db, projectId) {
 // Returns a lookup keyed for O(1) access during emit:
 //   { [instanceName]: { "<block>.<var>": { tag, varDtype, signalType, ioAddress, comment } } }
 // Joins hw_signals via hw_signal_id so IOTag generation gets the hardware address.
+// Derives varDtype from: signal_mappings.var_dtype → hw_module_templates.default_datatype → null
 async function loadMappingsForProject(db, projectId) {
   const { hwSignalToAddr, resolveHwIdentifier } = require('./connections');
   const { loadSlotAddressBases, baseForSignal } = require('./services/slotAddressMap');
   const rows = await db.prepare(
     `SELECT sm.instance_name, sm.block_name, sm.var_name, sm.signal_tag, sm.var_dtype,
             sm.signal_type, hw.station_address, hw.slot, hw.channel, hw.description,
-            hw.module_order_no AS hw_module_order_no, hw.signal_type AS hw_signal_type
+            hw.module_order_no AS hw_module_order_no, hw.signal_type AS hw_signal_type,
+            tpl.default_datatype AS module_default_datatype
      FROM signal_mappings sm
      LEFT JOIN hw_signals hw ON sm.hw_signal_id = hw.id
+     LEFT JOIN hw_module_templates tpl ON hw.module_order_no = tpl.order_no
      WHERE sm.project_id = ?`
   ).all(projectId);
   // Card catalogue for identifier resolution (same source as CFG generation), so an
@@ -74,9 +77,11 @@ async function loadMappingsForProject(db, projectId) {
           resolveHwIdentifier(templateMap, r.hw_module_order_no, sigType),
           baseForSignal(slotBases, r.station_address, r.slot, isOut))
       : null;
+    // Derive varDtype: explicit mapping → module default → null (xmlGenerator will use 'Bool' fallback)
+    const varDtype = r.var_dtype || r.module_default_datatype || null;
     (out[r.instance_name] ||= {})[`${r.block_name}.${r.var_name}`] = {
       tag:        r.signal_tag,
-      varDtype:   r.var_dtype,
+      varDtype,
       signalType: r.signal_type,
       ioAddress,
       comment:    r.description || null,

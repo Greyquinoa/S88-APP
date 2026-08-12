@@ -262,7 +262,7 @@ async function loadConnectionIOsForProject(db, projectId) {
      WHERE io.project_id = ?`
   ).all(projectId);
   // Card catalogue for identifier resolution (same source as CFG generation).
-  const templateRows = await db.prepare('SELECT order_no, signal_type, in_identifier, out_identifier FROM hw_module_templates').all();
+  const templateRows = await db.prepare('SELECT order_no, signal_type, in_identifier, out_identifier, default_datatype FROM hw_module_templates').all();
   const templateMap = new Map(templateRows.map(t => [t.order_no, t]));
   // Per-slot base addresses from the same allocator CFG generation uses, so an
   // analog card reports "IW 512" here and in the CFG rather than "IW 0".
@@ -277,9 +277,14 @@ async function loadConnectionIOsForProject(db, projectId) {
       ? hwSignalToAddr(r.station_address, r.slot, r.channel, sigType, ident,
           baseForSignal(slotBases, r.station_address, r.slot, isOut))
       : null;
+    // IOTag datatype comes from the hardware card, not the signal: the catalogue
+    // entry for the module carries default_datatype. Null leaves the emitter's
+    // 'Bool' fallback in place.
+    const varDtype = templateMap.get(r.hw_module_order_no)?.default_datatype || null;
     (out[r.instance_name] ||= {})[`${r.block_name}.${r.var_name}`] = {
       tag:             r.signal_name,
       signalType:      r.signal_type,
+      varDtype,
       dummy:           r.status !== 'real',
       required:        r.required ? 1 : 0,
       station_address: r.station_address,

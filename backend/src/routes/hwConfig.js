@@ -14,6 +14,7 @@ const { loadStationAutoSlotConfig } = require('../services/autoSlotResolver');
 const ModuleParameterExtractor = require('../services/moduleParameterExtractor');
 const ModuleParameterDb = require('../services/moduleParameterDb');
 const { findStationConflicts, loadExistingStations, buildConflictTable } = require('../services/stationUniqueness');
+const { upsertControllerFromCfg, buildBaselineInfo, ingestDevicesFromCfg } = require('../services/cfgIngest');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
@@ -751,6 +752,107 @@ router.post('/imports/:id/backfill-from-cfg', upload.single('cfg'), async (req, 
     }
 
     res.json({ ok: true, stations: stationCount, slots: slotCount, mrpDevices });
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// POST /api/hw-config/project/:id/upload-cfg (Phase 2 merged endpoint)
+// Accepts a baseline PCS7 CFG file. If the controller exists, additively imports devices.
+// If the controller doesn't exist, creates it atomically along with the devices.
+// Response unifies both old shapes so neither display regresses.
+router.post('/project/:id/upload-cfg', upload.single('cfg'), async (req, res) => {
+  try {
+    const db        = getDb();
+    const projectId = parseInt(req.params.id, 10);
+    if (!(await db.prepare('SELECT id FROM projects WHERE id=?').get(projectId)))
+      return err(res, 404, 'Project not found');
+    if (!req.file) return err(res, 400, 'No file uploaded');
+
+    const cfgText = req.file.buffer.toString('utf8');
+    const parsed  = parseCfg(cfgText);
+
+    if (!parsed.stationName) {
+      return err(res, 400, 'CFG has no station name; cannot identify controller');
+    }
+
+    const devices = parseCfgDevices(cfgText);
+    const baselineInfo = buildBaselineInfo(parsed);
+
+    // ── Validation phase (before any write) ─────────────────────────────────
+    // Resolve controller by station name; then validate cross-controller uniqueness
+    const existingCtrl = await db.prepare(
+      'SELECT id FROM hw_controllers WHERE project_id=? AND T16_Controller_TagName=?'
+    ).get(projectId, parsed.stationName);
+
+    const existingImport = existingCtrl
+      ? await db.prepare('SELECT id FROM hw_imports WHERE project_id=? AND hw_controller_id=?')
+          .get(projectId, existingCtrl.id)
+      : null;
+
+    // Check for address collisions within this controller (hard error)
+    if (existingImport) {
+      const existingStations = await loadExistingStations(db, existingImport.id);
+      const collisions = findStationConflicts([...existingStations, ...devices]);
+      if (collisions.length > 0) {
+        return err(res, 409, 'Station address conflicts: ' + collisions.join('; '),
+          { conflictRows: buildConflictTable([...existingStations, ...devices]) });
+      }
+    }
+
+    // TODO Phase 2: check for cross-controller IP/name collisions (warn, don't block)
+    // TODO Phase 2: skip/overwrite logic for existing stations in this controller
+
+    // ── Transaction: create controller + import + devices ────────────────────
+    const doUpsert = db.transaction(async () => {
+      // Upsert controller + fieldbuses
+      const { controllerId } = await upsertControllerFromCfg(db, projectId, parsed);
+
+      // Upsert import row (keyed by controller now)
+      const existingImportRecheck = await db.prepare(
+        'SELECT id FROM hw_imports WHERE project_id=? AND hw_controller_id=?'
+      ).get(projectId, controllerId);
+
+      let importId;
+      if (existingImportRecheck) {
+        // Update: preserve status, update baseline and info
+        await db.prepare('UPDATE hw_imports SET baseline_cfg=?, baseline_info=?, imported_at=NOW() WHERE id=?')
+          .run(cfgText, JSON.stringify(baselineInfo), existingImportRecheck.id);
+        importId = existingImportRecheck.id;
+      } else {
+        // Insert: new import for this controller
+        const r = await db.prepare(
+          'INSERT INTO hw_imports (project_id, hw_controller_id, baseline_cfg, status, baseline_info) VALUES (?,?,?,?,?)'
+        ).run(projectId, controllerId, cfgText, 'pending', JSON.stringify(baselineInfo));
+        importId = r.lastInsertRowid;
+      }
+
+      // Ingest devices if CFG has any
+      let stats = { stations: 0, slots: 0, mrpDevices: 0, skipped: [], overwritten: [] };
+      if (devices.length > 0) {
+        stats = await ingestDevicesFromCfg(db, importId, cfgText, {});
+      }
+
+      return { importId, controllerId, stats };
+    });
+
+    const { importId, controllerId, stats } = await doUpsert();
+
+    // ── Response ────────────────────────────────────────────────────────────
+    // Shape unifies both old shapes:
+    // - spread baselineInfo for the baseline panel (matches handleBaselineUpload)
+    // - stations/slots for the device counts (matches handleBackfillFromCfg)
+    res.json({
+      importId,
+      controllerId,
+      controllerName: parsed.stationName,
+      controllerCreated: !existingCtrl,
+      ...baselineInfo,
+      stations: stats.stations,
+      slots: stats.slots,
+      mrpDevices: stats.mrpDevices,
+      devicesImported: devices.length > 0,
+      skipped: stats.skipped,
+      overwritten: stats.overwritten,
+    });
   } catch (e) { err(res, 500, e.message); }
 });
 

@@ -122,6 +122,11 @@ async function runGeneration(db, body, onProgress) {
                 bucket[key].ioAddress = entry.ioAddress;
                 bucket[key].comment   = entry.comment || bucket[key].comment || null;
               }
+              // Datatype is a property of the card, so the reconciled entry's
+              // catalogue-derived value fills a mapping that carries none.
+              if (entry.varDtype && !bucket[key].varDtype) {
+                bucket[key].varDtype = entry.varDtype;
+              }
               continue;
             }
             bucket[key] = entry;
