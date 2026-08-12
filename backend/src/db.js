@@ -709,8 +709,12 @@ async function ensureSchema() {
     hw_category    TEXT,
     in_identifier  TEXT,
     out_identifier TEXT,
+    default_datatype TEXT,
     UNIQUE (order_no, hw_category)
   )`);
+
+  // Migration: add default_datatype to hw_module_templates if missing
+  await addColumnIfMissing('hw_module_templates', 'default_datatype', 'default_datatype TEXT');
 
   await rawRun(`CREATE TABLE IF NOT EXISTS hw_imports (
     id           SERIAL PRIMARY KEY,
@@ -914,6 +918,63 @@ async function ensureSchema() {
     updated_at          TIMESTAMPTZ DEFAULT NOW()
   )`);
   await rawRun(`CREATE INDEX IF NOT EXISTS idx_hwfb_ctrl ON hw_fieldbuses(hw_controller_id)`);
+
+  // ── HW Imports ↔ Controllers scoping (Phase 1) ──────────────────────────────────
+  // Migrate hw_imports to be scoped per controller, not per project. This fixes the
+  // corruption where a second controller's CFG upload overwrites the first's baseline_cfg.
+  // hw_controller_id is nullable to support legacy projects with one import + ambiguous
+  // controller assignment (backfilled only when project has exactly one controller AND one import).
+  await addColumnIfMissing('hw_imports', 'hw_controller_id',
+    'hw_controller_id INTEGER REFERENCES hw_controllers(id)');
+  await rawRun(`CREATE INDEX IF NOT EXISTS idx_hwi_ctrl ON hw_imports(hw_controller_id)`);
+
+  // Backfill: assign hw_controller_id only where unambiguous (exactly one controller AND one import per project).
+  // Anything else stays NULL; do not guess, as it would bind an import's signals to the wrong controller.
+  const backfillHwImports = async () => {
+    const backfills = await db.prepare(`
+      SELECT i.id, i.project_id, c.id AS controller_id
+      FROM hw_imports i
+      LEFT JOIN hw_controllers c ON c.project_id = i.project_id
+      WHERE i.hw_controller_id IS NULL
+        AND (SELECT COUNT(DISTINCT hw_controller_id) FROM hw_controllers WHERE project_id = i.project_id) = 1
+        AND (SELECT COUNT(*) FROM hw_imports WHERE project_id = i.project_id) = 1
+    `).all();
+    const updateStmt = db.prepare('UPDATE hw_imports SET hw_controller_id = ? WHERE id = ?');
+    for (const bf of backfills) {
+      await updateStmt.run(bf.controller_id, bf.id);
+    }
+  };
+  try {
+    await backfillHwImports();
+  } catch (e) {
+    console.warn('[ensureSchema] hw_imports backfill skipped (may be first boot):', e.message);
+  }
+
+  // Unique constraint: one CFG per controller, as a database invariant.
+  // (Multiple NULLs are allowed in Postgres unique indexes.)
+  await rawRun(`CREATE UNIQUE INDEX IF NOT EXISTS uq_hwi_proj_ctrl
+    ON hw_imports(project_id, hw_controller_id) WHERE hw_controller_id IS NOT NULL`);
+
+  // Unique constraint on controller names within a project — the entire dispatch
+  // depends on (project_id, T16_Controller_TagName) uniqueness.
+  try {
+    await rawRun(`CREATE UNIQUE INDEX IF NOT EXISTS uq_hwctrl_proj_name
+      ON hw_controllers(project_id, T16_Controller_TagName) WHERE T16_Controller_TagName IS NOT NULL`);
+  } catch (e) {
+    console.warn('[ensureSchema] hw_controllers(project_id, T16_Controller_TagName) unique index already exists or pre-existing data violates it:', e.message);
+  }
+
+  // Log any legacy rows that could not be backfilled.
+  try {
+    const legacyCount = await db.prepare(
+      'SELECT COUNT(*) AS n FROM hw_imports WHERE hw_controller_id IS NULL'
+    ).get();
+    if (legacyCount.n > 0) {
+      console.log(`[ensureSchema] ${legacyCount.n} legacy hw_imports row(s) with hw_controller_id=NULL (pre-phase-1 data)`);
+    }
+  } catch (e) {
+    console.warn('[ensureSchema] Could not log legacy imports:', e.message);
+  }
 
   // Seed common module templates. Idempotent via ON CONFLICT DO NOTHING: order_no+hw_category
   // is UNIQUE, so a row already present is left untouched.

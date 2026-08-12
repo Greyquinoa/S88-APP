@@ -72,7 +72,7 @@ router.post('/module-templates', async (req, res) => {
       order_no, display_name, family, signal_type, channel_count = 0,
       input_bytes = 0, output_bytes = 0, in_addr_fmt, out_addr_fmt,
       param_template, version, gsdml_file, dap_id, hw_category, subslot_defaults, port_config,
-      in_identifier, out_identifier,
+      in_identifier, out_identifier, default_datatype,
     } = req.body;
     if (!order_no || !display_name || !family) return err(res, 400, 'order_no, display_name, family required');
 
@@ -99,24 +99,24 @@ router.post('/module-templates', async (req, res) => {
         order_no=?, display_name=?, family=?, signal_type=?, channel_count=?,
         input_bytes=?, output_bytes=?, in_addr_fmt=?, out_addr_fmt=?,
         param_template=?, version=?, gsdml_file=?, dap_id=?, hw_category=?, subslot_defaults=?, port_config=?,
-        in_identifier=?, out_identifier=?
+        in_identifier=?, out_identifier=?, default_datatype=?
         WHERE id=?`).run(
         order_no, display_name, family, signal_type, channel_count,
         input_bytes, output_bytes, in_addr_fmt, out_addr_fmt,
         param_template, version, gsdml_file, dap_id, hw_category || null, subslot_defaults || null, port_config || null,
-        inIdent, outIdent, existing.id
+        inIdent, outIdent, default_datatype || null, existing.id
       );
       res.json({ id: existing.id, updated: true });
     } else {
       const r = await db.prepare(`INSERT INTO hw_module_templates
         (order_no, display_name, family, signal_type, channel_count, input_bytes, output_bytes,
          in_addr_fmt, out_addr_fmt, param_template, version, gsdml_file, dap_id, hw_category, subslot_defaults, port_config,
-         in_identifier, out_identifier)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+         in_identifier, out_identifier, default_datatype)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
         order_no, display_name, family, signal_type, channel_count,
         input_bytes, output_bytes, in_addr_fmt, out_addr_fmt,
         param_template, version, gsdml_file, dap_id, hw_category || null, subslot_defaults || null, port_config || null,
-        inIdent, outIdent
+        inIdent, outIdent, default_datatype || null
       );
       res.status(201).json({ id: r.lastInsertRowid });
     }
@@ -415,8 +415,12 @@ router.get('/project/:id/imports', async (req, res) => {
   try {
     const db        = getDb();
     const projectId = parseInt(req.params.id, 10);
-    const rows = await db.prepare(
-      'SELECT id, excel_name, status, imported_at, baseline_info, baseline_cfg FROM hw_imports WHERE project_id=? ORDER BY id DESC'
+    const rows = await db.prepare(`
+      SELECT i.id, i.excel_name, i.status, i.imported_at, i.baseline_info, i.baseline_cfg,
+             i.hw_controller_id, c.T16_Controller_TagName AS controller_name
+      FROM hw_imports i
+      LEFT JOIN hw_controllers c ON c.id = i.hw_controller_id
+      WHERE i.project_id=? ORDER BY i.id DESC`
     ).all(projectId);
     const out = [];
     for (const r of rows) {
@@ -431,7 +435,15 @@ router.get('/project/:id/imports', async (req, res) => {
             .run(JSON.stringify(info), r.id);
         } catch (_) { info.pipMappings = []; }
       }
-      out.push({ id: r.id, excel_name: r.excel_name, status: r.status, imported_at: r.imported_at, baseline_info: info });
+      out.push({
+        id: r.id,
+        excel_name: r.excel_name,
+        status: r.status,
+        imported_at: r.imported_at,
+        baseline_info: info,
+        hw_controller_id: r.hw_controller_id,
+        controller_name: r.controller_name,
+      });
     }
     res.json(out);
   } catch (e) { err(res, 500, e.message); }
@@ -464,20 +476,9 @@ router.post('/project/:id/upload-baseline', upload.single('baseline'), async (re
       pipMappings:   parsed.pipMappings,   // [{pipNo, ob, executionTime, timeScale}]
     };
 
-    const existing = await db.prepare('SELECT id FROM hw_imports WHERE project_id=? ORDER BY id DESC LIMIT 1').get(projectId);
-    let importId;
-    if (existing) {
-      await db.prepare('UPDATE hw_imports SET baseline_cfg=?, status=?, baseline_info=? WHERE id=?')
-        .run(cfgText, 'pending', JSON.stringify(baselineInfo), existing.id);
-      importId = existing.id;
-    } else {
-      const r = await db.prepare(
-        'INSERT INTO hw_imports (project_id, baseline_cfg, status, baseline_info) VALUES (?,?,?,?)'
-      ).run(projectId, cfgText, 'pending', JSON.stringify(baselineInfo));
-      importId = r.lastInsertRowid;
-    }
-
-    // ── Auto-populate hw_controller + hw_fieldbuses from parsed CFG ────────────
+    // ── Hoist controller upsert BEFORE import upsert (Phase 1 fix) ────────────
+    // This ensures the import is scoped to the correct controller. Must run before
+    // the import lookup so we have a controllerId to key the import by.
     // Rack chassis is on the RACK header line "RACK N, "orderNo", "name"" — not a SLOT entry
     const rackHeaderMatch = parsed.racks.length > 0
       ? parsed.racks[0].match(/^RACK\s+\d+,\s*"([^"]+)"[^,\n]*,\s*"([^"]+)"/m)
@@ -531,6 +532,24 @@ router.post('/project/:id/upload-baseline', upload.single('baseline'), async (re
         ctrlFields.T50_PS_Order_No, ctrlFields.T50_PS_Name
       );
       controllerId = r.lastInsertRowid;
+    }
+
+    // ── Now lookup the import, keyed by (project_id, hw_controller_id) ────────
+    const existingImport = await db.prepare(
+      'SELECT id FROM hw_imports WHERE project_id=? AND hw_controller_id=?'
+    ).get(projectId, controllerId);
+
+    let importId;
+    if (existingImport) {
+      // Update in place, preserving status (don't reset to 'pending' on re-upload)
+      await db.prepare('UPDATE hw_imports SET baseline_cfg=?, baseline_info=?, imported_at=NOW() WHERE id=?')
+        .run(cfgText, JSON.stringify(baselineInfo), existingImport.id);
+      importId = existingImport.id;
+    } else {
+      const r = await db.prepare(
+        'INSERT INTO hw_imports (project_id, hw_controller_id, baseline_cfg, status, baseline_info) VALUES (?,?,?,?,?)'
+      ).run(projectId, controllerId, cfgText, 'pending', JSON.stringify(baselineInfo));
+      importId = r.lastInsertRowid;
     }
 
     // Replace fieldbuses: one row per PN IO controller found in the CFG
