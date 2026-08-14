@@ -231,7 +231,7 @@ router.get('/:id/pcs7-config', async (req, res) => {
       ).get(projectId, parseInt(controllerId, 10));
       res.json(row || null);
     } else {
-      // Return all configs for this project, joined with controller names for context
+      // Return all configs for this project, joined with controller names and user projects
       const rows = await db.prepare(`
         SELECT pc.*, hwc.T16_Controller_TagName as controller_name
         FROM project_config pc
@@ -239,7 +239,23 @@ router.get('/:id/pcs7-config', async (req, res) => {
         WHERE pc.project_id = ?
         ORDER BY hwc.id NULLS FIRST, pc.updated_at DESC
       `).all(projectId);
-      res.json(rows);
+
+      // For each config, find which user_project(s) contain instances with that controller_id
+      const withUserProjects = [];
+      for (const cfg of rows) {
+        let userProjects = [];
+        if (cfg.hw_controller_id != null) {
+          const upRows = await db.prepare(`
+            SELECT DISTINCT user_project
+            FROM project_instances
+            WHERE project_id = ? AND hw_controller_id = ? AND user_project IS NOT NULL
+            ORDER BY user_project
+          `).all(projectId, cfg.hw_controller_id);
+          userProjects = upRows.map(r => r.user_project);
+        }
+        withUserProjects.push({ ...cfg, user_projects: userProjects });
+      }
+      res.json(withUserProjects);
     }
   } catch (err) {
     res.status(500).json({ error: err.message });

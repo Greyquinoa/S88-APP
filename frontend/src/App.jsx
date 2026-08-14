@@ -1284,11 +1284,15 @@ function Pcs7ConfigPanel({ projectId, configs, onConfigsChange, selectedConfigId
                   style={{ fontSize: 12, padding: "4px 8px", border: "0.5px solid var(--color-border-secondary)",
                     borderRadius: "var(--border-radius-sm)", background: "var(--color-background-primary)",
                     color: "var(--color-text-primary)" }}>
-                  {configs.map(c => (
-                    <option key={c.hw_controller_id ?? "default"} value={c.hw_controller_id ?? ""}>
-                      {c.project_name || `Controller ${c.hw_controller_id || "Default"}`}
-                    </option>
-                  ))}
+                  {configs.map(c => {
+                    const label = c.project_name || `Controller ${c.hw_controller_id || "Default"}`;
+                    const userProjectsLabel = c.user_projects?.length > 0 ? ` (${c.user_projects.join(", ")})` : "";
+                    return (
+                      <option key={c.hw_controller_id ?? "default"} value={c.hw_controller_id ?? ""}>
+                        {label}{userProjectsLabel}
+                      </option>
+                    );
+                  })}
                 </select>
               </div>
             )}
