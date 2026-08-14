@@ -93,7 +93,18 @@ async function runGeneration(db, body, onProgress) {
           WHERE project_id = ?
           ORDER BY sort_order, id
         `).all(proj.id);
-        projectConfig = (await db.prepare(`SELECT * FROM project_config WHERE project_id = ?`).get(proj.id)) || null;
+        // Load ALL controller configs (per-controller, not per-project)
+        const configRows = await db.prepare(`
+          SELECT * FROM project_config WHERE project_id = ?
+          ORDER BY hw_controller_id NULLS FIRST
+        `).all(proj.id);
+        // For now, maintain backward compatibility: projectConfig is the first config
+        // (or null if none exist). The xmlGenerator will use per-controller lookup.
+        projectConfig = configRows.length > 0 ? configRows[0] : null;
+        // Also provide the full map to the generator if needed: { hw_controller_id: config }
+        const projectConfigByController = new Map(
+          configRows.map(c => [c.hw_controller_id, c])
+        );
         signalMaps = await loadMappingsForProject(db, proj.id);
 
         // Per-instance matrix overrides — applied to matrix CM instances below.
@@ -524,7 +535,7 @@ async function runGeneration(db, body, onProgress) {
       // this frame is emitted just before so the label updates before the stall).
       const buildPct = 85 + Math.round(((groupIdx + 1) / groupCount) * 10);
       report(buildPct, 'building', `${up}: building XML…`);
-      const { xml, stats } = generateXML(instDefs, up, hierarchy, instanceFolderMap, projectConfig, connGroups, signalMaps);
+      const { xml, stats } = generateXML(instDefs, up, hierarchy, instanceFolderMap, projectConfig, connGroups, signalMaps, projectConfigByController);
       outputs.push({ userProject: up, xml, stats, instances: groupInstances });
       groupIdx++;
     }

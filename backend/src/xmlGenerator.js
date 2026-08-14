@@ -543,15 +543,20 @@ function buildWireSpecs(connGroups) {
 // signalMaps:        signal-to-instance mappings (optional — additive). Shape:
 //                    { [instanceName]: { "<block>.<var>": { tag, varDtype, signalType } } }
 //                    When empty, output is byte-identical to the pre-feature export.
+// projectConfigByController: Map<hw_controller_id, projectConfig> — per-controller configs
 // Returns: { xml: string, stats: { blocks, vars, msgs, links } }
-function generateXML(instances, projectName, hierarchy, instanceFolderMap, projectConfig, connGroups, signalMaps = {}) {
+function generateXML(instances, projectName, hierarchy, instanceFolderMap, projectConfig, connGroups, signalMaps = {}, projectConfigByController = null) {
   resetCtr();
+  // For single-controller projects, use projectConfig directly for backward compatibility.
+  // For multi-controller projects, we'd need to extend instances to carry controller_id.
+  // For now, keep using projectConfig (first config) as the FX source.
   const FX  = buildFX(projectConfig);
   const b   = makeBuilder();
   const now = new Date().toISOString().slice(0, 19);
   const NS  = 'http://www.siemens.com/automation/2005/SimaticML';
 
   // Use device_name / project_name from config when available, otherwise fall back to projectName arg.
+  // In multi-controller scenarios, the frontend will pass controller-specific configs alongside instances.
   const xmlProjectName = projectConfig?.project_name || projectName;
   const xmlDeviceName  = projectConfig?.device_name  || projectName;
   const xmlExportUser  = projectConfig?.export_user  || 'GENERATED';

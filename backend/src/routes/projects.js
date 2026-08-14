@@ -211,33 +211,66 @@ router.post('/', async (req, res) => {
 });
 
 // ── GET /api/projects/:id/pcs7-config ────────────────────────────────────────
+// Returns array of configs, one per hw_controller. If controller_id query param
+// is provided, returns just that controller's config.
 router.get('/:id/pcs7-config', async (req, res) => {
   try {
     const db  = getDb();
-    const row = await db.prepare('SELECT * FROM project_config WHERE project_id = ?').get(req.params.id);
-    res.json(row || null);
+    const projectId = req.params.id;
+    const controllerId = req.query.controller_id;
+
+    const proj = await db.prepare('SELECT id FROM projects WHERE id = ?').get(projectId);
+    if (!proj) return res.status(404).json({ error: 'Project not found' });
+
+    if (controllerId) {
+      // Return config for a specific controller
+      const row = await db.prepare(
+        'SELECT * FROM project_config WHERE project_id = ? AND hw_controller_id = ?'
+      ).get(projectId, parseInt(controllerId, 10));
+      res.json(row || null);
+    } else {
+      // Return all configs for this project, joined with controller names for context
+      const rows = await db.prepare(`
+        SELECT pc.*, hwc.T16_Controller_TagName as controller_name
+        FROM project_config pc
+        LEFT JOIN hw_controllers hwc ON hwc.id = pc.hw_controller_id
+        WHERE pc.project_id = ?
+        ORDER BY hwc.id NULLS FIRST, pc.updated_at DESC
+      `).all(projectId);
+      res.json(rows);
+    }
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 // ── PUT /api/projects/:id/pcs7-config — save manually-edited fields ──────────
+// Body must include hw_controller_id to identify which controller's config to save
 router.put('/:id/pcs7-config', async (req, res) => {
   try {
     const db  = getDb();
-    const proj = await db.prepare('SELECT id FROM projects WHERE id = ?').get(req.params.id);
-    if (!proj) return res.status(404).json({ error: 'Project not found' });
+    const projectId = req.params.id;
     const {
+      hw_controller_id,
       project_name, project_id_val, device_name, device_id, cpu_id,
       process_cell, process_cell_id, unit_name, unit_id, cm_folder_id,
       export_user, unit_author,
     } = req.body || {};
+
+    const proj = await db.prepare('SELECT id FROM projects WHERE id = ?').get(projectId);
+    if (!proj) return res.status(404).json({ error: 'Project not found' });
+    if (hw_controller_id == null) return res.status(400).json({ error: 'hw_controller_id required' });
+
+    const hwCtrl = await db.prepare('SELECT id FROM hw_controllers WHERE id = ? AND project_id = ?')
+      .get(parseInt(hw_controller_id, 10), projectId);
+    if (!hwCtrl) return res.status(404).json({ error: 'Controller not found in this project' });
+
     await db.prepare(`
       INSERT INTO project_config
-        (project_id, project_name, project_id_val, device_name, device_id, cpu_id,
+        (project_id, hw_controller_id, project_name, project_id_val, device_name, device_id, cpu_id,
          process_cell, process_cell_id, unit_name, unit_id, cm_folder_id, export_user, unit_author, updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NOW())
-      ON CONFLICT(project_id) DO UPDATE SET
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,NOW())
+      ON CONFLICT(project_id, hw_controller_id) DO UPDATE SET
         project_name     = excluded.project_name,
         project_id_val   = excluded.project_id_val,
         device_name      = excluded.device_name,
@@ -252,12 +285,14 @@ router.put('/:id/pcs7-config', async (req, res) => {
         unit_author      = excluded.unit_author,
         updated_at       = NOW()
     `).run(
-      req.params.id,
+      projectId, parseInt(hw_controller_id, 10),
       project_name || '', project_id_val || '', device_name || '', device_id || '', cpu_id || '',
       process_cell || '', process_cell_id || '', unit_name || '', unit_id || '', cm_folder_id || '',
       export_user || '', unit_author || '',
     );
-    const saved = await db.prepare('SELECT * FROM project_config WHERE project_id = ?').get(req.params.id);
+    const saved = await db.prepare(
+      'SELECT * FROM project_config WHERE project_id = ? AND hw_controller_id = ?'
+    ).get(projectId, parseInt(hw_controller_id, 10));
     res.json(saved);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -265,22 +300,42 @@ router.put('/:id/pcs7-config', async (req, res) => {
 });
 
 // ── POST /api/projects/:id/pcs7-config/parse-xml — upload + parse SimaticML ──
+// Query param: controller_id (optional) — if provided, associates config with that controller.
+// If omitted, associates with the first controller in the project.
 router.post('/:id/pcs7-config/parse-xml', upload.single('pcs7xml'), async (req, res) => {
   try {
     const db   = getDb();
-    const proj = await db.prepare('SELECT id FROM projects WHERE id = ?').get(req.params.id);
+    const projectId = req.params.id;
+    const controllerId = req.query.controller_id;
+
+    const proj = await db.prepare('SELECT id FROM projects WHERE id = ?').get(projectId);
     if (!proj) return res.status(404).json({ error: 'Project not found' });
     if (!req.file) return res.status(400).json({ error: 'No file uploaded (field name: pcs7xml)' });
 
     const { config, missing } = await parsePcs7Config(req.file.buffer);
 
-    // Upsert into project_config
+    // Determine which controller to associate with: explicit param, or first controller in project
+    let hwControllerId = null;
+    if (controllerId) {
+      const ctrl = await db.prepare('SELECT id FROM hw_controllers WHERE id = ? AND project_id = ?')
+        .get(parseInt(controllerId, 10), projectId);
+      if (!ctrl) return res.status(404).json({ error: 'Controller not found in this project' });
+      hwControllerId = parseInt(controllerId, 10);
+    } else {
+      // Auto-select first controller if not specified
+      const firstCtrl = await db.prepare(
+        'SELECT id FROM hw_controllers WHERE project_id = ? ORDER BY id LIMIT 1'
+      ).get(projectId);
+      hwControllerId = firstCtrl?.id || null;
+    }
+
+    // Upsert into project_config with controller association
     await db.prepare(`
       INSERT INTO project_config
-        (project_id, project_name, project_id_val, device_name, device_id, cpu_id,
+        (project_id, hw_controller_id, project_name, project_id_val, device_name, device_id, cpu_id,
          process_cell, process_cell_id, unit_name, unit_id, cm_folder_id, export_user, unit_author, updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NOW())
-      ON CONFLICT(project_id) DO UPDATE SET
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,NOW())
+      ON CONFLICT(project_id, hw_controller_id) DO UPDATE SET
         project_name     = excluded.project_name,
         project_id_val   = excluded.project_id_val,
         device_name      = excluded.device_name,
@@ -295,13 +350,15 @@ router.post('/:id/pcs7-config/parse-xml', upload.single('pcs7xml'), async (req, 
         unit_author      = excluded.unit_author,
         updated_at       = NOW()
     `).run(
-      req.params.id,
+      projectId, hwControllerId,
       config.project_name, config.project_id_val, config.device_name, config.device_id, config.cpu_id,
       config.process_cell, config.process_cell_id, config.unit_name, config.unit_id, config.cm_folder_id,
       config.export_user, config.unit_author,
     );
 
-    const saved = await db.prepare('SELECT * FROM project_config WHERE project_id = ?').get(req.params.id);
+    const saved = await db.prepare(
+      'SELECT * FROM project_config WHERE project_id = ? AND hw_controller_id = ?'
+    ).get(projectId, hwControllerId);
     res.json({ config: saved, missing });
   } catch (err) {
     console.error('[Projects] pcs7-config parse error:', err.message);
