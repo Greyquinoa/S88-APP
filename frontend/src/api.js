@@ -347,16 +347,19 @@ export async function executeWorkflowStream({ importId, projectId, functionMapId
 }
 
 // ── PCS7 Project Config ───────────────────────────────────────────────────────
+// Returns array of configs (one per controller)
 export async function getProjectConfig(projectId) {
   return request('GET', `/projects/${projectId}/pcs7-config`);
 }
+// Save config for a specific controller; data must include hw_controller_id
 export async function saveProjectConfig(projectId, data) {
   return request('PUT', `/projects/${projectId}/pcs7-config`, data);
 }
-export async function parseProjectXml(projectId, file) {
+// Parse PCS7 XML; optional params string can specify ?controller_id=N
+export async function parseProjectXml(projectId, file, params = "") {
   const fd = new FormData();
   fd.append('pcs7xml', file);
-  return request('POST', `/projects/${projectId}/pcs7-config/parse-xml`, fd, true);
+  return request('POST', `/projects/${projectId}/pcs7-config/parse-xml${params}`, fd, true);
 }
 
 // ── Valve / Mode Commands ─────────────────────────────────────────────────────
@@ -476,6 +479,13 @@ export async function applyHwIoList(importId, approvedKeys, parsedRows, fileName
 // so the Hardware preview/mapping can consume the same sheet (no re-upload).
 export async function ingestIoRowsIntoHw(hwImportId, ioImportId) {
   return request('POST', `/hw-config/imports/${hwImportId}/ingest-io-rows`, { ioImportId });
+}
+
+// Multi-controller variant: split the IO rows across the project's HW imports by
+// the AS-assignment column. Returns { groups, skipped, ambiguous, totalRows }.
+export async function ingestIoRowsSplitByAs(projectId, ioImportId, asColumn) {
+  return request('POST', `/hw-config/project/${projectId}/ingest-io-rows-split`,
+    { ioImportId, asColumn });
 }
 
 // Preview HW import using stored rows + a column mapping (no file upload).

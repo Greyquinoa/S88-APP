@@ -18,7 +18,7 @@ import {
   getValveCommands, saveValveCommands,
   getIoConnections, createIoConnection, updateIoConnection, deleteIoConnection,
   generateConnections, getConnectionIOs,
-  listHwImports, ingestIoRowsIntoHw,
+  ingestIoRowsSplitByAs,
   getLatestIoImport, getIOHeaders,
   runReconciliation, getReconciliationInstances,
 } from "./api.js";
@@ -91,9 +91,12 @@ export default function App() {
   const [unitTypes, setUnitTypes]           = useState([]);   // global library list
   const [unitInstances, setUnitInstances]   = useState([]);   // per-project
   const [savedProjectId, setSavedProjectId] = useState(null); // DB id of current project
-  const [pendingHwMapping, setPendingHwMapping] = useState(null); // { ioImportId, hardwareMappings } handed off from unified IO screen
+  // { groups, skipped, ambiguous, totalRows, ioImportId, hardwareMappings } handed off
+  // from the unified IO screen; `groups` is one entry per controller the rows split across.
+  const [pendingHwMapping, setPendingHwMapping] = useState(null);
   const [compositeCmTypes, setCompositeCmTypes] = useState([]); // global composite library
-  const [projectConfig, setProjectConfig]   = useState(null);  // PCS7 hardware IDs
+  const [projectConfigs, setProjectConfigs]   = useState([]);  // array of PCS7 configs (one per controller)
+  const [selectedConfigId, setSelectedConfigId] = useState(null); // selected config for editing (hw_controller_id or null)
   const [valveCommands, setValveCommands]   = useState([]);    // user-editable mode command lookup
 
   // ── Unit Connections state ─────────────────────────────────────────────────
@@ -150,7 +153,11 @@ export default function App() {
   }
 
   async function loadProjectConfig(projectId) {
-    try { setProjectConfig(await getProjectConfig(projectId)); } catch (_) {}
+    try {
+      const configs = await getProjectConfig(projectId);
+      setProjectConfigs(Array.isArray(configs) ? configs : []);
+      setSelectedConfigId(null);  // reset to first config
+    } catch (_) {}
   }
 
   // Load connections and variables when unit type is selected
@@ -718,7 +725,8 @@ export default function App() {
           savedProjectId={savedProjectId}
           userProjects={userProjects} setUserProjects={setUserProjects}
           instances={instances} setInstances={setInstances}
-          projectConfig={projectConfig} onProjectConfigChange={setProjectConfig}
+          projectConfigs={projectConfigs} onProjectConfigsChange={setProjectConfigs}
+          selectedConfigId={selectedConfigId} onSelectedConfigIdChange={setSelectedConfigId}
           onCreateProject={name => {
             setSavedProjectName(name);
             setSavedProjectId(null);
@@ -740,14 +748,32 @@ export default function App() {
               onPromoted={() => savedProjectId && loadProjectIntoState(savedProjectId)}
               onImportHardware={async (ioImportId, hardwareMappings) => {
                 try {
-                  const hwImports = await listHwImports(savedProjectId);
-                  const hwImport = Array.isArray(hwImports) && hwImports.length > 0 ? hwImports[0] : null;
-                  if (!hwImport) {
-                    setError('No Hardware import found. Upload a baseline CFG on the HW Config step first, then retry Import Hardware.');
+                  // hardwareMappings is { excelColumn: hwField } — find the column bound to AS.
+                  const asColumn = Object.keys(hardwareMappings)
+                    .find(col => hardwareMappings[col] === 'as_assignment');
+                  if (!asColumn) {
+                    setError('AS Assignment column is not mapped. Map it on the column-mapping screen and retry.');
                     return;
                   }
-                  await ingestIoRowsIntoHw(hwImport.id, ioImportId);
-                  setPendingHwMapping({ hwImportId: hwImport.id, ioImportId, hardwareMappings });
+
+                  // The server groups the rows by AS value and stages each group into
+                  // its own controller's hw_excel_raw.
+                  const result = await ingestIoRowsSplitByAs(savedProjectId, ioImportId, asColumn);
+
+                  if (!result.groups || result.groups.length === 0) {
+                    const seen = (result.skipped || []).map(s => `"${s.asValue || '(blank)'}"`).join(', ');
+                    setError(`No rows matched any controller. AS values found in the sheet: ${seen || 'none'}. ` +
+                             `Check the AS column mapping, or upload a baseline CFG for those controllers.`);
+                    return;
+                  }
+
+                  setPendingHwMapping({
+                    groups:    result.groups,      // [{ hwImportId, controllerName, rowCount }]
+                    skipped:   result.skipped,
+                    ambiguous: result.ambiguous,
+                    totalRows: result.totalRows,
+                    ioImportId, hardwareMappings,
+                  });
                   setStep(7);
                 } catch (e) {
                   setError(e.message);
@@ -925,7 +951,7 @@ export default function App() {
 // ── Step 0: Projects ─────────────────────────────────────────────────────────
 function StepProjects({ loading, savedProjectName, savedProjectId,
     userProjects, setUserProjects, instances, setInstances,
-    projectConfig, onProjectConfigChange,
+    projectConfigs, onProjectConfigsChange, selectedConfigId, onSelectedConfigIdChange,
     onCreateProject, onLoadProject, setError }) {
   const [projects, setProjects]   = useState([]);
   const [busy, setBusy]           = useState(false);
@@ -1126,8 +1152,10 @@ function StepProjects({ loading, savedProjectName, savedProjectId,
 
             <Pcs7ConfigPanel
               projectId={savedProjectId}
-              config={projectConfig}
-              onConfigChange={onProjectConfigChange}
+              configs={projectConfigs}
+              onConfigsChange={onProjectConfigsChange}
+              selectedConfigId={selectedConfigId}
+              onSelectedConfigIdChange={onSelectedConfigIdChange}
               setError={setError} />
           </>
           )}
@@ -1160,26 +1188,32 @@ const PCS7_CONFIG_FIELDS = [
   { key: "unit_author",     label: "Unit Author"     },
 ];
 
-function Pcs7ConfigPanel({ projectId, config, onConfigChange, setError }) {
+function Pcs7ConfigPanel({ projectId, configs, onConfigsChange, selectedConfigId, onSelectedConfigIdChange, setError }) {
   const [expanded, setExpanded] = useState(false);
-  const [draft, setDraft]       = useState(null);  // editing state
+  const [draft, setDraft]       = useState(null);
   const [saving, setSaving]     = useState(false);
   const [parseMsg, setParseMsg] = useState("");
   const fileRef = useRef(null);
 
-  const hasConfig = config && Object.values(config).some(v => v && typeof v === "string" && v.length > 0);
+  // Get the currently selected config (or first if none selected)
+  const selectedConfig = configs.find(c => c.hw_controller_id === selectedConfigId) || configs[0];
+  const hasAnyConfig = configs.some(c => Object.values(c).some(v => v && typeof v === "string" && v.length > 0));
 
   function startEdit() {
-    setDraft(PCS7_CONFIG_FIELDS.reduce((acc, f) => ({ ...acc, [f.key]: config?.[f.key] || "" }), {}));
+    if (!selectedConfig) return;
+    setDraft(PCS7_CONFIG_FIELDS.reduce((acc, f) => ({ ...acc, [f.key]: selectedConfig?.[f.key] || "" }), {}));
   }
   function cancelEdit() { setDraft(null); }
 
   async function handleSave() {
-    if (!projectId || !draft) return;
+    if (!projectId || !draft || !selectedConfig) return;
     setSaving(true);
     try {
-        const saved = await saveProjectConfig(projectId, draft);
-        onConfigChange(saved);
+        const hwControllerId = selectedConfig.hw_controller_id;
+        const saved = await saveProjectConfig(projectId, { ...draft, hw_controller_id: hwControllerId });
+        // Update the configs array
+        const updated = configs.map(c => c.hw_controller_id === hwControllerId ? saved : c);
+        onConfigsChange(updated);
         setDraft(null);
     } catch (e) { setError(e.message); }
     finally { setSaving(false); }
@@ -1190,8 +1224,14 @@ function Pcs7ConfigPanel({ projectId, config, onConfigChange, setError }) {
     if (!file || !projectId) return;
     setParseMsg("Parsing…");
     try {
-        const { config: saved, missing } = await parseProjectXml(projectId, file);
-        onConfigChange(saved);
+        const hwControllerId = selectedConfig?.hw_controller_id;
+        const params = hwControllerId ? `?controller_id=${hwControllerId}` : "";
+        const { config: saved, missing } = await parseProjectXml(projectId, file, params);
+        // Update the configs array
+        const updated = hwControllerId
+          ? configs.map(c => c.hw_controller_id === hwControllerId ? saved : c)
+          : [saved, ...configs.filter(c => c.hw_controller_id !== null)];
+        onConfigsChange(updated);
         setParseMsg(missing.length
           ? `Loaded. Not found in XML: ${missing.join(", ")}`
           : "All fields extracted successfully.");
@@ -1213,15 +1253,15 @@ function Pcs7ConfigPanel({ projectId, config, onConfigChange, setError }) {
               cursor: "pointer", padding: 0, fontSize: 13, fontWeight: 500,
               color: "var(--color-text-primary)" }}>
             <i className={`ti ti-chevron-${expanded ? "down" : "right"}`} style={{ fontSize: 12 }} />
-            PCS7 Project Config
-            {hasConfig && !expanded && (
+            PCS7 Project Config {configs.length > 1 && `(${configs.length} controllers)`}
+            {hasAnyConfig && !expanded && (
               <span style={{ fontSize: 11, marginLeft: 4, color: "var(--color-text-secondary)", fontWeight: 400 }}>
-                ({config.project_name || config.device_name || "configured"})
+                — configured
               </span>
             )}
-            {!hasConfig && (
+            {!hasAnyConfig && (
               <span style={{ fontSize: 11, marginLeft: 4, color: "#D97706", fontWeight: 400 }}>
-                — using default IDs
+                — using defaults
               </span>
             )}
           </button>
@@ -1231,9 +1271,27 @@ function Pcs7ConfigPanel({ projectId, config, onConfigChange, setError }) {
           <div style={{ border: "0.5px solid var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)",
               padding: "12px 14px", background: "var(--color-background-secondary)" }}>
             <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 10 }}>
-              Upload a PCS7 SimaticML export to fill in project-level hardware IDs automatically,
-              or edit fields manually. These IDs are written into the generated XML.
+              Upload PCS7 SimaticML exports per AS controller to fill in hardware IDs,
+              or edit manually. Each controller's config is saved separately.
             </div>
+
+            {configs.length > 0 && (
+              <div style={{ marginBottom: 12 }}>
+                <label style={{ fontSize: 12, color: "var(--color-text-secondary)", display: "block", marginBottom: 4 }}>
+                  Select Controller:
+                </label>
+                <select value={selectedConfigId ?? ""} onChange={e => onSelectedConfigIdChange(e.target.value === "" ? null : parseInt(e.target.value, 10))}
+                  style={{ fontSize: 12, padding: "4px 8px", border: "0.5px solid var(--color-border-secondary)",
+                    borderRadius: "var(--border-radius-sm)", background: "var(--color-background-primary)",
+                    color: "var(--color-text-primary)" }}>
+                  {configs.map(c => (
+                    <option key={c.hw_controller_id ?? "default"} value={c.hw_controller_id ?? ""}>
+                      {c.project_name || `Controller ${c.hw_controller_id || "Default"}`}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
 
             {/* Upload row */}
             <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
@@ -1249,64 +1307,67 @@ function Pcs7ConfigPanel({ projectId, config, onConfigChange, setError }) {
               )}
             </div>
 
-            {/* Field table */}
-            {draft ? (
+            {selectedConfig && (
               <>
-                <div style={{ display: "grid", gridTemplateColumns: "160px 1fr",
-                    border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-md)",
-                    overflow: "hidden", marginBottom: 10 }}>
-                  {PCS7_CONFIG_FIELDS.map((f, idx) => (
-                    <React.Fragment key={f.key}>
-                      <div style={{ padding: "5px 10px", fontSize: 12,
-                          color: "var(--color-text-secondary)", fontWeight: 500,
-                          background: "var(--color-background-secondary)",
-                          borderBottom: idx < PCS7_CONFIG_FIELDS.length - 1 ? "0.5px solid var(--color-border-tertiary)" : "none" }}>
-                        {f.label}
-                      </div>
-                      <div style={{ padding: "3px 8px",
-                          borderLeft: "0.5px solid var(--color-border-tertiary)",
-                          borderBottom: idx < PCS7_CONFIG_FIELDS.length - 1 ? "0.5px solid var(--color-border-tertiary)" : "none" }}>
-                        <input value={draft[f.key] || ""} onChange={e => setDraft(d => ({ ...d, [f.key]: e.target.value }))}
-                          style={{ width: "100%", padding: "3px 6px", fontSize: 12, fontFamily: "var(--font-mono)",
-                            border: "0.5px solid var(--color-border-secondary)", borderRadius: "var(--border-radius-sm)",
-                            background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
-                      </div>
-                    </React.Fragment>
-                  ))}
-                </div>
-                <div style={{ display: "flex", gap: 8 }}>
-                  <Btn primary onClick={handleSave} disabled={saving}>
-                    {saving ? "Saving…" : "Save"}
-                  </Btn>
-                  <Btn onClick={cancelEdit}>Cancel</Btn>
-                </div>
-              </>
-            ) : (
-              <>
-                <div style={{ display: "grid", gridTemplateColumns: "160px 1fr",
-                    border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-md)",
-                    overflow: "hidden", marginBottom: 10 }}>
-                  {PCS7_CONFIG_FIELDS.map((f, idx) => {
-                    const val = config?.[f.key];
-                    return (
-                      <React.Fragment key={f.key}>
-                        <div style={{ padding: "5px 10px", fontSize: 12,
-                            color: "var(--color-text-secondary)", fontWeight: 500,
-                            background: "var(--color-background-secondary)",
-                            borderBottom: idx < PCS7_CONFIG_FIELDS.length - 1 ? "0.5px solid var(--color-border-tertiary)" : "none" }}>
-                          {f.label}
-                        </div>
-                        <div style={{ padding: "5px 10px", fontSize: 12, fontFamily: "var(--font-mono)",
-                            color: val ? "var(--color-text-primary)" : "var(--color-text-secondary)",
-                            borderLeft: "0.5px solid var(--color-border-tertiary)",
-                            borderBottom: idx < PCS7_CONFIG_FIELDS.length - 1 ? "0.5px solid var(--color-border-tertiary)" : "none" }}>
-                          {val || <em style={{ fontStyle: "italic" }}>— default</em>}
-                        </div>
-                      </React.Fragment>
-                    );
-                  })}
-                </div>
-                <Btn onClick={startEdit}><i className="ti ti-edit" /> Edit</Btn>
+                {draft ? (
+                  <>
+                    <div style={{ display: "grid", gridTemplateColumns: "160px 1fr",
+                        border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-md)",
+                        overflow: "hidden", marginBottom: 10 }}>
+                      {PCS7_CONFIG_FIELDS.map((f, idx) => (
+                        <React.Fragment key={f.key}>
+                          <div style={{ padding: "5px 10px", fontSize: 12,
+                              color: "var(--color-text-secondary)", fontWeight: 500,
+                              background: "var(--color-background-secondary)",
+                              borderBottom: idx < PCS7_CONFIG_FIELDS.length - 1 ? "0.5px solid var(--color-border-tertiary)" : "none" }}>
+                            {f.label}
+                          </div>
+                          <div style={{ padding: "3px 8px",
+                              borderLeft: "0.5px solid var(--color-border-tertiary)",
+                              borderBottom: idx < PCS7_CONFIG_FIELDS.length - 1 ? "0.5px solid var(--color-border-tertiary)" : "none" }}>
+                            <input value={draft[f.key] || ""} onChange={e => setDraft(d => ({ ...d, [f.key]: e.target.value }))}
+                              style={{ width: "100%", padding: "3px 6px", fontSize: 12, fontFamily: "var(--font-mono)",
+                                border: "0.5px solid var(--color-border-secondary)", borderRadius: "var(--border-radius-sm)",
+                                background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
+                          </div>
+                        </React.Fragment>
+                      ))}
+                    </div>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <Btn primary onClick={handleSave} disabled={saving}>
+                        {saving ? "Saving…" : "Save"}
+                      </Btn>
+                      <Btn onClick={cancelEdit}>Cancel</Btn>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div style={{ display: "grid", gridTemplateColumns: "160px 1fr",
+                        border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-md)",
+                        overflow: "hidden", marginBottom: 10 }}>
+                      {PCS7_CONFIG_FIELDS.map((f, idx) => {
+                        const val = selectedConfig?.[f.key];
+                        return (
+                          <React.Fragment key={f.key}>
+                            <div style={{ padding: "5px 10px", fontSize: 12,
+                                color: "var(--color-text-secondary)", fontWeight: 500,
+                                background: "var(--color-background-secondary)",
+                                borderBottom: idx < PCS7_CONFIG_FIELDS.length - 1 ? "0.5px solid var(--color-border-tertiary)" : "none" }}>
+                              {f.label}
+                            </div>
+                            <div style={{ padding: "5px 10px", fontSize: 12, fontFamily: "var(--font-mono)",
+                                color: val ? "var(--color-text-primary)" : "var(--color-text-secondary)",
+                                borderLeft: "0.5px solid var(--color-border-tertiary)",
+                                borderBottom: idx < PCS7_CONFIG_FIELDS.length - 1 ? "0.5px solid var(--color-border-tertiary)" : "none" }}>
+                              {val || <em style={{ fontStyle: "italic" }}>— default</em>}
+                            </div>
+                          </React.Fragment>
+                        );
+                      })}
+                    </div>
+                    <Btn onClick={startEdit}><i className="ti ti-edit" /> Edit</Btn>
+                  </>
+                )}
               </>
             )}
           </div>
@@ -4212,7 +4273,7 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
                       ` · ${connResult.conflicts.length} duplicate symbol${connResult.conflicts.length !== 1 ? "s" : ""} (bound first)`}
                     {connResult.warnings?.length > 0 &&
                       ` · ${connResult.warnings.length} type warning${connResult.warnings.length !== 1 ? "s" : ""}`}
-                    {connResult.importId == null && " · no hardware import found"}
+                    {!connResult.importIds?.length && " · no hardware import found"}
                   </>
                 ) : (
                   <>Connection generation failed: {connResult.message}</>
