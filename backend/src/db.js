@@ -436,6 +436,17 @@ async function ensureSchema() {
     UNIQUE(project_id, hw_controller_id)
   )`);
 
+  // Backfill: add hw_controller_id column if it doesn't exist (for existing databases)
+  await addColumnIfMissing('project_config', 'hw_controller_id', 'hw_controller_id INTEGER REFERENCES hw_controllers(id)');
+
+  // Also ensure the UNIQUE constraint exists
+  try {
+    await rawRun(`ALTER TABLE project_config DROP CONSTRAINT IF EXISTS project_config_project_id_key`);
+  } catch (_) {}
+  try {
+    await rawRun(`ALTER TABLE project_config ADD CONSTRAINT project_config_project_id_hw_controller_id_key UNIQUE(project_id, hw_controller_id)`);
+  } catch (_) {}  // constraint may already exist
+
   // ── IO Import System ──────────────────────────────────────────────
   const ioStmts = [
     `CREATE TABLE IF NOT EXISTS io_imports (
