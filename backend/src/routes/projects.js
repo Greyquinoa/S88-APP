@@ -231,31 +231,15 @@ router.get('/:id/pcs7-config', async (req, res) => {
       ).get(projectId, parseInt(controllerId, 10));
       res.json(row || null);
     } else {
-      // Return all configs for this project, joined with controller names and user projects
+      // Return all configs for this project, joined with controller names and user_project
       const rows = await db.prepare(`
-        SELECT pc.*, hwc.T16_Controller_TagName as controller_name
+        SELECT pc.*, hwc.T16_Controller_TagName as controller_name, hwc.user_project
         FROM project_config pc
         LEFT JOIN hw_controllers hwc ON hwc.id = pc.hw_controller_id
         WHERE pc.project_id = ?
         ORDER BY hwc.id NULLS FIRST, pc.updated_at DESC
       `).all(projectId);
-
-      // For each config, find which user_project(s) contain instances with that controller_id
-      const withUserProjects = [];
-      for (const cfg of rows) {
-        let userProjects = [];
-        if (cfg.hw_controller_id != null) {
-          const upRows = await db.prepare(`
-            SELECT DISTINCT user_project
-            FROM project_instances
-            WHERE project_id = ? AND hw_controller_id = ? AND user_project IS NOT NULL
-            ORDER BY user_project
-          `).all(projectId, cfg.hw_controller_id);
-          userProjects = upRows.map(r => r.user_project);
-        }
-        withUserProjects.push({ ...cfg, user_projects: userProjects });
-      }
-      res.json(withUserProjects);
+      res.json(rows);
     }
   } catch (err) {
     res.status(500).json({ error: err.message });

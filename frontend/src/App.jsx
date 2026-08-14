@@ -1286,10 +1286,10 @@ function Pcs7ConfigPanel({ projectId, configs, onConfigsChange, selectedConfigId
                     color: "var(--color-text-primary)" }}>
                   {configs.map(c => {
                     const label = c.project_name || `Controller ${c.hw_controller_id || "Default"}`;
-                    const userProjectsLabel = c.user_projects?.length > 0 ? ` (${c.user_projects.join(", ")})` : "";
+                    const asLabel = c.user_project ? ` [${c.user_project}]` : " [unassigned]";
                     return (
                       <option key={c.hw_controller_id ?? "default"} value={c.hw_controller_id ?? ""}>
-                        {label}{userProjectsLabel}
+                        {label}{asLabel}
                       </option>
                     );
                   })}

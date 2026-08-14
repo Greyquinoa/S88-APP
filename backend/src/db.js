@@ -1459,6 +1459,9 @@ async function ensureSchema() {
   await addColumnIfMissing('project_instances', 'hw_controller_id', 'hw_controller_id INTEGER REFERENCES hw_controllers(id)');
   await rawRun(`CREATE INDEX IF NOT EXISTS idx_pi_hw_controller ON project_instances(hw_controller_id)`);
 
+  // Migration: add user_project to hw_controllers so each controller maps to its AS
+  await addColumnIfMissing('hw_controllers', 'user_project', 'user_project TEXT');
+
   console.log('[DB] Schema ready');
 }
 
