@@ -1455,6 +1455,10 @@ async function ensureSchema() {
   await addColumnIfMissing('project_instances', 'last_reconciled_at', 'last_reconciled_at TIMESTAMPTZ');
   await rawRun(`CREATE INDEX IF NOT EXISTS idx_pi_recon_status ON project_instances(project_id, reconciliation_status)`);
 
+  // Migration: add hw_controller_id to project_instances for per-controller config lookup
+  await addColumnIfMissing('project_instances', 'hw_controller_id', 'hw_controller_id INTEGER REFERENCES hw_controllers(id)');
+  await rawRun(`CREATE INDEX IF NOT EXISTS idx_pi_hw_controller ON project_instances(hw_controller_id)`);
+
   console.log('[DB] Schema ready');
 }
 

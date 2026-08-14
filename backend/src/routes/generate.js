@@ -40,6 +40,7 @@ async function runGeneration(db, body, onProgress) {
   // Load the hierarchy and project config for this saved project (looked up by name).
   let hierarchy = [];
   let projectConfig = null;
+  let projectConfigByController = null;
   let signalMaps = {};   // { instanceName: { "block.var": { tag, ... } } } — injected at export
   let matrixOverrides = {};   // { instanceName: { enabled, cells: { mode_nr: { colName: val } } } }
   // Instances whose reconciliation left them as unaccepted DUMMY are excluded
@@ -52,6 +53,19 @@ async function runGeneration(db, body, onProgress) {
           `SELECT instance_name FROM project_instances WHERE project_id = ? AND reconciliation_status = 'DUMMY'`
         ).all(proj.id);
         excludedDummies = dummyRows.map(r => r.instance_name);
+
+        // Enrich instances with their hw_controller_id from the database, so each
+        // instance can be matched to its controller's PCS7 config during XML generation.
+        const savedInstances = await db.prepare(
+          `SELECT instance_name, hw_controller_id FROM project_instances WHERE project_id = ?`
+        ).all(proj.id);
+        const instanceControllerMap = new Map(
+          savedInstances.map(s => [s.instance_name, s.hw_controller_id])
+        );
+        instances = instances.map(inst => {
+          const hwCtrlId = instanceControllerMap.get(inst.instanceName);
+          return hwCtrlId !== undefined ? { ...inst, hw_controller_id: hwCtrlId } : inst;
+        });
 
         // Safety net: enabledBlocks is client-supplied, and an empty list silently
         // drops every optional block from the export. The saved profile is the
@@ -102,7 +116,7 @@ async function runGeneration(db, body, onProgress) {
         // (or null if none exist). The xmlGenerator will use per-controller lookup.
         projectConfig = configRows.length > 0 ? configRows[0] : null;
         // Also provide the full map to the generator if needed: { hw_controller_id: config }
-        const projectConfigByController = new Map(
+        projectConfigByController = new Map(
           configRows.map(c => [c.hw_controller_id, c])
         );
         signalMaps = await loadMappingsForProject(db, proj.id);

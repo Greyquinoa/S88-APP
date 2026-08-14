@@ -48,7 +48,7 @@ router.get('/:id', async (req, res) => {
 
     const instanceRows = await db.prepare(`
       SELECT cm_type, instance_name, sampling_time, user_project, folder_id, role_assignments,
-             composite_group_id, composite_id, member_idx, source, connections
+             composite_group_id, composite_id, member_idx, source, connections, hw_controller_id
       FROM project_instances
       WHERE project_id = ?
       ORDER BY sort_order, id
@@ -172,12 +172,13 @@ router.post('/', async (req, res) => {
 
       const insInst = db.prepare(`
         INSERT INTO project_instances (project_id, cm_type, instance_name, sampling_time, user_project, folder_id, role_assignments, sort_order, composite_group_id, composite_id, member_idx, source, connections,
-          is_imported, is_generated, reconciliation_status, accepted_at, accepted_by, last_reconciled_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          is_imported, is_generated, reconciliation_status, accepted_at, accepted_by, last_reconciled_at, hw_controller_id)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       `);
       for (let idx = 0; idx < instances.length; idx++) {
         const i = instances[idx];
         const folderDbId = i.folder_client_id != null ? folderIdMap[i.folder_client_id] ?? null : null;
+        const hwCtrlId = i.hw_controller_id ?? null;
         // Carry forward reconciliation state for a row that already existed under
         // this name; a genuinely new instance starts unreconciled.
         const rec = priorRecon.get(i.instance_name);
@@ -188,7 +189,8 @@ router.post('/', async (req, res) => {
           i.source || 'manual', JSON.stringify(i.connections || []),
           rec?.is_imported ?? false, rec?.is_generated ?? false,
           rec?.reconciliation_status ?? 'PENDING',
-          rec?.accepted_at ?? null, rec?.accepted_by ?? null, rec?.last_reconciled_at ?? null);
+          rec?.accepted_at ?? null, rec?.accepted_by ?? null, rec?.last_reconciled_at ?? null,
+          hwCtrlId);
       }
 
       const insProf = db.prepare(`
