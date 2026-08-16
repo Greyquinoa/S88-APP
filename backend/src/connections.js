@@ -211,7 +211,13 @@ async function reconcileConnections(db, projectId) {
   });
   await rebuild();
 
-  return { importId, total: desired.length, real, dummy, conflicts, warnings };
+  // Reconciliation spans every hw_import in the project, so there is no single
+  // "the" import to report — return the set that actually contributed a match.
+  const importIds = [...new Set(
+    [...hwMap.values()].map(h => h.hw_import_id)
+  )].sort((a, b) => a - b);
+
+  return { importIds, total: desired.length, real, dummy, conflicts, warnings };
 }
 
 // ── IO address computation ────────────────────────────────────────────────────

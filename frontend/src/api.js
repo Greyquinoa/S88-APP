@@ -12,10 +12,17 @@ async function request(method, path, body, isFile = false) {
     opts.body = body; // FormData
   }
   const res = await fetch(`${BASE}${path}`, opts);
-  const data = await res.json();
+  // 204 No Content (and any empty body) has nothing to parse — res.json() would
+  // throw "Unexpected end of JSON input" on an otherwise successful request.
+  const text = await res.text();
+  let data = null;
+  if (text) {
+    try { data = JSON.parse(text); }
+    catch { if (res.ok) throw new Error('Invalid JSON response from server'); }
+  }
   if (!res.ok) {
-    const e = new Error(data.error || `HTTP ${res.status}`);
-    if (data.conflictRows) e.conflictRows = data.conflictRows;
+    const e = new Error(data?.error || `HTTP ${res.status}`);
+    if (data?.conflictRows) e.conflictRows = data.conflictRows;
     throw e;
   }
   return data;
@@ -347,19 +354,32 @@ export async function executeWorkflowStream({ importId, projectId, functionMapId
 }
 
 // ── PCS7 Project Config ───────────────────────────────────────────────────────
-// Returns array of configs (one per controller)
 export async function getProjectConfig(projectId) {
   return request('GET', `/projects/${projectId}/pcs7-config`);
 }
-// Save config for a specific controller; data must include hw_controller_id
 export async function saveProjectConfig(projectId, data) {
   return request('PUT', `/projects/${projectId}/pcs7-config`, data);
 }
-// Parse PCS7 XML; optional params string can specify ?controller_id=N
-export async function parseProjectXml(projectId, file, params = "") {
+export async function parseProjectXml(projectId, file) {
   const fd = new FormData();
   fd.append('pcs7xml', file);
-  return request('POST', `/projects/${projectId}/pcs7-config/parse-xml${params}`, fd, true);
+  return request('POST', `/projects/${projectId}/pcs7-config/parse-xml`, fd, true);
+}
+
+// ── PCS7 User-Project Config (per-user-project scoping) ────────────────────
+export async function getUserProjectConfig(projectId, userProjectName) {
+  return request('GET', `/projects/${projectId}/user-projects/${encodeURIComponent(userProjectName)}/pcs7-config`);
+}
+export async function saveUserProjectConfig(projectId, userProjectName, data) {
+  return request('PUT', `/projects/${projectId}/user-projects/${encodeURIComponent(userProjectName)}/pcs7-config`, data);
+}
+export async function parseUserProjectXml(projectId, userProjectName, file) {
+  const fd = new FormData();
+  fd.append('pcs7xml', file);
+  return request('POST', `/projects/${projectId}/user-projects/${encodeURIComponent(userProjectName)}/pcs7-config/parse-xml`, fd, true);
+}
+export async function saveUserProjectConfigWithWarning(projectId, userProjectName, config, targetUserProject) {
+  return request('POST', `/projects/${projectId}/user-projects/${encodeURIComponent(userProjectName)}/pcs7-config/save-with-warning`, { config, targetUserProject });
 }
 
 // ── Valve / Mode Commands ─────────────────────────────────────────────────────

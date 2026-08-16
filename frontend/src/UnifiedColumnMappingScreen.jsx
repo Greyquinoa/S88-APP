@@ -163,6 +163,7 @@ const HW_CORE_MANDATORY = [
   { key: 'slot', label: 'SLOT *', desc: 'Module position in rack' },
   { key: 'tag', label: 'TAG *', desc: 'Signal identifier' },
   { key: 'channel', label: 'CHANNEL *', desc: 'Signal channel number' },
+  { key: 'as_assignment', label: 'AS ASSIGNMENT *', desc: 'Controller this row belongs to (e.g. AS01)' },
 ];
 
 const HW_MODULE_ORDER_FIELD = { key: 'module_order_no', label: 'MODULE ORDER NO (CARD MLFB)', desc: 'Siemens module catalog number — Tier 1' };

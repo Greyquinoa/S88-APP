@@ -1921,6 +1921,21 @@ function TabWorkflow({ importId, projectId, functionMaps, columnMaps, currentImp
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
           <Callout tone="success">✓ Workflow completed successfully</Callout>
 
+          {/* Controllers whose CFG could not be built — without this they simply
+              have no download button and the reason is invisible. */}
+          {result.cfgErrors?.length > 0 && (
+            <Callout tone="warning">
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>
+                {result.cfgErrors.length} controller{result.cfgErrors.length > 1 ? 's' : ''} produced no CFG
+              </div>
+              {result.cfgErrors.map((e, i) => (
+                <div key={i} style={{ fontSize: 12 }}>
+                  {e.controllerName || `import ${e.hwImportId}`}: {e.error}
+                </div>
+              ))}
+            </Callout>
+          )}
+
           {/* Stats */}
           {result.stats && (
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: 8 }}>
@@ -1935,40 +1950,53 @@ function TabWorkflow({ importId, projectId, functionMaps, columnMaps, currentImp
           )}
 
           {/* XML + CFG downloads */}
-          {(result.xml || result.cfg) && (
-            <div style={{ display: 'flex', gap: 8 }}>
-              {result.xml && (
-                <Btn primary
+          {(result.xml || result.cfg || result.cfgs?.length) && (
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              {/* One button per user project. Falls back to the single combined
+                  XML for older responses that carry no outputs array. */}
+              {(result.outputs?.length ? result.outputs : (result.xml ? [{ userProject: null, xml: result.xml }] : []))
+                .map((out, i) => (
+                <Btn key={out.userProject || i} primary
                   onClick={() => {
-                    const blob = new Blob([result.xml], { type: 'application/xml' });
+                    const blob = new Blob([out.xml], { type: 'application/xml' });
                     const url = URL.createObjectURL(blob);
                     const a = document.createElement('a');
                     a.href = url;
-                    a.download = `project_${result.auditId}.xml`;
+                    a.download = out.userProject
+                      ? `${out.userProject}.xml`
+                      : `project_${result.auditId}.xml`;
                     document.body.appendChild(a);
                     a.click();
                     document.body.removeChild(a);
                     URL.revokeObjectURL(url);
                   }}>
-                  <i className="ti ti-download" /> Download XML
+                  <i className="ti ti-download" /> Download {out.userProject ? `${out.userProject}.xml` : 'XML'}
                 </Btn>
-              )}
-              {result.cfg && (
-                <Btn
-                  onClick={() => {
-                    const blob = new Blob([result.cfg.text], { type: 'text/plain' });
-                    const url = URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = `hardware_${result.auditId}.cfg`;
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
-                    URL.revokeObjectURL(url);
-                  }}>
-                  <i className="ti ti-download" /> Download CFG
-                </Btn>
-              )}
+              ))}
+              {/* One button per controller. Falls back to the single combined CFG
+                  for older responses that carry no cfgs array. */}
+              {(result.cfgs?.length
+                  ? result.cfgs
+                  : (result.cfg ? [{ userProject: null, controllerName: null, text: result.cfg.text }] : []))
+                .map((c, i) => {
+                  const label = c.userProject || c.controllerName;
+                  return (
+                    <Btn key={label || i}
+                      onClick={() => {
+                        const blob = new Blob([c.text], { type: 'text/plain' });
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = label ? `${label}.cfg` : `hardware_${result.auditId}.cfg`;
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                        URL.revokeObjectURL(url);
+                      }}>
+                      <i className="ti ti-download" /> Download {label ? `${label}.cfg` : 'CFG'}
+                    </Btn>
+                  );
+                })}
             </div>
           )}
 

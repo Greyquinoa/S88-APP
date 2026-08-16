@@ -134,42 +134,117 @@ async function executeWorkflow(db, { importId, projectId, functionMapId }, onPro
     // has a hardware mapping configured. Auto-imports New signals only; Modified and
     // Missing rows vs. the existing hw_signals are skipped and logged, never
     // overwritten or deleted (see hardwareAutoSync.js for the full rationale).
-    let hwLog = null;
-    let cfgResult = null;
+    // One hardware import per controller, so hardware is synced and a CFG built once
+    // per controller. Anything that stops a single controller (no baseline, no rows)
+    // is recorded and skipped rather than failing the whole run.
+    const hwLogs    = [];   // [{ hwImportId, controllerName, log }]
+    const cfgs      = [];   // [{ userProject, controllerName, hwImportId, text, stats, warnings }]
+    const cfgErrors = [];   // [{ hwImportId, controllerName, error }]
+    const cfgSkipped = [];  // [{ hwImportId, reason }]
     report(32, 'hardware', 'Checking for hardware configuration…');
-    const hwImport = await db.prepare(
-      'SELECT id FROM hw_imports WHERE project_id = ? ORDER BY id DESC LIMIT 1'
-    ).get(projectId);
 
-    // Warn if multiple controllers exist — multi-controller workflow is not yet automated
-    const controllerCount = await db.prepare(
-      'SELECT COUNT(*) AS cnt FROM hw_controllers WHERE project_id = ?'
-    ).get(projectId);
-    if (controllerCount && controllerCount.cnt > 1) {
+    const hwImports = await db.prepare(`
+      SELECT i.id AS hw_import_id,
+             c.T16_Controller_TagName AS controller_name,
+             c.user_project           AS controller_user_project
+      FROM hw_imports i
+      JOIN hw_controllers c ON c.id = i.hw_controller_id
+      WHERE i.project_id = ?
+      ORDER BY i.hw_controller_id
+    `).all(projectId);
+
+    // Imports with no controller cannot be named or mapped to a user project.
+    const orphanRows = await db.prepare(
+      'SELECT id FROM hw_imports WHERE project_id = ? AND hw_controller_id IS NULL'
+    ).all(projectId);
+    for (const o of orphanRows) cfgSkipped.push({ hwImportId: o.id, reason: 'no controller assigned' });
+    if (orphanRows.length) {
       report(32, 'hardware',
-        `WARNING: This project has ${controllerCount.cnt} controllers. XML generation currently covers only the latest import. ` +
-        'See plan for multi-controller fan-out.');
+        `Skipping ${orphanRows.length} hardware import(s) with no controller assigned — ` +
+        'assign a controller in HW Config to include them');
     }
 
-    if (!hwImport) {
-      report(38, 'hardware', 'No hardware import found for this project — skipping hardware sync');
+    // The AS column routes each row to its controller. Without it a multi-controller
+    // sync would import every controller's signals into every import, so refuse to
+    // loop instead and fall back to the single newest import.
+    const asColumn = Object.entries(hardwareColumnMap || {})
+      .find(([, field]) => field === 'as_assignment')?.[0] || null;
+
+    let hwTargets = hwImports;
+    if (hwImports.length > 1 && !asColumn) {
+      report(32, 'hardware',
+        'WARNING: several controllers exist but no AS Assignment column is mapped — ' +
+        'cannot split hardware rows per controller. Falling back to the newest import only. ' +
+        'Map the AS Assignment column to generate one CFG per controller.');
+      hwTargets = hwImports.slice(-1);
+    }
+
+    if (hwTargets.length === 0) {
+      report(38, 'hardware', 'No hardware import with an assigned controller — skipping hardware sync');
     } else if (!hardwareColumnMap || Object.keys(hardwareColumnMap).length === 0) {
       report(38, 'hardware', 'No hardware column mapping configured — skipping hardware sync');
     } else {
-      report(33, 'hardware', 'Syncing hardware signals (new rows only)…');
-      const syncResult = await autoSyncHardware(db, {
-        hwImportId: hwImport.id,
-        ioImportId: importId,
-        columnMap: hardwareColumnMap,
-      });
-      hwLog = syncResult.log;
-      report(36, 'hardware',
-        `Hardware sync: ${hwLog.imported} imported, ${hwLog.skippedModified.length} modified skipped, ${hwLog.skippedMissing.length} missing skipped`);
+      const n = hwTargets.length;
+      for (let i = 0; i < n; i++) {
+        const t    = hwTargets[i];
+        const name = t.controller_user_project || t.controller_name || `import_${t.hw_import_id}`;
+        const lo   = 33 + Math.round((i / n) * 7);
+        const hi   = 33 + Math.round(((i + 1) / n) * 7);
 
-      report(38, 'hardware', 'Generating hardware CFG…');
-      cfgResult = await generateCfgForWorkflow(db, hwImport.id);
-      report(40, 'hardware', 'Hardware CFG generated');
+        // Pre-flight instead of try/catch: executeWorkflow runs inside a single
+        // Postgres transaction, so a thrown-and-caught error would poison every
+        // later statement. Check the two conditions generateCfgForWorkflow throws on.
+        const meta = await db.prepare(
+          'SELECT (baseline_cfg IS NOT NULL) AS has_baseline FROM hw_imports WHERE id = ?'
+        ).get(t.hw_import_id);
+        if (!meta?.has_baseline) {
+          cfgErrors.push({ hwImportId: t.hw_import_id, controllerName: name,
+                           error: 'no baseline CFG uploaded' });
+          report(hi, 'hardware', `${name}: CFG skipped — no baseline CFG uploaded`);
+          continue;
+        }
+
+        report(lo, 'hardware', `${name} (${i + 1}/${n}): syncing hardware signals…`);
+        const syncResult = await autoSyncHardware(db, {
+          hwImportId: t.hw_import_id,
+          ioImportId: importId,
+          columnMap:  hardwareColumnMap,
+          // Only filter when we can: a single controller with no AS column keeps
+          // the pre-split behaviour of taking the whole sheet.
+          asColumn:       asColumn || undefined,
+          controllerName: asColumn ? (t.controller_name || name) : undefined,
+        });
+        hwLogs.push({ hwImportId: t.hw_import_id, controllerName: name, log: syncResult.log });
+
+        const sig = await db.prepare(
+          "SELECT COUNT(*) AS n FROM hw_signals WHERE hw_import_id = ? AND module_order_no != 'PLACEHOLDER'"
+        ).get(t.hw_import_id);
+        if (Number(sig?.n || 0) === 0) {
+          cfgErrors.push({ hwImportId: t.hw_import_id, controllerName: name,
+                           error: 'no hardware signals after sync' });
+          report(hi, 'hardware', `${name}: CFG skipped — no hardware signals`);
+          continue;
+        }
+
+        const r = await generateCfgForWorkflow(db, t.hw_import_id);
+        cfgs.push({
+          userProject: name, controllerName: t.controller_name || null,
+          hwImportId: t.hw_import_id,
+          text: r.cfgText, stats: r.stats, warnings: r.warnings,
+        });
+        report(hi, 'hardware', `${name}: CFG generated`);
+      }
+      report(40, 'hardware',
+        `Hardware: ${cfgs.length} CFG(s) generated` + (cfgErrors.length ? `, ${cfgErrors.length} skipped` : ''));
     }
+
+    // Aggregate for the existing single-log UI panel; hwLogs keeps the breakdown.
+    const hwLog = hwLogs.length ? {
+      imported:  hwLogs.reduce((a, e) => a + (e.log.imported  || 0), 0),
+      unchanged: hwLogs.reduce((a, e) => a + (e.log.unchanged || 0), 0),
+      skippedModified: hwLogs.flatMap(e => (e.log.skippedModified || []).map(s => ({ ...s, controller: e.controllerName }))),
+      skippedMissing:  hwLogs.flatMap(e => (e.log.skippedMissing  || []).map(s => ({ ...s, controller: e.controllerName }))),
+    } : null;
 
     // ── PHASE 1c: GENERATE CONNECTIONS (Component 3) ────────────────────────────
     // Reconcile each CM instance's dummy IO signal names against hw_signals.tag,
@@ -191,7 +266,9 @@ async function executeWorkflow(db, { importId, projectId, functionMapId }, onPro
     report(43, 'resolving', 'Resolving CM types and signal mappings…');
 
     let hierarchy = [];
-    let projectConfig = null;
+    // PCS7 config is scoped per user project: { userProjectName: configRow }. Each
+    // group's XML is built with its own row, so AS01 and AS02 get their own IDs.
+    const configByUserProject = {};
     let signalMaps = {};
     hierarchy = await db.prepare(`
       SELECT id, parent_id, name, s88_type, sort_order
@@ -199,7 +276,13 @@ async function executeWorkflow(db, { importId, projectId, functionMapId }, onPro
       WHERE project_id = ?
       ORDER BY sort_order, id
     `).all(projectId);
-    projectConfig = (await db.prepare('SELECT * FROM project_config WHERE project_id = ?').get(projectId)) || null;
+    // Rows with a NULL user_project are pre-migration leftovers and are
+    // deliberately ignored — a group with no matching row falls back to
+    // FX_DEFAULT inside generateXML.
+    const cfgRows = await db.prepare(
+      'SELECT * FROM project_config WHERE project_id = ? AND user_project IS NOT NULL'
+    ).all(projectId);
+    for (const r of cfgRows) configByUserProject[r.user_project] = r;
     signalMaps = await loadMappingsForProject(db, projectId);
 
     const connIOs = await loadConnectionIOsForProject(db, projectId);
@@ -319,13 +402,30 @@ async function executeWorkflow(db, { importId, projectId, functionMapId }, onPro
       };
     }
 
-    const instDefs = [];
-    for (let i = 0; i < instances.length; i++) {
-      instDefs.push(await resolveInstance(instances[i]));
-      const pct = 42 + Math.round(((i + 1) / instances.length) * 43);
-      if ((i + 1) % Math.max(1, Math.floor(instances.length / 10)) === 0 || i === instances.length - 1) {
-        report(pct, 'resolving', `Resolved ${i + 1}/${instances.length} instances`);
+    // Group instances by user project so each group is emitted as its own XML with
+    // its own PCS7 config. Instances with no user project fall into a single group
+    // keyed by the project name (legacy behaviour: one combined XML).
+    const groupedInstances = new Map();
+    for (const inst of instances) {
+      const key = inst.user_project || proj.name;
+      if (!groupedInstances.has(key)) groupedInstances.set(key, []);
+      groupedInstances.get(key).push(inst);
+    }
+
+    // Resolve every instance once, keeping the group association.
+    const instDefsByGroup = new Map();
+    let resolvedCount = 0;
+    for (const [groupName, groupInsts] of groupedInstances) {
+      const defs = [];
+      for (const inst of groupInsts) {
+        defs.push(await resolveInstance(inst));
+        resolvedCount++;
+        const pct = 42 + Math.round((resolvedCount / instances.length) * 43);
+        if (resolvedCount % Math.max(1, Math.floor(instances.length / 10)) === 0 || resolvedCount === instances.length) {
+          report(pct, 'resolving', `Resolved ${resolvedCount}/${instances.length} instances`);
+        }
       }
+      instDefsByGroup.set(groupName, defs);
     }
 
     // Build connection groups (simplified — no composites here)
@@ -349,9 +449,30 @@ async function executeWorkflow(db, { importId, projectId, functionMapId }, onPro
       });
     }
 
-    // Generate XML
+    // Generate one XML per user project, each with its own PCS7 config.
     report(88, 'building', 'Building XML…');
-    const { xml, stats } = generateXML(instDefs, proj.name, hierarchy, {}, projectConfig, connGroups, signalMaps);
+    const outputs = [];
+    for (const [groupName, defs] of instDefsByGroup) {
+      if (!defs.length) continue;
+      const groupConfig = configByUserProject[groupName] || null;
+      if (!groupConfig) {
+        console.warn(`[workflow] No PCS7 config found for user project '${groupName}' — using default IDs`);
+      }
+      report(88, 'building', `${groupName}: building XML…`);
+      const built = generateXML(defs, groupName, hierarchy, {}, groupConfig, connGroups, signalMaps);
+      outputs.push({ userProject: groupName, xml: built.xml, stats: built.stats });
+    }
+
+    // Backward-compatible single-XML fields: the first group's XML, plus stats
+    // summed across every group so the existing UI totals stay meaningful.
+    const xml = outputs.length === 1 ? outputs[0].xml : (outputs[0]?.xml || '');
+    const stats = outputs.reduce((acc, o) => ({
+      blocks: acc.blocks + (o.stats?.blocks || 0),
+      vars:   acc.vars   + (o.stats?.vars   || 0),
+      msgs:   acc.msgs   + (o.stats?.msgs   || 0),
+      links:  acc.links  + (o.stats?.links  || 0),
+      sizeKb: Math.round((acc.sizeKb + Number(o.stats?.sizeKb || 0)) * 100) / 100,
+    }), { blocks: 0, vars: 0, msgs: 0, links: 0, sizeKb: 0 });
 
     // ── PHASE 3: FINALIZATION (95–100%) ────────────────────────────────────────
     report(95, 'finalizing', 'Saving audit trail…');
@@ -381,11 +502,21 @@ async function executeWorkflow(db, { importId, projectId, functionMapId }, onPro
     report(100, 'finalizing', 'Workflow complete!');
     return {
       success: true,
+      // One entry per user project: { userProject, xml, stats }.
+      outputs,
+      // Backward-compatible aggregates (first XML + summed stats).
       xml,
       stats,
       auditId: genId,
       hwLog,
-      cfg: cfgResult ? { text: cfgResult.cfgText, stats: cfgResult.stats, warnings: cfgResult.warnings } : null,
+      hwLogs,
+      // One entry per controller: { userProject, controllerName, hwImportId, text, stats, warnings }.
+      cfgs,
+      cfgErrors,
+      cfgSkipped,
+      // Backward-compatible single-CFG field: the first generated CFG, mirroring
+      // how `xml` above exposes the first user project's XML.
+      cfg: cfgs.length ? { text: cfgs[0].text, stats: cfgs[0].stats, warnings: cfgs[0].warnings } : null,
       connections: connectionsResult,
       derivedValues: derivedValuesResult,
     };

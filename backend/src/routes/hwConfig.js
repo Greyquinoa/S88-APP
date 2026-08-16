@@ -14,7 +14,6 @@ const { loadStationAutoSlotConfig } = require('../services/autoSlotResolver');
 const ModuleParameterExtractor = require('../services/moduleParameterExtractor');
 const ModuleParameterDb = require('../services/moduleParameterDb');
 const { findStationConflicts, loadExistingStations, buildConflictTable } = require('../services/stationUniqueness');
-const { upsertControllerFromCfg, buildBaselineInfo, ingestDevicesFromCfg } = require('../services/cfgIngest');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
@@ -610,10 +609,10 @@ router.post('/imports/:id/backfill-from-cfg', upload.single('cfg'), async (req, 
 
     const insertSignal = db.prepare(`
       INSERT INTO hw_signals
-        (hw_import_id, station_address, station_name, ip_address, router_address,
+        (hw_import_id, station_address, station_name, ip_address, router_address, as_assignment,
          subsystem_no, slot, module_order_no, module_name, signal_type,
          pip_no, potential_group, tag, description, station_mlfb)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
 
     const insertSubslot = db.prepare(`
       INSERT INTO hw_slot_subslots
@@ -642,7 +641,7 @@ router.post('/imports/:id/backfill-from-cfg', upload.single('cfg'), async (req, 
           : dev.orderNo;
         await insertSignal.run(
           importId,
-          dev.address, dev.name, dev.ip, dev.routerAddress,
+          dev.address, dev.name, dev.ip, dev.routerAddress, dev.asAssignment || null,
           dev.subsystemNo, 0,
           slot0OrderNo, dev.name,
           null, null, null, null, null,
@@ -661,7 +660,7 @@ router.post('/imports/:id/backfill-from-cfg', upload.single('cfg'), async (req, 
             // No SYMBOL lines — insert one representative row for the slot
             await insertSignal.run(
               importId,
-              dev.address, dev.name, dev.ip, dev.routerAddress,
+              dev.address, dev.name, dev.ip, dev.routerAddress, dev.asAssignment || null,
               dev.subsystemNo, slot.slot,
               slot.orderNo, slot.name,
               signalType,
@@ -675,7 +674,7 @@ router.post('/imports/:id/backfill-from-cfg', upload.single('cfg'), async (req, 
             for (const sym of slot.symbols) {
               await insertSignal.run(
                 importId,
-                dev.address, dev.name, dev.ip, dev.routerAddress,
+                dev.address, dev.name, dev.ip, dev.routerAddress, dev.asAssignment || null,
                 dev.subsystemNo, slot.slot,
                 slot.orderNo, slot.name,
                 signalType,
@@ -755,107 +754,6 @@ router.post('/imports/:id/backfill-from-cfg', upload.single('cfg'), async (req, 
   } catch (e) { err(res, 500, e.message); }
 });
 
-// POST /api/hw-config/project/:id/upload-cfg (Phase 2 merged endpoint)
-// Accepts a baseline PCS7 CFG file. If the controller exists, additively imports devices.
-// If the controller doesn't exist, creates it atomically along with the devices.
-// Response unifies both old shapes so neither display regresses.
-router.post('/project/:id/upload-cfg', upload.single('cfg'), async (req, res) => {
-  try {
-    const db        = getDb();
-    const projectId = parseInt(req.params.id, 10);
-    if (!(await db.prepare('SELECT id FROM projects WHERE id=?').get(projectId)))
-      return err(res, 404, 'Project not found');
-    if (!req.file) return err(res, 400, 'No file uploaded');
-
-    const cfgText = req.file.buffer.toString('utf8');
-    const parsed  = parseCfg(cfgText);
-
-    if (!parsed.stationName) {
-      return err(res, 400, 'CFG has no station name; cannot identify controller');
-    }
-
-    const devices = parseCfgDevices(cfgText);
-    const baselineInfo = buildBaselineInfo(parsed);
-
-    // ── Validation phase (before any write) ─────────────────────────────────
-    // Resolve controller by station name; then validate cross-controller uniqueness
-    const existingCtrl = await db.prepare(
-      'SELECT id FROM hw_controllers WHERE project_id=? AND T16_Controller_TagName=?'
-    ).get(projectId, parsed.stationName);
-
-    const existingImport = existingCtrl
-      ? await db.prepare('SELECT id FROM hw_imports WHERE project_id=? AND hw_controller_id=?')
-          .get(projectId, existingCtrl.id)
-      : null;
-
-    // Check for address collisions within this controller (hard error)
-    if (existingImport) {
-      const existingStations = await loadExistingStations(db, existingImport.id);
-      const collisions = findStationConflicts([...existingStations, ...devices]);
-      if (collisions.length > 0) {
-        return err(res, 409, 'Station address conflicts: ' + collisions.join('; '),
-          { conflictRows: buildConflictTable([...existingStations, ...devices]) });
-      }
-    }
-
-    // TODO Phase 2: check for cross-controller IP/name collisions (warn, don't block)
-    // TODO Phase 2: skip/overwrite logic for existing stations in this controller
-
-    // ── Transaction: create controller + import + devices ────────────────────
-    const doUpsert = db.transaction(async () => {
-      // Upsert controller + fieldbuses
-      const { controllerId } = await upsertControllerFromCfg(db, projectId, parsed);
-
-      // Upsert import row (keyed by controller now)
-      const existingImportRecheck = await db.prepare(
-        'SELECT id FROM hw_imports WHERE project_id=? AND hw_controller_id=?'
-      ).get(projectId, controllerId);
-
-      let importId;
-      if (existingImportRecheck) {
-        // Update: preserve status, update baseline and info
-        await db.prepare('UPDATE hw_imports SET baseline_cfg=?, baseline_info=?, imported_at=NOW() WHERE id=?')
-          .run(cfgText, JSON.stringify(baselineInfo), existingImportRecheck.id);
-        importId = existingImportRecheck.id;
-      } else {
-        // Insert: new import for this controller
-        const r = await db.prepare(
-          'INSERT INTO hw_imports (project_id, hw_controller_id, baseline_cfg, status, baseline_info) VALUES (?,?,?,?,?)'
-        ).run(projectId, controllerId, cfgText, 'pending', JSON.stringify(baselineInfo));
-        importId = r.lastInsertRowid;
-      }
-
-      // Ingest devices if CFG has any
-      let stats = { stations: 0, slots: 0, mrpDevices: 0, skipped: [], overwritten: [] };
-      if (devices.length > 0) {
-        stats = await ingestDevicesFromCfg(db, importId, cfgText, {});
-      }
-
-      return { importId, controllerId, stats };
-    });
-
-    const { importId, controllerId, stats } = await doUpsert();
-
-    // ── Response ────────────────────────────────────────────────────────────
-    // Shape unifies both old shapes:
-    // - spread baselineInfo for the baseline panel (matches handleBaselineUpload)
-    // - stations/slots for the device counts (matches handleBackfillFromCfg)
-    res.json({
-      importId,
-      controllerId,
-      controllerName: parsed.stationName,
-      controllerCreated: !existingCtrl,
-      ...baselineInfo,
-      stations: stats.stations,
-      slots: stats.slots,
-      mrpDevices: stats.mrpDevices,
-      devicesImported: devices.length > 0,
-      skipped: stats.skipped,
-      overwritten: stats.overwritten,
-    });
-  } catch (e) { err(res, 500, e.message); }
-});
-
 // POST /api/hw-config/imports/:id/parse-headers
 // Extract column headers from an Excel file without parsing data
 // Returns: { headers: string[] }
@@ -921,6 +819,109 @@ router.post('/imports/:id/ingest-io-rows', async (req, res) => {
   } catch (e) { err(res, 500, e.message); }
 });
 
+// Controller tag names are stored verbatim from the CFG STATION line (see
+// cfgParser.js) — nothing trims or case-folds them on the way in. Matching a
+// spreadsheet cell against one therefore has to normalise both sides, but only
+// by trim + casefold: anything fuzzier risks routing a row to the wrong AS.
+// Shared with the workflow's per-controller sync via hwExcelParser.
+const { normAs } = require('../services/hwExcelParser');
+
+// POST /api/hw-config/project/:id/ingest-io-rows-split
+// Multi-controller unified import: split one IO import's rows across the project's
+// HW imports by an "AS assignment" column, staging each group into its own
+// hw_excel_raw so the existing preview/apply flow can run once per controller.
+// Rows whose AS value matches no controller are skipped and reported back.
+// Body: { ioImportId, asColumn }
+router.post('/project/:id/ingest-io-rows-split', async (req, res) => {
+  try {
+    const db        = getDb();
+    const projectId = parseInt(req.params.id, 10);
+    const { ioImportId, asColumn } = req.body || {};
+    if (!ioImportId) return err(res, 400, 'ioImportId required');
+    if (!asColumn)   return err(res, 400, 'asColumn required');
+
+    // ── 1. Build the AS index: normalised controller name → hw_import ──────────
+    const imports = await db.prepare(`
+      SELECT i.id AS import_id, c.T16_Controller_TagName AS name
+      FROM hw_imports i
+      JOIN hw_controllers c ON c.id = i.hw_controller_id
+      WHERE i.project_id = ?
+      ORDER BY i.hw_controller_id`).all(projectId);
+
+    const index     = new Map();  // norm → { importId, name }
+    const ambiguous = new Map();  // norm → [name, ...]
+    for (const r of imports) {
+      const n = normAs(r.name);
+      if (!n) continue;                       // unnamed controller: unroutable
+      if (index.has(n)) {
+        const list = ambiguous.get(n) || [index.get(n).name];
+        list.push(r.name);
+        ambiguous.set(n, list);
+        continue;                             // first (lowest controller id) wins
+      }
+      index.set(n, { importId: r.import_id, name: r.name });
+    }
+    if (index.size === 0) {
+      return err(res, 400, 'No controllers with a station name found for this project. Upload a baseline CFG first.');
+    }
+
+    // ── 2. Bucket the IO rows by AS value ──────────────────────────────────────
+    const ioRows = await db.prepare(
+      'SELECT row_number, raw_data FROM io_tags WHERE import_id=? ORDER BY row_number, id'
+    ).all(parseInt(ioImportId, 10));
+    if (ioRows.length === 0) return err(res, 400, 'IO import has no rows to ingest');
+
+    const buckets = new Map();  // importId → [row_json, ...]
+    const skipped = new Map();  // raw AS value → { rowCount, sampleRowNumbers }
+
+    for (const row of ioRows) {
+      let obj;
+      try { obj = JSON.parse(row.raw_data || '{}'); } catch (_) { obj = {}; }
+      const hit = index.get(normAs(obj[asColumn]));
+      if (!hit) {
+        const key = String(obj[asColumn] ?? '').trim();
+        const s = skipped.get(key) || { rowCount: 0, sampleRowNumbers: [] };
+        s.rowCount++;
+        if (s.sampleRowNumbers.length < 5) s.sampleRowNumbers.push(row.row_number);
+        skipped.set(key, s);
+        continue;
+      }
+      if (!buckets.has(hit.importId)) buckets.set(hit.importId, []);
+      buckets.get(hit.importId).push(row.raw_data || '{}');
+    }
+
+    // ── 3. Stage each bucket, all in one transaction ───────────────────────────
+    // Only imports that received rows are cleared: a controller matching nothing
+    // this run keeps whatever it had staged, so re-importing a partial sheet
+    // never silently blanks another controller.
+    const del    = db.prepare('DELETE FROM hw_excel_raw WHERE hw_import_id=?');
+    const insert = db.prepare('INSERT INTO hw_excel_raw (hw_import_id, row_index, row_json) VALUES (?,?,?)');
+    const writeAll = db.transaction(async (entries) => {
+      for (const [impId, rows] of entries) {
+        await del.run(impId);
+        for (let i = 0; i < rows.length; i++) await insert.run(impId, i, rows[i]);
+      }
+    });
+    await writeAll([...buckets.entries()]);
+
+    // ── 4. Respond, ordered by controller so the review sequence is stable ─────
+    const groups = [];
+    for (const r of imports) {
+      const rows = buckets.get(r.import_id);
+      if (rows && rows.length) {
+        groups.push({ hwImportId: r.import_id, controllerName: r.name, rowCount: rows.length });
+      }
+    }
+
+    res.json({
+      groups,
+      skipped:   [...skipped.entries()].map(([asValue, s]) => ({ asValue, ...s })),
+      ambiguous: [...ambiguous.entries()].map(([normalized, controllerNames]) => ({ normalized, controllerNames })),
+      totalRows: ioRows.length,
+    });
+  } catch (e) { err(res, 500, e.message); }
+});
+
 // GET /api/hw-config/imports/:id/excel-preview
 // Returns raw Excel rows stored during parse-headers (no file re-upload needed)
 // Optional query: ?limit=N (default 100)
@@ -963,7 +964,8 @@ router.post('/imports/:id/suggest-column-mappings', async (req, res) => {
     // Define mandatory and optional fields that can be mapped
     const MANDATORY_FIELDS = ['station_address', 'module_order_no', 'slot', 'tag', 'channel'];
     const OPTIONAL_FIELDS = [
-      'station_name', 'ip_address', 'description', 'signal_type', 'subsystem_no', 'router_address'
+      'station_name', 'ip_address', 'description', 'signal_type', 'subsystem_no', 'router_address',
+      'as_assignment'
     ];
     const ALL_FIELDS = [...MANDATORY_FIELDS, ...OPTIONAL_FIELDS];
 
@@ -1009,7 +1011,8 @@ router.post('/imports/:id/upload-iolist', upload.single('iolist'), async (req, r
       }
     }
 
-    const { rows, stations, colMap, resolutionStats } = await parseHwExcel(req.file.buffer, sheetName, overrideColumnMap, db);
+    const { rows, stations, colMap, resolutionStats, slotConflicts } =
+      await parseHwExcel(req.file.buffer, sheetName, overrideColumnMap, db);
 
     // Additive import: build the incoming station set (one entry per address) and validate
     // it — together with the stations already stored for this import — for uniqueness of
@@ -1034,8 +1037,8 @@ router.post('/imports/:id/upload-iolist', upload.single('iolist'), async (req, r
       INSERT INTO hw_signals
         (hw_import_id, row_number, station_address, station_name, ip_address,
          slot, channel, module_order_no, module_name, tag, description, signal_type, subsystem_no, router_address,
-         station_mlfb, resolved_by_tier2, unresolved)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         station_mlfb, resolved_by_tier2, unresolved, as_assignment)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     `);
     const insertBatch = db.transaction(async (batch) => {
       for (const r of batch) {
@@ -1043,7 +1046,7 @@ router.post('/imports/:id/upload-iolist', upload.single('iolist'), async (req, r
           r.slot, r.channel, r.orderNo, r.moduleName, r.tag, r.desc, r.signalType,
           r.subsystemNo ?? null, r.routerAddress || null,
           r.stationMlfb || null,
-          !!r.resolvedByTier2, !!r.unresolved);
+          !!r.resolvedByTier2, !!r.unresolved, r.asAssignment || null);
       }
     });
     for (let i = 0; i < rows.length; i += 500) await insertBatch(rows.slice(i, i + 500));
@@ -1051,7 +1054,8 @@ router.post('/imports/:id/upload-iolist', upload.single('iolist'), async (req, r
     // Tier 2: Create slot 0 rows for stations with station_mlfb
     // This enables the grid to auto-generate ports (0.2, 0.3) based on the station module's port_config
     const tier2Stations = await db.prepare(`
-      SELECT DISTINCT station_address, station_name, ip_address, router_address, subsystem_no, station_mlfb
+      SELECT DISTINCT station_address, station_name, ip_address, router_address, subsystem_no, station_mlfb,
+             as_assignment
       FROM hw_signals
       WHERE hw_import_id=? AND resolved_by_tier2=true AND station_mlfb IS NOT NULL
         AND NOT EXISTS (SELECT 1 FROM hw_signals s2 WHERE s2.hw_import_id=? AND s2.station_address=hw_signals.station_address AND s2.slot=0)
@@ -1062,15 +1066,15 @@ router.post('/imports/:id/upload-iolist', upload.single('iolist'), async (req, r
         INSERT INTO hw_signals
           (hw_import_id, row_number, station_address, station_name, ip_address,
            slot, channel, module_order_no, module_name, tag, description, signal_type, subsystem_no, router_address,
-           station_mlfb, resolved_by_tier2, unresolved)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           station_mlfb, resolved_by_tier2, unresolved, as_assignment)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       `);
       for (const s of tier2Stations) {
         await insSlot0.run(
           importId, null, s.station_address, s.station_name, s.ip_address,
           0, null, s.station_mlfb, s.station_name,
           null, null, null, s.subsystem_no, s.router_address,
-          s.station_mlfb, true, false
+          s.station_mlfb, true, false, s.as_assignment || null
         );
       }
     }
@@ -1078,8 +1082,9 @@ router.post('/imports/:id/upload-iolist', upload.single('iolist'), async (req, r
     await db.prepare('UPDATE hw_imports SET excel_name=?, status=? WHERE id=?')
       .run(req.file.originalname, 'ready', importId);
 
-    res.json({ importId, stationCount: stations.size, signalCount: rows.length, colMap, resolutionStats });
-  } catch (e) { err(res, 500, e.message); }
+    res.json({ importId, stationCount: stations.size, signalCount: rows.length, colMap, resolutionStats,
+               slotConflicts: slotConflicts || [] });
+  } catch (e) { err(res, e.statusCode || 500, e.message); }
 });
 
 // POST /api/hw-config/imports/:id/preview-iolist  (parse + diff, NO DB writes)
@@ -1617,10 +1622,16 @@ router.post('/imports/:id/apply-iolist', async (req, res) => {
     }
 
     const apply = db.transaction(async () => {
-      // Delete approved missing rows
+      // Delete approved missing rows (clear FK refs to instance_ios first)
       for (const r of dbRows) {
         const key = `${r.station_address}:${r.slot}:${chKey(r.channel, r.tag, r.signal_type)}`;
         if (missingSet.has(key) && approvedSet.has(key)) {
+          const hwSigs = await db.prepare(
+            `SELECT id FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=? AND channel IS NOT DISTINCT FROM ?`
+          ).all(importId, r.station_address, r.slot, r.channel ?? null);
+          for (const sig of hwSigs) {
+            await db.prepare('UPDATE instance_ios SET hw_signal_id=NULL WHERE hw_signal_id=?').run(sig.id);
+          }
           await db.prepare(
             `DELETE FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=? AND channel IS NOT DISTINCT FROM ?`
           ).run(importId, r.station_address, r.slot, r.channel ?? null);
@@ -1632,8 +1643,8 @@ router.post('/imports/:id/apply-iolist', async (req, res) => {
         INSERT INTO hw_signals
           (hw_import_id, row_number, station_address, station_name, ip_address,
            slot, channel, module_order_no, module_name, tag, description, signal_type, subsystem_no, router_address,
-           station_mlfb, resolved_by_tier2, unresolved)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           station_mlfb, resolved_by_tier2, unresolved, as_assignment)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       `);
 
       let rowIdx = 0;
@@ -1641,7 +1652,13 @@ router.post('/imports/:id/apply-iolist', async (req, res) => {
         const key = `${r.stationAddr}:${r.slot}:${chKey(r.channel, r.tag, r.signalType)}`;
         if (!approvedSet.has(key)) { rowIdx++; continue; }
 
-        // Delete existing row for this key before inserting (upsert)
+        // Delete existing row for this key before inserting (upsert). Clear FK refs first.
+        const hwSigs = await db.prepare(
+          `SELECT id FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=? AND channel IS NOT DISTINCT FROM ?`
+        ).all(importId, r.stationAddr, r.slot, r.channel ?? null);
+        for (const sig of hwSigs) {
+          await db.prepare('UPDATE instance_ios SET hw_signal_id=NULL WHERE hw_signal_id=?').run(sig.id);
+        }
         await db.prepare(
           `DELETE FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=? AND channel IS NOT DISTINCT FROM ?`
         ).run(importId, r.stationAddr, r.slot, r.channel ?? null);
@@ -1650,7 +1667,7 @@ router.post('/imports/:id/apply-iolist', async (req, res) => {
           r.slot, r.channel ?? null, r.orderNo, r.moduleName, r.tag, r.desc,
           r.signalType, r.subsystemNo ?? null, r.routerAddress || null,
           r.stationMlfb || null,
-          !!r.resolvedByTier2, !!r.unresolved);
+          !!r.resolvedByTier2, !!r.unresolved, r.asAssignment || null);
         rowIdx++;
       }
 
@@ -1665,7 +1682,8 @@ router.post('/imports/:id/apply-iolist', async (req, res) => {
     // Tier 2: Create slot 0 rows for stations with station_mlfb
     // This enables the grid to auto-generate ports (0.2, 0.3) based on the station module's port_config
     const tier2Stations = await db.prepare(`
-      SELECT DISTINCT station_address, station_name, ip_address, router_address, subsystem_no, station_mlfb
+      SELECT DISTINCT station_address, station_name, ip_address, router_address, subsystem_no, station_mlfb,
+             as_assignment
       FROM hw_signals
       WHERE hw_import_id=? AND resolved_by_tier2=true AND station_mlfb IS NOT NULL
         AND NOT EXISTS (SELECT 1 FROM hw_signals s2 WHERE s2.hw_import_id=? AND s2.station_address=hw_signals.station_address AND s2.slot=0)
@@ -1676,15 +1694,15 @@ router.post('/imports/:id/apply-iolist', async (req, res) => {
         INSERT INTO hw_signals
           (hw_import_id, row_number, station_address, station_name, ip_address,
            slot, channel, module_order_no, module_name, tag, description, signal_type, subsystem_no, router_address,
-           station_mlfb, resolved_by_tier2, unresolved)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           station_mlfb, resolved_by_tier2, unresolved, as_assignment)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       `);
       for (const s of tier2Stations) {
         await insSlot0.run(
           importId, null, s.station_address, s.station_name, s.ip_address,
           0, null, s.station_mlfb, s.station_name,
           null, null, null, s.subsystem_no, s.router_address,
-          s.station_mlfb, true, false
+          s.station_mlfb, true, false, s.as_assignment || null
         );
       }
     }
@@ -1721,7 +1739,7 @@ router.get('/imports/:id/stations', async (req, res) => {
 
     const allAddrs = await db.prepare(
       `SELECT station_address, MIN(station_name) AS station_name, MIN(ip_address) AS ip_address,
-              MIN(router_address) AS router_address, MIN(subsystem_no) AS subsystem_no,
+              MIN(router_address) AS router_address, MIN(as_assignment) AS as_assignment, MIN(subsystem_no) AS subsystem_no,
               BOOL_OR(COALESCE(approved,false)) AS approved
        FROM hw_signals WHERE hw_import_id=? GROUP BY station_address ORDER BY station_address`
     ).all(importId);
@@ -1765,6 +1783,7 @@ router.get('/imports/:id/stations', async (req, res) => {
         name:          r.station_name,
         ip:            r.ip_address,
         routerAddress: r.router_address || null,
+        asAssignment:  r.as_assignment || null,
         subsystemNo:   r.subsystem_no,
         approved:      !!r.approved,
         orderNo:       s0.orderNo || null,
@@ -1885,13 +1904,13 @@ router.get('/imports/:id/signals', async (req, res) => {
   } catch (e) { err(res, 500, e.message); }
 });
 
-// PATCH /api/hw-config/imports/:id/stations/:addr — edit station name / ip / subsystemNo
+// PATCH /api/hw-config/imports/:id/stations/:addr — edit station name / ip / subsystemNo / router_address / as_assignment
 router.patch('/imports/:id/stations/:addr', async (req, res) => {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id,   10);
     const addr     = parseInt(req.params.addr, 10);
-    const { station_name, ip_address, subsystem_no, router_address } = req.body;
+    const { station_name, ip_address, subsystem_no, router_address, as_assignment } = req.body;
 
     const sets = [];
     const vals = [];
@@ -1899,6 +1918,7 @@ router.patch('/imports/:id/stations/:addr', async (req, res) => {
     if (ip_address      !== undefined) { sets.push('ip_address=?');      vals.push(ip_address); }
     if (subsystem_no    !== undefined) { sets.push('subsystem_no=?');    vals.push(subsystem_no); }
     if (router_address  !== undefined) { sets.push('router_address=?');  vals.push(router_address); }
+    if (as_assignment   !== undefined) { sets.push('as_assignment=?');   vals.push(as_assignment); }
     if (!sets.length) return err(res, 400, 'Nothing to update');
 
     // Validate device name uniqueness if station_name is being updated
@@ -2501,6 +2521,7 @@ router.post('/imports/:id/generate', async (req, res) => {
       subslotMap.get(key).push({ subslotNo: r.subslot_no, paProfile: r.pa_profile || null });
     }
 
+    const controllerId = hwImport.hw_controller_id || null;
     const stations = new Map();
     for (const sig of signals) {
       const addr = sig.station_address;
@@ -2509,6 +2530,7 @@ router.post('/imports/:id/generate', async (req, res) => {
           address: addr, name: sig.station_name, ip: sig.ip_address,
           routerAddress: sig.router_address || null,
           subsystemNo: sig.subsystem_no,
+          controllerId: controllerId,
           slots: new Map(),
         });
       }
@@ -2541,7 +2563,8 @@ router.post('/imports/:id/generate', async (req, res) => {
     const parsedBaseline = parseCfg(hwImport.baseline_cfg);
     allocateAddresses(stations, templateMap,
       parsedBaseline.existingAddresses.maxInput,
-      parsedBaseline.existingAddresses.maxOutput
+      parsedBaseline.existingAddresses.maxOutput,
+      null
     );
 
     const { cfg: cfgText, warnings } = await generateCfg(parsedBaseline, stations, templateMap, db);

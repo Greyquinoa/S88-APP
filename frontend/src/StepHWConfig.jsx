@@ -44,7 +44,12 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
   const [baselineInfo, setBaselineInfo] = useState(null);
   const [ioListOk,     setIoListOk]     = useState(false);
   const [ioListInfo,   setIoListInfo]   = useState(null);
-  const [reviewData,   setReviewData]   = useState(null);   // diff payload → opens HwImportReview modal
+  // Review queue — one entry per controller the import split across. The manual
+  // (single-controller) path enqueues a one-element array, so there is exactly one
+  // render site and one apply handler regardless of how the review was triggered.
+  const [reviewQueue,  setReviewQueue]  = useState([]);     // [{ hwImportId, controllerName, rowCount, data }]
+  const [reviewIdx,    setReviewIdx]    = useState(0);
+  const [importNotice, setImportNotice] = useState(null);   // { skipped, ambiguous, groups, totalRows }
   const [controllers,  setControllers]  = useState([]);
   const [selectedId,   setSelectedId]   = useState(null);
   const [stations,     setStations]     = useState([]);
@@ -178,13 +183,12 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
   // preview and open the review modal so the user can confirm the hardware import.
   useEffect(() => {
     if (!pendingHwMapping || !pendingHwMapping.hardwareMappings) return;
-    // Prefer the HW import id supplied with the handoff; fall back to loaded importId.
-    const hwId = pendingHwMapping.hwImportId || importId;
-    if (!hwId) return;
+    const groups = pendingHwMapping.groups || [];
+    if (groups.length === 0) return;
 
     let cancelled = false;
     (async () => {
-      setLoading("Preparing hardware import…");
+      setLoading(`Preparing hardware import for ${groups.length} controller${groups.length !== 1 ? "s" : ""}…`);
       setError("");
       try {
         // hardwareMappings is { column: hw_field }. preview-mapped expects
@@ -193,13 +197,29 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
         for (const [col, field] of Object.entries(pendingHwMapping.hardwareMappings)) {
           columnMap[field] = col;
         }
-        const data = await previewHwMapped(hwId, columnMap);
+
+        // Sequential rather than parallel: preview-mapped is read-only, but N
+        // concurrent full-sheet diffs is needless load and serialising keeps the
+        // partial-failure story simple (whatever previewed before the error is dropped).
+        const queue = [];
+        for (const g of groups) {
+          const data = await previewHwMapped(g.hwImportId, columnMap);
+          if (cancelled) return;
+          queue.push({ ...g, data });
+        }
         if (cancelled) return;
-        // importId is already set via the derivation; just set the display state
+
         setBaselineOk(true);
         setExcelHeaders([]);       // headers came from IO sheet; not needed here
         setHwTab("import");
-        setReviewData(data);       // opens HwImportReview modal
+        setImportNotice({
+          skipped:   pendingHwMapping.skipped   || [],
+          ambiguous: pendingHwMapping.ambiguous || [],
+          groups,
+          totalRows: pendingHwMapping.totalRows,
+        });
+        setReviewIdx(0);
+        setReviewQueue(queue);     // opens the first HwImportReview modal
       } catch (e) {
         if (!cancelled) setError(e.message);
       } finally {
@@ -271,11 +291,28 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
   }
 
   async function handleReviewApplied() {
-    setReviewData(null);
     setIoListOk(true);
+    // More controllers queued — advance instead of closing out. The modal remounts
+    // (keyed on hwImportId) so its selection state starts fresh for the next one.
+    if (reviewIdx + 1 < reviewQueue.length) {
+      setReviewIdx(reviewIdx + 1);
+      return;
+    }
+    setReviewQueue([]);
+    setReviewIdx(0);
     await loadStations(importId);
     await loadCfgs(importId);
     setHwTab("config");
+  }
+
+  // ✕ mid-queue means "skip this controller", not "abandon the whole import".
+  function handleReviewClosed() {
+    if (reviewIdx + 1 < reviewQueue.length) {
+      setReviewIdx(reviewIdx + 1);
+      return;
+    }
+    setReviewQueue([]);
+    setReviewIdx(0);
   }
 
   async function handleBackfillFromCfg(file) {
@@ -622,6 +659,42 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
             </ul>
           </div>
         )}
+        {importNotice && (importNotice.skipped.length > 0 || importNotice.ambiguous.length > 0) && (() => {
+          const skippedTotal = importNotice.skipped.reduce((n, s) => n + s.rowCount, 0);
+          const routed = importNotice.totalRows - skippedTotal;
+          return (
+            <div style={alertStyle("#fffbeb", "#fcd34d", "#92400e")}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+                <strong>
+                  ⚠ Routed {routed} of {importNotice.totalRows} rows to{" "}
+                  {importNotice.groups.length} controller{importNotice.groups.length !== 1 ? "s" : ""}
+                  {skippedTotal > 0 && `; ${skippedTotal} row${skippedTotal !== 1 ? "s" : ""} skipped`}
+                </strong>
+                <button onClick={() => setImportNotice(null)}
+                  style={{ background: "none", border: "none", cursor: "pointer", color: "#92400e", fontSize: 16, lineHeight: 1 }}
+                  title="Dismiss">✕</button>
+              </div>
+              <ul style={{ margin: "6px 0 0 0", paddingLeft: 20, fontSize: 12 }}>
+                {importNotice.skipped.slice(0, 20).map((s, i) => (
+                  <li key={i}>
+                    AS value <code>{s.asValue || "(blank)"}</code> — no matching controller — {s.rowCount} row{s.rowCount !== 1 ? "s" : ""}
+                    {s.sampleRowNumbers.length > 0 &&
+                      ` (e.g. row${s.sampleRowNumbers.length !== 1 ? "s" : ""} ${s.sampleRowNumbers.join(", ")})`}
+                  </li>
+                ))}
+                {importNotice.skipped.length > 20 && (
+                  <li>…and {importNotice.skipped.length - 20} more distinct AS values</li>
+                )}
+                {importNotice.ambiguous.map((a, i) => (
+                  <li key={`amb-${i}`}>
+                    Ambiguous controller name <code>{a.normalized}</code> matches {a.controllerNames.length} controllers
+                    ({a.controllerNames.join(", ")}) — rows routed to the first only.
+                  </li>
+                ))}
+              </ul>
+            </div>
+          );
+        })()}
 
         {/* Import + Column Mapping — tabbed workspace */}
         {hwTab === "import" && (
@@ -636,10 +709,7 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
             ioListRef={ioListRef}
             onBaselineChange={async (e) => { await handleBaselineUpload(e); await loadControllers(); }}
             onIoListChange={handleIoListUpload}
-            onBaselineBtn={() => {
-              baselineRef.current.value = "";  // Allow re-uploading same filename
-              baselineRef.current.click();
-            }}
+            onBaselineBtn={() => baselineRef.current.click()}
             onIoListBtn={() => {
               if (!importId) { setError("Upload a baseline CFG first."); return; }
               ioListRef.current.click();
@@ -663,7 +733,15 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
             setLoading={setLoading}
             showColmap={excelHeaders.length > 0}
             onMappingComplete={(data) => {
-              setReviewData(data);
+              // Manual path: the user already picked a controller, so this is a
+              // one-element queue targeting the currently-derived import.
+              setImportNotice(null);
+              setReviewIdx(0);
+              setReviewQueue([{
+                hwImportId: importId,
+                controllerName: selectedController?.T16_Controller_TagName || null,
+                data,
+              }]);
             }}
           />
         )}
@@ -834,17 +912,27 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
         )}
       </div>
 
-      {/* ── Delta-review modal ──────────────────────────────────────────── */}
-      {reviewData && (
+      {/* ── Delta-review modal — one per queued controller, in sequence ──── */}
+      {reviewQueue.length > 0 && reviewQueue[reviewIdx] && (
         <HwImportReview
-          importId={importId}
-          summary={reviewData.summary}
-          items={reviewData.items}
-          parsedRows={reviewData.parsedRows}
-          fileName={reviewData.fileName}
-          resolutionStats={reviewData.resolutionStats}
+          /* Keyed so React remounts between controllers: the modal seeds its
+             selection Set once at mount, so a reused instance would carry the
+             previous controller's checkboxes into this one's apply. */
+          key={reviewQueue[reviewIdx].hwImportId}
+          /* The import this preview was computed against — NOT the sidebar-derived
+             importId, which would send every group to the selected controller. */
+          importId={reviewQueue[reviewIdx].hwImportId}
+          controllerName={reviewQueue[reviewIdx].controllerName}
+          queuePosition={reviewQueue.length > 1
+            ? { index: reviewIdx + 1, total: reviewQueue.length }
+            : null}
+          summary={reviewQueue[reviewIdx].data.summary}
+          items={reviewQueue[reviewIdx].data.items}
+          parsedRows={reviewQueue[reviewIdx].data.parsedRows}
+          fileName={reviewQueue[reviewIdx].data.fileName}
+          resolutionStats={reviewQueue[reviewIdx].data.resolutionStats}
           onApplied={handleReviewApplied}
-          onClose={() => setReviewData(null)}
+          onClose={handleReviewClosed}
         />
       )}
 
@@ -2073,39 +2161,87 @@ function ImportPanel({
 
       <div style={{ display: "flex", gap: 24, marginBottom: 24, flexWrap: "wrap" }}>
         <UploadCard
-          label="1. PCS7 CFG"
+          label="1. Import Empty Controller"
           ok={baselineOk} okLabel="✓ Loaded"
-          btnLabel={baselineOk ? "Upload / Update CFG" : "Upload .cfg"}
+          btnLabel={baselineOk ? "Upload" : "Upload .cfg"}
           onBtn={onBaselineBtn}
           accept=".cfg"
           inputRef={baselineRef}
           onChange={onBaselineChange}
-          disabled={!!loading}
         />
         <UploadCard
           label="2. HW IO List (Excel)"
           ok={ioListOk} okLabel="✓ Loaded"
-          btnLabel={ioListOk ? "Replace IO List" : "Upload Excel"}
+          btnLabel={ioListOk ? "Upload" : "Upload Excel"}
           onBtn={onIoListBtn}
           accept=".xlsx,.xlsm,.xls"
           inputRef={ioListRef}
           onChange={onIoListChange}
-          disabled={!importId || !!loading}
+          disabled={!importId}
         />
+      </div>
+
+      {/* Divider with OR label */}
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
+        <div style={{ flex: 1, height: 1, background: "var(--color-border-tertiary, #e5e7eb)" }} />
+        <span style={{ fontSize: 12, color: "var(--color-text-secondary, #6b7280)", fontWeight: 500 }}>OR</span>
+        <div style={{ flex: 1, height: 1, background: "var(--color-border-tertiary, #e5e7eb)" }} />
+      </div>
+
+      {/* Import from CFG option */}
+      <div style={{
+        display: "flex", alignItems: "center", gap: 16,
+        padding: "14px 18px",
+        background: baselineOk ? "var(--color-background-secondary, #f5f5f5)" : "#f9fafb",
+        border: `1px solid ${baselineOk ? "var(--color-border-secondary, rgba(0,0,0,.2))" : "#e5e7eb"}`,
+        borderRadius: "var(--border-radius-lg, 12px)",
+        opacity: baselineOk ? 1 : 0.5,
+      }}>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 3, color: "var(--color-text-primary, #1a1a1a)" }}>
+            2. Import device list from CFG
+          </div>
+          <div style={{ fontSize: 12, color: "var(--color-text-secondary, #6b7280)", lineHeight: 1.5 }}>
+            Select a previously generated CFG file to restore station, module, IP,
+            PIP, POTENTIAL_GROUP and tag data — no Excel sheet needed.
+            {!baselineOk && " Upload a baseline CFG first."}
+          </div>
+        </div>
+        <input
+          ref={cfgBackfillRef}
+          type="file"
+          accept=".cfg"
+          style={{ display: "none" }}
+          onChange={onCfgBackfillChange}
+        />
+        <button
+          onClick={onBackfillFromCfg}
+          disabled={!baselineOk || !!loading}
+          style={{
+            ...btnStyle,
+            background: baselineOk ? "#0C447C" : "#e5e7eb",
+            color: baselineOk ? "#fff" : "#9ca3af",
+            border: "none",
+            padding: "8px 18px",
+            fontSize: 13,
+            flexShrink: 0,
+            opacity: !baselineOk || !!loading ? 0.6 : 1,
+            cursor: !baselineOk || !!loading ? "not-allowed" : "pointer",
+          }}
+        >
+          {loading && loading.includes("Reading") ? "Reading…" : "Select & Import CFG"}
+        </button>
       </div>
 
       {ioListInfo && (
         <div style={{ marginTop: 20, fontSize: 13, color: "#444",
                       background: "#f5fff5", border: "1px solid #9d9", borderRadius: 6, padding: "8px 14px" }}>
-          <div>
-            Device data imported from this CFG — <strong>{ioListInfo.stationCount}</strong> station{ioListInfo.stationCount !== 1 ? "s" : ""},{" "}
-            <strong>{ioListInfo.signalCount}</strong> slot{ioListInfo.signalCount !== 1 ? "s" : ""}.
-          </div>
-          {ioListInfo.skipped && ioListInfo.skipped.length > 0 && (
-            <div style={{ marginTop: 6, fontSize: 12, color: "#666" }}>
-              Skipped {ioListInfo.skipped.length} existing station{ioListInfo.skipped.length !== 1 ? "s" : ""}: {ioListInfo.skipped.join(", ")}
-            </div>
-          )}
+          Device data imported — <strong>{ioListInfo.stationCount}</strong> station{ioListInfo.stationCount !== 1 ? "s" : ""},{" "}
+          <strong>{ioListInfo.signalCount}</strong> slot{ioListInfo.signalCount !== 1 ? "s" : ""}.{" "}
+          <span style={{ color: "#2255cc", cursor: "pointer", textDecoration: "underline" }}
+                onClick={() => {}}>
+            Switch to Configuration tab to review and generate.
+          </span>
         </div>
       )}
     </div>
@@ -4269,18 +4405,7 @@ function UploadCard({ label, ok, okLabel, btnLabel, onBtn, accept, inputRef, onC
                   borderRadius: 8, padding: "14px 16px" }}>
       <label style={{ fontWeight: 700, display: "block", marginBottom: 8, fontSize: 14 }}>{label}</label>
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-        <button
-          onClick={onBtn}
-          disabled={disabled}
-          style={{
-            ...btnStyle,
-            opacity: disabled ? 0.6 : 1,
-            cursor: disabled ? "not-allowed" : "pointer",
-            pointerEvents: disabled ? "none" : "auto",
-          }}
-        >
-          {btnLabel}
-        </button>
+        <button onClick={onBtn} style={{ ...btnStyle, opacity: disabled ? 0.5 : 1 }}>{btnLabel}</button>
         {ok && <span style={{ color: "#2a8", fontWeight: 700, fontSize: 13 }}>{okLabel}</span>}
         <input type="file" accept={accept} ref={inputRef} onChange={onChange} style={{ display: "none" }} />
       </div>

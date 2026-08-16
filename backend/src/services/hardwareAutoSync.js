@@ -9,7 +9,7 @@
 // deleted. This makes the sync side-effect-safe to run unattended inside a bigger
 // automated workflow.
 'use strict';
-const { parseRawExcelRows } = require('./hwExcelParser');
+const { parseRawExcelRows, normAs } = require('./hwExcelParser');
 const { parseCfg } = require('./cfgParser');
 const { allocateAddresses } = require('./hwAddressEngine');
 const { generateCfg } = require('./cfgGenerator');
@@ -31,16 +31,37 @@ function chKey(channel, tag, signalType) {
  * @param {object} params.columnMap - { column: hw_field } as stored in the column-map
  *   config's mappings.hardware (UnifiedColumnMappingScreen shape). Inverted internally
  *   to the { hw_field: column } shape parseRawExcelRows expects.
+ * @param {string} [params.asColumn] - Name of the spreadsheet column holding the AS /
+ *   controller assignment. Supply together with controllerName to restrict this sync
+ *   to one controller's rows.
+ * @param {string} [params.controllerName] - Controller tag name (e.g. "AS01") whose
+ *   rows should be kept. See the filter note below — omitting this on a multi-controller
+ *   project imports every controller's signals into this one import.
  * @returns {{ log: object, stationCount: number, signalCount: number }}
  */
-async function autoSyncHardware(db, { hwImportId, ioImportId, columnMap }) {
+async function autoSyncHardware(db, { hwImportId, ioImportId, columnMap, asColumn, controllerName }) {
   const hwImport = await db.prepare('SELECT id FROM hw_imports WHERE id=?').get(hwImportId);
   if (!hwImport) throw new Error('HW import not found');
 
-  const ioRows = await db.prepare(
+  let ioRows = await db.prepare(
     'SELECT raw_data FROM io_tags WHERE import_id=? ORDER BY row_number, id'
   ).all(ioImportId);
   if (ioRows.length === 0) throw new Error('IO import has no rows to sync into hardware');
+
+  // Keep only this controller's rows. Without this the block below stages the whole
+  // sheet into THIS import — overwriting what ingest-io-rows-split staged and, when
+  // called once per controller, importing every controller's signals into each one.
+  // Matching mirrors the split endpoint exactly (shared normAs).
+  if (asColumn && controllerName) {
+    const want = normAs(controllerName);
+    ioRows = ioRows.filter(r => {
+      let obj; try { obj = JSON.parse(r.raw_data || '{}'); } catch (_) { return false; }
+      return normAs(obj[asColumn]) === want;
+    });
+    if (ioRows.length === 0) {
+      throw new Error(`No IO rows are assigned to controller '${controllerName}' (column '${asColumn}')`);
+    }
+  }
 
   // io_tags.raw_data is {column: value} JSON — identical shape to hw_excel_raw.row_json.
   await db.prepare('DELETE FROM hw_excel_raw WHERE hw_import_id=?').run(hwImportId);
@@ -64,7 +85,8 @@ async function autoSyncHardware(db, { hwImportId, ioImportId, columnMap }) {
   }
 
   const dbRows = await db.prepare(
-    `SELECT station_address, station_name, slot, channel, module_order_no, module_name, tag, signal_type, description
+    `SELECT station_address, station_name, slot, channel, module_order_no, module_name, tag, signal_type, description,
+            as_assignment
      FROM hw_signals WHERE hw_import_id=? AND module_order_no != 'PLACEHOLDER'`
   ).all(hwImportId);
   const current = new Map();
@@ -73,7 +95,7 @@ async function autoSyncHardware(db, { hwImportId, ioImportId, columnMap }) {
     current.set(key, r);
   }
 
-  const CMP_FIELDS = ['station_address', 'station_name', 'slot', 'module_order_no', 'module_name', 'channel', 'tag', 'signal_type', 'description'];
+  const CMP_FIELDS = ['station_address', 'station_name', 'slot', 'module_order_no', 'module_name', 'channel', 'tag', 'signal_type', 'description', 'as_assignment'];
   const newRows = [];
   const skippedModified = [];
   const skippedMissing = [];
@@ -88,14 +110,23 @@ async function autoSyncHardware(db, { hwImportId, ioImportId, columnMap }) {
       slot: inc.slot, module_order_no: inc.orderNo || null, module_name: inc.moduleName || null,
       channel: chKey(inc.channel, inc.tag, inc.signalType), tag: inc.tag || null,
       signal_type: inc.signalType || null, description: inc.desc || null,
+      as_assignment: inc.asAssignment || null,
     };
     const curNorm = {
       station_address: cur.station_address, station_name: cur.station_name,
       slot: cur.slot, module_order_no: cur.module_order_no, module_name: cur.module_name,
       channel: chKey(cur.channel, cur.tag, cur.signal_type), tag: cur.tag,
       signal_type: cur.signal_type, description: cur.description,
+      as_assignment: cur.as_assignment,
     };
-    const changedFields = CMP_FIELDS.filter(f => String(curNorm[f] ?? '') !== String(incomingNorm[f] ?? ''));
+    const changedFields = CMP_FIELDS.filter(f => {
+      // as_assignment was not persisted on the Excel path historically, so rows
+      // predating that fix hold NULL. Treat "stored blank, incoming set" as a
+      // backfill rather than a modification — otherwise the first sync after the
+      // fix reports every pre-existing row as modified and imports nothing.
+      if (f === 'as_assignment' && !curNorm[f]) return false;
+      return String(curNorm[f] ?? '') !== String(incomingNorm[f] ?? '');
+    });
 
     if (changedFields.length > 0) {
       skippedModified.push({ key, station: inc.stationAddr, slot: inc.slot, tag: inc.tag || null, changedFields });
@@ -134,8 +165,8 @@ async function autoSyncHardware(db, { hwImportId, ioImportId, columnMap }) {
     INSERT INTO hw_signals
       (hw_import_id, row_number, station_address, station_name, ip_address,
        slot, channel, module_order_no, module_name, tag, description, signal_type, subsystem_no, router_address,
-       station_mlfb, resolved_by_tier2, unresolved)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+       station_mlfb, resolved_by_tier2, unresolved, as_assignment)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `);
   const insertNew = db.transaction(async (rows) => {
     let rowIdx = 0;
@@ -143,7 +174,8 @@ async function autoSyncHardware(db, { hwImportId, ioImportId, columnMap }) {
       await ins.run(hwImportId, r.rowNum ?? rowIdx, r.stationAddr, r.stationName, r.ip,
         r.slot, r.channel ?? null, r.orderNo, r.moduleName, r.tag, r.desc,
         r.signalType, r.subsystemNo ?? null, r.routerAddress || null,
-        r.stationMlfb || null, !!r.resolvedByTier2, !!r.unresolved);
+        r.stationMlfb || null, !!r.resolvedByTier2, !!r.unresolved,
+        r.asAssignment || null);
       rowIdx++;
     }
   });
@@ -152,7 +184,8 @@ async function autoSyncHardware(db, { hwImportId, ioImportId, columnMap }) {
   // Tier 2: create slot 0 rows for stations resolved via Protocol+SignalType lookup,
   // matching the manual-flow behavior so downstream CFG generation sees consistent data.
   const tier2Stations = await db.prepare(`
-    SELECT DISTINCT station_address, station_name, ip_address, router_address, subsystem_no, station_mlfb
+    SELECT DISTINCT station_address, station_name, ip_address, router_address, subsystem_no, station_mlfb,
+           as_assignment
     FROM hw_signals
     WHERE hw_import_id=? AND resolved_by_tier2=true AND station_mlfb IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM hw_signals s2 WHERE s2.hw_import_id=? AND s2.station_address=hw_signals.station_address AND s2.slot=0)
@@ -162,15 +195,15 @@ async function autoSyncHardware(db, { hwImportId, ioImportId, columnMap }) {
       INSERT INTO hw_signals
         (hw_import_id, row_number, station_address, station_name, ip_address,
          slot, channel, module_order_no, module_name, tag, description, signal_type, subsystem_no, router_address,
-         station_mlfb, resolved_by_tier2, unresolved)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         station_mlfb, resolved_by_tier2, unresolved, as_assignment)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     `);
     for (const s of tier2Stations) {
       await insSlot0.run(
         hwImportId, null, s.station_address, s.station_name, s.ip_address,
         0, null, s.station_mlfb, s.station_name,
         null, null, null, s.subsystem_no, s.router_address,
-        s.station_mlfb, true, false
+        s.station_mlfb, true, false, s.as_assignment || null
       );
     }
   }
@@ -222,6 +255,7 @@ async function generateCfgForWorkflow(db, hwImportId) {
     subslotMap.get(key).push({ subslotNo: r.subslot_no, paProfile: r.pa_profile || null });
   }
 
+  const controllerId = hwImport.hw_controller_id || null;
   const stations = new Map();
   for (const sig of signals) {
     const addr = sig.station_address;
@@ -230,6 +264,7 @@ async function generateCfgForWorkflow(db, hwImportId) {
         address: addr, name: sig.station_name, ip: sig.ip_address,
         routerAddress: sig.router_address || null,
         subsystemNo: sig.subsystem_no,
+        controllerId: controllerId,
         slots: new Map(),
       });
     }
@@ -259,7 +294,8 @@ async function generateCfgForWorkflow(db, hwImportId) {
   const parsedBaseline = parseCfg(hwImport.baseline_cfg);
   allocateAddresses(stations, templateMap,
     parsedBaseline.existingAddresses.maxInput,
-    parsedBaseline.existingAddresses.maxOutput
+    parsedBaseline.existingAddresses.maxOutput,
+    null
   );
 
   const { cfg: cfgText, warnings } = await generateCfg(parsedBaseline, stations, templateMap, db);

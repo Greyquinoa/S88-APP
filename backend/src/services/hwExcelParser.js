@@ -16,6 +16,7 @@ const FIELD_ALIASES = {
   channel:         ['channel', 'channel_no', 'channelno', 'channel number', 'ch'],
   subsystem_no:    ['subsystem_no', 'subsystemno', 'subsystem no', 'io_subsystem', 'iosubsystem', 'pn_system', 'pnsystem'],
   router_address:  ['router_address', 'routeraddress', 'router address', 'gateway', 'gateway_ip', 'gatewayip', 'default_gateway'],
+  as_assignment:   ['as_assignment', 'asassignment', 'as assignment', 'automation_station', 'automationstation', 'automation station', 'as'],
   protocol:        ['protocol', 'comm_protocol', 'communication', 'bus_type', 'protocoltype', 'commtype', 'comm_type'],
 };
 
@@ -77,6 +78,11 @@ async function parseHwExcel(buffer, sheetName, overrideColumnMap, db) {
   const stations = new Map();
   const rawRows = [];
   const rawExcelRows = rows.map(r => r.data); // original column→value objects
+  // Stations are keyed by address alone, which is only safe while every sheet
+  // belongs to a single controller. Track the AS values so a mixed sheet can be
+  // rejected rather than silently collapsed (see the guard after this loop).
+  const asValuesSeen = new Set();
+  const slotConflicts = [];
 
   // Track resolution stats for Tier 1 vs Tier 2
   const resolutionStats = {
@@ -145,21 +151,33 @@ async function parseHwExcel(buffer, sheetName, overrideColumnMap, db) {
     const subsystemRaw  = get('subsystem_no');
     const subsystemNo   = subsystemRaw != null ? parseInt(subsystemRaw, 10) : null;
     const routerAddress = get('router_address') || '';
+    const asAssignment  = get('as_assignment') || '';
+
+    if (asAssignment) asValuesSeen.add(asAssignment);
 
     // Build station
     if (!stations.has(stationAddr)) {
-      stations.set(stationAddr, { address: stationAddr, name: stationName, ip, routerAddress, slots: new Map(), subsystemNo });
+      stations.set(stationAddr, { address: stationAddr, name: stationName, ip, routerAddress, asAssignment, slots: new Map(), subsystemNo });
     }
     const station = stations.get(stationAddr);
-    // Update name/ip/subsystemNo/routerAddress from first row that specifies them
+    // Update name/ip/subsystemNo/routerAddress/asAssignment from first row that specifies them
     if (!station.name && stationName) station.name = stationName;
     if (!station.ip && ip) station.ip = ip;
     if (!station.routerAddress && routerAddress) station.routerAddress = routerAddress;
+    if (!station.asAssignment && asAssignment) station.asAssignment = asAssignment;
     if (station.subsystemNo == null && subsystemNo != null) station.subsystemNo = subsystemNo;
 
-    // Build slot
+    // Build slot. First writer wins — kept deliberately, since changing which
+    // module survives would alter existing correct output. But a later row
+    // carrying a DIFFERENT module for the same slot is real data loss, so record
+    // it instead of dropping it silently.
     if (!station.slots.has(slot)) {
       station.slots.set(slot, { slot, orderNo, name: moduleName, channels: [] });
+    } else {
+      const existing = station.slots.get(slot);
+      if (existing.orderNo && orderNo && existing.orderNo !== orderNo) {
+        slotConflicts.push({ stationAddr, slot, kept: existing.orderNo, dropped: orderNo, rowNum });
+      }
     }
     const slotObj = station.slots.get(slot);
 
@@ -169,14 +187,27 @@ async function parseHwExcel(buffer, sheetName, overrideColumnMap, db) {
     }
 
     rawRows.push({
-      rowNum, stationAddr, slot, orderNo, moduleName, tag, desc, signalType, channel, ip, stationName, subsystemNo, routerAddress,
+      rowNum, stationAddr, slot, orderNo, moduleName, tag, desc, signalType, channel, ip, stationName, subsystemNo, routerAddress, asAssignment,
       stationMlfb,
       resolvedByTier2: !!tier2Used,
       unresolved: !!unresolved,
     });
   }
 
-  return { headers, colMap, rows: rawRows, stations, rawExcelRows, resolutionStats };
+  // A sheet spanning several controllers cannot be represented here: `stations` is
+  // keyed by address alone, so a second controller reusing an address would merge
+  // into the first and lose its modules. Reject it and point at the split import,
+  // which stages each controller's rows into its own hardware import.
+  if (asValuesSeen.size > 1) {
+    const e = new Error(
+      `This sheet contains rows for multiple controllers (${[...asValuesSeen].sort().join(', ')}). ` +
+      `Use "Import Hardware" so each controller's rows are staged into its own hardware import.`);
+    e.statusCode = 400;
+    throw e;
+  }
+
+  return { headers, colMap, rows: rawRows, stations, rawExcelRows, resolutionStats,
+           asValues: [...asValuesSeen], slotConflicts };
 }
 
 /**
@@ -189,6 +220,11 @@ async function parseHwExcel(buffer, sheetName, overrideColumnMap, db) {
 async function parseRawExcelRows(rawExcelRows, colMap, db) {
   const stations = new Map();
   const rows = [];
+  // Unlike parseHwExcel this never throws on a mixed sheet: callers here replay
+  // pre-split, AS-pure buckets, and the legacy pre-split path has no AS mapping
+  // at all. Report the values instead and let the caller decide.
+  const asValuesSeen = new Set();
+  const slotConflicts = [];
   const resolutionStats = {
     total: 0,
     tier1: 0,
@@ -259,20 +295,30 @@ async function parseRawExcelRows(rawExcelRows, colMap, db) {
     const subsystemParsed = subsystemRaw != null ? parseInt(subsystemRaw, 10) : null;
     const subsystemNo = isNaN(subsystemParsed) ? null : subsystemParsed;
     const routerAddress = get('router_address') || '';
+    const asAssignment = get('as_assignment') || '';
+
+    if (asAssignment) asValuesSeen.add(asAssignment);
 
     // Build station
     if (!stations.has(stationAddr)) {
-      stations.set(stationAddr, { address: stationAddr, name: stationName, ip, routerAddress, slots: new Map(), subsystemNo });
+      stations.set(stationAddr, { address: stationAddr, name: stationName, ip, routerAddress, asAssignment, slots: new Map(), subsystemNo });
     }
     const station = stations.get(stationAddr);
     if (!station.name && stationName) station.name = stationName;
     if (!station.ip && ip) station.ip = ip;
     if (!station.routerAddress && routerAddress) station.routerAddress = routerAddress;
+    if (!station.asAssignment && asAssignment) station.asAssignment = asAssignment;
     if (station.subsystemNo == null && subsystemNo != null) station.subsystemNo = subsystemNo;
 
-    // Build slot
+    // Build slot — first writer wins, but record a differing module rather than
+    // dropping it silently (see the matching comment in parseHwExcel).
     if (!station.slots.has(slot)) {
       station.slots.set(slot, { slot, orderNo, name: moduleName, channels: [] });
+    } else {
+      const existing = station.slots.get(slot);
+      if (existing.orderNo && orderNo && existing.orderNo !== orderNo) {
+        slotConflicts.push({ stationAddr, slot, kept: existing.orderNo, dropped: orderNo, rowNum });
+      }
     }
     const slotObj = station.slots.get(slot);
 
@@ -282,14 +328,14 @@ async function parseRawExcelRows(rawExcelRows, colMap, db) {
     }
 
     rows.push({
-      rowNum, stationAddr, slot, orderNo, moduleName, tag, desc, signalType, channel, ip, stationName, subsystemNo, routerAddress,
+      rowNum, stationAddr, slot, orderNo, moduleName, tag, desc, signalType, channel, ip, stationName, subsystemNo, routerAddress, asAssignment,
       stationMlfb,
       resolvedByTier2: !!tier2Used,
       unresolved: !!unresolved,
     });
   }
 
-  return { rows, stations, resolutionStats };
+  return { rows, stations, resolutionStats, asValues: [...asValuesSeen], slotConflicts };
 }
 
 /**
@@ -368,4 +414,13 @@ function suggestColumnMappingByLevenshtein(appFields, excelColumns, threshold = 
   return suggestions;
 }
 
-module.exports = { parseHwExcel, parseRawExcelRows, detectColumnMap, suggestColumnMappingByLevenshtein, resolveTier2 };
+/**
+ * Normalise an AS / controller name for matching. Controller tag names are stored
+ * verbatim from the CFG STATION line, so both sides must be normalised — but only
+ * by trim + casefold: anything fuzzier risks routing a row to the wrong controller.
+ * Shared by the split-ingest endpoint and the workflow's per-controller sync so
+ * they can never disagree about what "matches".
+ */
+const normAs = (v) => String(v ?? '').trim().toLowerCase();
+
+module.exports = { parseHwExcel, parseRawExcelRows, detectColumnMap, suggestColumnMappingByLevenshtein, resolveTier2, normAs };

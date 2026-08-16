@@ -31,34 +31,17 @@ const FX_DEFAULT = {
   PC:    'OD01101071:00000145:00000000:00000000',
 };
 
-// Get the effective config for an instance. Checks instance.hw_controller_id
-// against the per-controller config map; falls back to projectConfig if not found.
-function getInstanceConfig(instance, projectConfig, projectConfigByController) {
-  if (instance?.hw_controller_id != null && projectConfigByController) {
-    const ctrlConfig = projectConfigByController.get(instance.hw_controller_id);
-    if (ctrlConfig) return ctrlConfig;
-  }
-  return projectConfig;
-}
-
 // Build a FX object merged with live project config extracted from a PCS7 export.
 // projectConfig is the row from project_config (may be null → use defaults everywhere).
-// projectConfigByController: optional Map<hw_controller_id, config> for per-controller lookup
-function buildFX(projectConfig, controllerId = null, projectConfigByController = null) {
-  let config = projectConfig;
-  // If per-controller map is provided and instance has a controller_id, use that controller's config
-  if (controllerId != null && projectConfigByController) {
-    const ctrlConfig = projectConfigByController.get(controllerId);
-    if (ctrlConfig) config = ctrlConfig;
-  }
-  if (!config) return FX_DEFAULT;
+function buildFX(projectConfig) {
+  if (!projectConfig) return FX_DEFAULT;
   return {
-    PROJ:  config.project_id_val  || FX_DEFAULT.PROJ,
-    DEV:   config.device_id       || FX_DEFAULT.DEV,
+    PROJ:  projectConfig.project_id_val  || FX_DEFAULT.PROJ,
+    DEV:   projectConfig.device_id       || FX_DEFAULT.DEV,
     RACK:  FX_DEFAULT.RACK,   // not extracted by the parser — keep default
-    CPU:   config.cpu_id          || FX_DEFAULT.CPU,
+    CPU:   projectConfig.cpu_id          || FX_DEFAULT.CPU,
     IOTAG: FX_DEFAULT.IOTAG,  // not exposed in exports
-    PC:    config.process_cell_id || FX_DEFAULT.PC,
+    PC:    projectConfig.process_cell_id || FX_DEFAULT.PC,
   };
 }
 
@@ -560,14 +543,10 @@ function buildWireSpecs(connGroups) {
 // signalMaps:        signal-to-instance mappings (optional — additive). Shape:
 //                    { [instanceName]: { "<block>.<var>": { tag, varDtype, signalType } } }
 //                    When empty, output is byte-identical to the pre-feature export.
-// projectConfigByController: Map<hw_controller_id, projectConfig> — per-controller configs
 // Returns: { xml: string, stats: { blocks, vars, msgs, links } }
-function generateXML(instances, projectName, hierarchy, instanceFolderMap, projectConfig, connGroups, signalMaps = {}, projectConfigByController = null) {
+function generateXML(instances, projectName, hierarchy, instanceFolderMap, projectConfig, connGroups, signalMaps = {}) {
   resetCtr();
-  // For backward compatibility, use projectConfig for global FX (PROJ, DEV, CPU, PC IDs).
-  // If per-controller configs exist, projectConfig is the first one, which serves as the primary.
-  // (A single XML cannot have multiple device IDs, so all instances share the primary controller's config.)
-  const FX  = buildFX(projectConfig, null, projectConfigByController);
+  const FX  = buildFX(projectConfig);
   const b   = makeBuilder();
   const now = new Date().toISOString().slice(0, 19);
   const NS  = 'http://www.siemens.com/automation/2005/SimaticML';
@@ -579,18 +558,6 @@ function generateXML(instances, projectName, hierarchy, instanceFolderMap, proje
 
   // Stats counters (shared, mutated by helpers)
   const counters = { blocks: 0, vars: 0, msgs: 0, links: 0 };
-
-  // ── ARCHITECTURE NOTE: Per-Controller Configs ────────────────────────────────
-  // Each instance carries an optional hw_controller_id (from project_instances table).
-  // The projectConfigByController Map stores separate PCS7 configs per controller.
-  // Currently, all instances in one XML share the PRIMARY config (from projectConfig,
-  // the first controller's config) because SimaticML structure allows only one PROJ/DEV/CPU
-  // per XML document.
-  //
-  // If support for multiple XMLs per project is added, the FX object generation should be
-  // moved into a per-controller loop, and getInstanceConfig() should be called for each
-  // instance to fetch its controller-specific config.
-  // For now, instances preserve hw_controller_id for future use and data consistency.
 
   // ── Document header ─────────────────────────────────────────────────────────
   b.raw(`<?xml version="1.0" encoding="UTF-8" standalone="no"?>`);

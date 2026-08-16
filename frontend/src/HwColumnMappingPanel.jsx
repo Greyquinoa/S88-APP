@@ -21,6 +21,7 @@ export default function HwColumnMappingPanel({ importId, excelHeaders, selectedC
     { key: 'slot', label: 'Slot', desc: 'Module position in rack' },
     { key: 'tag', label: 'Tag', desc: 'Signal identifier' },
     { key: 'channel', label: 'Channel', desc: 'Signal channel number' },
+    { key: 'as_assignment', label: 'AS Assignment', desc: 'Controller this row belongs to (e.g. AS01)' },
   ];
 
   const MODULE_ORDER_FIELD = { key: 'module_order_no', label: 'Module Order No (Card MLFB)', desc: 'Siemens module catalog number — Tier 1' };
@@ -99,6 +100,7 @@ export default function HwColumnMappingPanel({ importId, excelHeaders, selectedC
     description: 'desc',
     subsystem_no: 'subsystemNo',
     router_address: 'routerAddress',
+    as_assignment: 'asAssignment',
   };
 
   function handleNextStep() {

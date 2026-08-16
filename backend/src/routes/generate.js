@@ -39,8 +39,9 @@ async function runGeneration(db, body, onProgress) {
 
   // Load the hierarchy and project config for this saved project (looked up by name).
   let hierarchy = [];
-  let projectConfig = null;
-  let projectConfigByController = null;
+  // PCS7 config is scoped per user project: { userProjectName: configRow }. Each
+  // group's XML is built with its own row, so AS01 and AS02 get their own IDs.
+  let configByUserProject = {};
   let signalMaps = {};   // { instanceName: { "block.var": { tag, ... } } } — injected at export
   let matrixOverrides = {};   // { instanceName: { enabled, cells: { mode_nr: { colName: val } } } }
   // Instances whose reconciliation left them as unaccepted DUMMY are excluded
@@ -53,19 +54,6 @@ async function runGeneration(db, body, onProgress) {
           `SELECT instance_name FROM project_instances WHERE project_id = ? AND reconciliation_status = 'DUMMY'`
         ).all(proj.id);
         excludedDummies = dummyRows.map(r => r.instance_name);
-
-        // Enrich instances with their hw_controller_id from the database, so each
-        // instance can be matched to its controller's PCS7 config during XML generation.
-        const savedInstances = await db.prepare(
-          `SELECT instance_name, hw_controller_id FROM project_instances WHERE project_id = ?`
-        ).all(proj.id);
-        const instanceControllerMap = new Map(
-          savedInstances.map(s => [s.instance_name, s.hw_controller_id])
-        );
-        instances = instances.map(inst => {
-          const hwCtrlId = instanceControllerMap.get(inst.instanceName);
-          return hwCtrlId !== undefined ? { ...inst, hw_controller_id: hwCtrlId } : inst;
-        });
 
         // Safety net: enabledBlocks is client-supplied, and an empty list silently
         // drops every optional block from the export. The saved profile is the
@@ -107,18 +95,13 @@ async function runGeneration(db, body, onProgress) {
           WHERE project_id = ?
           ORDER BY sort_order, id
         `).all(proj.id);
-        // Load ALL controller configs (per-controller, not per-project)
-        const configRows = await db.prepare(`
-          SELECT * FROM project_config WHERE project_id = ?
-          ORDER BY hw_controller_id NULLS FIRST
-        `).all(proj.id);
-        // For now, maintain backward compatibility: projectConfig is the first config
-        // (or null if none exist). The xmlGenerator will use per-controller lookup.
-        projectConfig = configRows.length > 0 ? configRows[0] : null;
-        // Also provide the full map to the generator if needed: { hw_controller_id: config }
-        projectConfigByController = new Map(
-          configRows.map(c => [c.hw_controller_id, c])
-        );
+        // One config row per user project. Rows with a NULL user_project are
+        // pre-migration leftovers and are deliberately ignored — a group with no
+        // matching row falls back to FX_DEFAULT inside generateXML.
+        const cfgRows = await db.prepare(
+          `SELECT * FROM project_config WHERE project_id = ? AND user_project IS NOT NULL`
+        ).all(proj.id);
+        for (const r of cfgRows) configByUserProject[r.user_project] = r;
         signalMaps = await loadMappingsForProject(db, proj.id);
 
         // Per-instance matrix overrides — applied to matrix CM instances below.
@@ -549,7 +532,11 @@ async function runGeneration(db, body, onProgress) {
       // this frame is emitted just before so the label updates before the stall).
       const buildPct = 85 + Math.round(((groupIdx + 1) / groupCount) * 10);
       report(buildPct, 'building', `${up}: building XML…`);
-      const { xml, stats } = generateXML(instDefs, up, hierarchy, instanceFolderMap, projectConfig, connGroups, signalMaps, projectConfigByController);
+      const groupConfig = configByUserProject[up] || null;
+      if (!groupConfig) {
+        console.warn(`[generate] No PCS7 config found for user project '${up}' — using default IDs`);
+      }
+      const { xml, stats } = generateXML(instDefs, up, hierarchy, instanceFolderMap, groupConfig, connGroups, signalMaps);
       outputs.push({ userProject: up, xml, stats, instances: groupInstances });
       groupIdx++;
     }

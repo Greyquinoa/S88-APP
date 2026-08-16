@@ -133,7 +133,7 @@ function ResolutionStatsBanner({ stats }) {
 }
 
 // ── Main component ────────────────────────────────────────────────────────────
-export default function HwImportReview({ importId, summary, items, parsedRows, fileName, resolutionStats, onApplied, onClose }) {
+export default function HwImportReview({ importId, summary, items, parsedRows, fileName, resolutionStats, controllerName, queuePosition, onApplied, onClose }) {
   const [filter, setFilter]   = useState('all');
   const [selected, setSelected] = useState(() => {
     // Pre-select all non-unchanged rows
@@ -305,9 +305,22 @@ export default function HwImportReview({ importId, summary, items, parsedRows, f
           display: 'flex', alignItems: 'center', justifyContent: 'space-between',
           padding: '14px 20px', background: '#1e40af', color: '#fff', flexShrink: 0,
         }}>
-          <div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
             <span style={{ fontSize: 18, fontWeight: 700 }}>Import Review &amp; Validation</span>
-            <span style={{ marginLeft: 12, fontSize: 13, opacity: 0.8 }}>{fileName}</span>
+            {controllerName && (
+              <span style={{
+                fontSize: 13, fontWeight: 700, fontFamily: 'var(--font-mono, ui-monospace, monospace)',
+                background: 'rgba(255,255,255,0.18)', padding: '2px 10px', borderRadius: 10,
+              }}>
+                {controllerName}
+              </span>
+            )}
+            {queuePosition && (
+              <span style={{ fontSize: 12, opacity: 0.85 }}>
+                Controller {queuePosition.index} of {queuePosition.total}
+              </span>
+            )}
+            <span style={{ fontSize: 13, opacity: 0.8 }}>{fileName}</span>
           </div>
           <button onClick={onClose} style={{
             background: 'none', border: 'none', color: '#fff', fontSize: 22,

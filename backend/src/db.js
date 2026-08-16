@@ -415,11 +415,10 @@ async function ensureSchema() {
   // Migration: add is_valid to lib_variables (marks a variable as exposed for composite wiring)
   await addColumnIfMissing('lib_variables', 'is_valid', 'is_valid BOOLEAN NOT NULL DEFAULT FALSE');
 
-  // Migration: project_config now links to hw_controllers (per-controller, not per-project)
+  // Migration: add project_config table (per-project PCS7 hardware IDs)
   await rawRun(`CREATE TABLE IF NOT EXISTS project_config (
     id               SERIAL PRIMARY KEY,
-    project_id       INTEGER NOT NULL REFERENCES projects(id),
-    hw_controller_id INTEGER REFERENCES hw_controllers(id),
+    project_id       INTEGER NOT NULL UNIQUE REFERENCES projects(id),
     project_name     TEXT,
     project_id_val   TEXT,
     device_name      TEXT,
@@ -432,20 +431,8 @@ async function ensureSchema() {
     cm_folder_id     TEXT,
     export_user      TEXT,
     unit_author      TEXT,
-    updated_at       TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(project_id, hw_controller_id)
+    updated_at       TIMESTAMPTZ DEFAULT NOW()
   )`);
-
-  // Backfill: add hw_controller_id column if it doesn't exist (for existing databases)
-  await addColumnIfMissing('project_config', 'hw_controller_id', 'hw_controller_id INTEGER REFERENCES hw_controllers(id)');
-
-  // Also ensure the UNIQUE constraint exists
-  try {
-    await rawRun(`ALTER TABLE project_config DROP CONSTRAINT IF EXISTS project_config_project_id_key`);
-  } catch (_) {}
-  try {
-    await rawRun(`ALTER TABLE project_config ADD CONSTRAINT project_config_project_id_hw_controller_id_key UNIQUE(project_id, hw_controller_id)`);
-  } catch (_) {}  // constraint may already exist
 
   // ── IO Import System ──────────────────────────────────────────────
   const ioStmts = [
@@ -1466,12 +1453,41 @@ async function ensureSchema() {
   await addColumnIfMissing('project_instances', 'last_reconciled_at', 'last_reconciled_at TIMESTAMPTZ');
   await rawRun(`CREATE INDEX IF NOT EXISTS idx_pi_recon_status ON project_instances(project_id, reconciliation_status)`);
 
-  // Migration: add hw_controller_id to project_instances for per-controller config lookup
-  await addColumnIfMissing('project_instances', 'hw_controller_id', 'hw_controller_id INTEGER REFERENCES hw_controllers(id)');
-  await rawRun(`CREATE INDEX IF NOT EXISTS idx_pi_hw_controller ON project_instances(hw_controller_id)`);
+  // ── Migration: Refactor project_config from per-controller to per-user-project ──
+  // This migration changes project_config scoping from hw_controller_id to user_project.
+  // hw_controller_id entries are orphaned (backfill not provided—user re-uploads as needed).
+  {
+    try {
+      const hasUserProject = (await tableColumns('project_config')).includes('user_project');
+      const hasHwControllerId = (await tableColumns('project_config')).includes('hw_controller_id');
 
-  // Migration: add user_project to hw_controllers so each controller maps to its AS
-  await addColumnIfMissing('hw_controllers', 'user_project', 'user_project TEXT');
+      if (!hasUserProject) {
+        await rawRun('ALTER TABLE project_config ADD COLUMN user_project TEXT');
+        console.log('[DB] Migration: Added user_project column to project_config');
+      }
+
+      if (hasHwControllerId) {
+        try { await rawRun('ALTER TABLE project_config DROP CONSTRAINT IF EXISTS project_config_project_id_hw_controller_key'); } catch (_) {}
+        try { await rawRun('ALTER TABLE project_config DROP CONSTRAINT IF EXISTS project_config_project_id_hw_controller_id_key'); } catch (_) {}
+        try { await rawRun('ALTER TABLE project_config DROP COLUMN hw_controller_id'); } catch (e) {
+          console.log('[DB] Migration: Could not drop hw_controller_id:', e.message);
+        }
+        console.log('[DB] Migration: Removed hw_controller_id from project_config');
+      }
+
+      // Create new unique constraint if not already present
+      try {
+        await rawRun('ALTER TABLE project_config ADD CONSTRAINT project_config_proj_userproj_unique UNIQUE(project_id, user_project)');
+        console.log('[DB] Migration: Added unique constraint (project_id, user_project) to project_config');
+      } catch (e) {
+        if (!e.message.includes('already exists')) {
+          console.log('[DB] Migration: Unique constraint check — may already exist:', e.message);
+        }
+      }
+    } catch (e) {
+      console.log('[DB] Migration: project_config refactoring warning:', e.message);
+    }
+  }
 
   console.log('[DB] Schema ready');
 }

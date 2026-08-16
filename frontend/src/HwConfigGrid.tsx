@@ -33,6 +33,7 @@ export interface HwStation {
   approved?: boolean;
   orderNo?: string | null;
   family?: string | null;
+  routerAddress?: string | null;
 }
 
 export interface HwModuleTemplate {

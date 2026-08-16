@@ -28,7 +28,7 @@ const { parseCfg } = require('./cfgParser');
  */
 async function buildAllocatedStations(db, importId) {
   const hwImport = await db.prepare(
-    'SELECT id, baseline_cfg FROM hw_imports WHERE id=?'
+    'SELECT id, baseline_cfg, hw_controller_id FROM hw_imports WHERE id=?'
   ).get(importId);
   if (!hwImport) return new Map();
 
@@ -62,6 +62,11 @@ async function buildAllocatedStations(db, importId) {
       stations.set(addr, {
         address: addr, name: sig.station_name, ip: sig.ip_address,
         routerAddress: sig.router_address || null, subsystemNo: sig.subsystem_no,
+        // The controller lives on the import, not on the signal row (one import per
+        // controller). allocateAddresses() groups by this to keep address cursors
+        // isolated per controller; without it every station lands in the untagged
+        // fallback group. Same source generateCfgForWorkflow() uses.
+        controllerId: hwImport.hw_controller_id || null,
         slots: new Map(),
       });
     }
@@ -83,7 +88,10 @@ async function buildAllocatedStations(db, importId) {
     maxOut = parsed.existingAddresses.maxOutput;
   }
 
-  allocateAddresses(stations, templateMap, maxIn, maxOut);
+  // controllerMap is intentionally null: this runs per-import and every import
+  // belongs to exactly one controller, so all stations share a controllerId and
+  // fall through to the global baseline high-water marks below.
+  allocateAddresses(stations, templateMap, maxIn, maxOut, null);
   return stations;
 }
 

@@ -75,16 +75,51 @@ router.put('/:id', async (req, res) => {
 });
 
 // DELETE /api/hw-controllers/:id
+// Cascades to all imports, signals, fieldbuses, and generated configs.
+// Catalogue tables (templates, hardware_resolution) are NOT deleted — they are project-wide.
 router.delete('/:id', async (req, res) => {
-  const db = getDb();
-  const existing = await db.prepare('SELECT * FROM hw_controllers WHERE id = ?').get(Number(req.params.id));
-  if (!existing) return res.status(404).json({ error: 'Not found' });
-  await db.transaction(async () => {
-    // cascade: fieldbuses → controller
-    await db.prepare('DELETE FROM hw_fieldbuses WHERE hw_controller_id = ?').run(Number(req.params.id));
-    await db.prepare('DELETE FROM hw_controllers WHERE id = ?').run(Number(req.params.id));
-  })();
-  res.status(204).send();
+  try {
+    const db = getDb();
+    const controllerId = Number(req.params.id);
+    const existing = await db.prepare('SELECT * FROM hw_controllers WHERE id = ?').get(controllerId);
+    if (!existing) return res.status(404).json({ error: 'Not found' });
+
+    await db.transaction(async () => {
+      // ── Step 1: Find all imports scoped to this controller ───────────────────
+      const imports = await db.prepare('SELECT id FROM hw_imports WHERE hw_controller_id = ?').all(controllerId);
+      const importIds = imports.map(r => r.id);
+
+      // ── Step 2: For each import, cascade delete ────────────────────────────
+      for (const importId of importIds) {
+        // Delete instance_ios that reference signals from this import
+        const signals = await db.prepare('SELECT id FROM hw_signals WHERE hw_import_id = ?').all(importId);
+        const signalIds = signals.map(r => r.id);
+        for (const sigId of signalIds) {
+          await db.prepare('DELETE FROM instance_ios WHERE hw_signal_id = ?').run(sigId);
+        }
+
+        // Delete import-scoped tables
+        await db.prepare('DELETE FROM hw_signals WHERE hw_import_id = ?').run(importId);
+        await db.prepare('DELETE FROM hw_excel_raw WHERE hw_import_id = ?').run(importId);
+        await db.prepare('DELETE FROM hw_slot_subslots WHERE hw_import_id = ?').run(importId);
+        await db.prepare('DELETE FROM hw_generated_cfgs WHERE hw_import_id = ?').run(importId);
+        await db.prepare('DELETE FROM mrp_configs WHERE hw_import_id = ?').run(importId);
+
+        // Delete the import itself
+        await db.prepare('DELETE FROM hw_imports WHERE id = ?').run(importId);
+      }
+
+      // ── Step 3: Delete fieldbuses scoped to this controller ────────────────
+      await db.prepare('DELETE FROM hw_fieldbuses WHERE hw_controller_id = ?').run(controllerId);
+
+      // ── Step 4: Delete the controller itself ──────────────────────────────
+      await db.prepare('DELETE FROM hw_controllers WHERE id = ?').run(controllerId);
+    })();
+
+    res.status(204).send();
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 function pick(body) {
