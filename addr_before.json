@@ -1,0 +1,38 @@
+[
+  {
+    "addr": 1,
+    "controllerId": null,
+    "slots": [
+      {
+        "slot": 0,
+        "orderNo": "6ES7 155-6AU00-0CN0",
+        "in": null,
+        "out": null
+      },
+      {
+        "slot": 1,
+        "orderNo": "6ES7 134-6HD00-0BA1",
+        "in": 512,
+        "out": null
+      },
+      {
+        "slot": 2,
+        "orderNo": "6ES7 131-6BH00-0BA0",
+        "in": 0,
+        "out": null
+      },
+      {
+        "slot": 3,
+        "orderNo": "6ES7 132-6BH00-0BA0",
+        "in": null,
+        "out": 0
+      },
+      {
+        "slot": 4,
+        "orderNo": "V1_1:6ES7 193-6PA00-0AA0",
+        "in": null,
+        "out": null
+      }
+    ]
+  }
+]

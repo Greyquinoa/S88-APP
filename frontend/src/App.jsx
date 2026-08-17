@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback, useLayoutEffect, Fragment } from "react";
+import { useNavigate, useLocation } from 'react-router-dom';
 import { AgGridReact } from "ag-grid-react";
 import { AllCommunityModule, ModuleRegistry, themeQuartz } from "ag-grid-community";
 
@@ -41,6 +42,7 @@ import Sidebar from "./Sidebar.jsx";
 import { GlobalLoadingProvider } from "./LoadingContext.jsx";
 import Nimbus from "./components/Nimbus/Nimbus";
 import UserProjectConfigModal from "./UserProjectConfigModal.jsx";
+import { ROUTE_TO_STEP, STEP_TO_ROUTE } from './routes.js';
 
 const STEPS = ["Projects", "IO Import", "EPH/EM Import", "Library", "Unit Types", "Hierarchy", "Instances", "HW Config", "Generate"];
 const DEFAULT_ON_OPTIONAL = ["MV_Rate"];
@@ -51,7 +53,12 @@ let _folderClientCtr = 1;
 const newFolderClientId = () => `cf${_folderClientCtr++}`;
 
 export default function App() {
-  const [step, setStep]               = useState(0);
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [step, setStep]               = useState(() => {
+    // Get initial step from URL path, default to 0 if not found
+    return ROUTE_TO_STEP[location.pathname] ?? 0;
+  });
   const [libStatus, setLibStatus]     = useState(null);   // { cm_count, last_loaded }
   const [cmTypes, setCmTypes]         = useState([]);      // from DB
   const [cmtProfiles, setProfiles]    = useState([]);      // { id, cmType, enabledBlocks }
@@ -105,6 +112,22 @@ export default function App() {
   // ── Unit Connections state ─────────────────────────────────────────────────
   const [unitConnections, setUnitConnections]           = useState({});     // unitTypeId -> connections[]
   const [cmTypeVarCache, setCmTypeVarCache]             = useState({});     // member alias -> {vars, subMembers, ...}
+
+  // Sync URL with step changes
+  useEffect(() => {
+    const route = STEP_TO_ROUTE[step];
+    if (route && location.pathname !== route) {
+      navigate(route, { replace: true });
+    }
+  }, [step, navigate, location.pathname]);
+
+  // Handle URL changes (browser back/forward buttons)
+  useEffect(() => {
+    const newStep = ROUTE_TO_STEP[location.pathname] ?? 0;
+    if (newStep !== step) {
+      setStep(newStep);
+    }
+  }, [location.pathname]);
 
   // Check library status on mount + load unit types + composite types
   useEffect(() => {
