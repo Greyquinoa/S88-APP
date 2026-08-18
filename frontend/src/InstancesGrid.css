@@ -227,6 +227,12 @@
   font-family: var(--font-mono, ui-monospace, monospace);
 }
 
+/* IO preview: columns with a suggested internal-field mapping are accented,
+   matching the old preview table's blue header treatment. */
+.ig-grid-wrap .io-preview-header-mapped .ag-header-cell-label {
+  color: #0C447C;
+}
+
 /* Ensure the delete column cell doesn't pad awkwardly */
 .ig-grid-wrap [col-id="id"] .ag-cell-wrapper {
   padding: 0;

@@ -231,8 +231,9 @@ export async function reimportIOList(importId, file) {
 export async function getIOHeaders(importId) {
   return request('GET', `/io/imports/${importId}/headers`);
 }
-export async function getIOPreview(importId) {
-  return request('GET', `/io/imports/${importId}/preview`);
+export async function getIOPreview(importId, params = {}) {
+  const qs = new URLSearchParams(params).toString();
+  return request('GET', `/io/imports/${importId}/preview${qs ? '?' + qs : ''}`);
 }
 export async function getIOTags(importId, params = {}) {
   const qs = new URLSearchParams(params).toString();

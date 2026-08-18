@@ -16,6 +16,13 @@ const upload  = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50
 
 function err(res, code, msg) { return res.status(code).json({ error: msg }); }
 
+// Preview paging. Raw rows are never returned in full: a 50k-row import is tens
+// of MB of JSON, which stalls the server serialising it and the browser parsing
+// it. Upload/reimport return the first page; the grid pages the rest via
+// GET /imports/:id/preview?offset=&limit=.
+const PREVIEW_DEFAULT_LIMIT = 200;
+const PREVIEW_MAX_LIMIT     = 1000;
+
 // ── Upload + parse Excel ──────────────────────────────────────────────────────
 // POST /api/io/project/:projectId/upload
 // multipart: field "iolist", optional query ?sheet=Sheet1&column_map_id=1
@@ -92,7 +99,8 @@ router.post('/project/:projectId/upload', upload.single('iolist'), async (req, r
       suggestions,
       validation,
       hierarchyStats,
-      preview: rows.map(r => r.data),
+      // First page only — the grid pages the rest in via /preview.
+      preview: rows.slice(0, PREVIEW_DEFAULT_LIMIT).map(r => r.data),
     });
   } catch (e) {
     console.error('[IO upload]', e.message);
@@ -161,7 +169,8 @@ router.post('/imports/:id/reimport', upload.single('iolist'), async (req, res) =
       suggestions,
       validation,
       hierarchyStats,
-      preview: rows.map(r => r.data),
+      // First page only — the grid pages the rest in via /preview.
+      preview: rows.slice(0, PREVIEW_DEFAULT_LIMIT).map(r => r.data),
     });
   } catch (e) {
     console.error('[IO reimport]', e.message);
@@ -212,16 +221,25 @@ router.get('/imports/:id/headers', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// GET /api/io/imports/:id/preview — all raw rows for preview display
+// GET /api/io/imports/:id/preview — a window of raw rows for preview display
+//
+// Paginated on purpose — see PREVIEW_DEFAULT_LIMIT above. Callers page through
+// with ?offset=&limit= (AG Grid's infinite row model does exactly this).
 router.get('/imports/:id/preview', async (req, res) => {
   try {
     const db  = getDb();
     const imp = await db.prepare('SELECT total_rows FROM io_imports WHERE id=?').get(req.params.id);
     if (!imp) return err(res, 404, 'Import not found');
 
+    const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+    const limit  = Math.min(
+      PREVIEW_MAX_LIMIT,
+      Math.max(1, parseInt(req.query.limit, 10) || PREVIEW_DEFAULT_LIMIT),
+    );
+
     const rows = await db.prepare(
-      'SELECT raw_data FROM io_tags WHERE import_id=? ORDER BY row_number'
-    ).all(req.params.id);
+      'SELECT raw_data FROM io_tags WHERE import_id=? ORDER BY row_number LIMIT ? OFFSET ?'
+    ).all(req.params.id, limit, offset);
 
     const preview = [];
     for (const row of rows) {
@@ -232,7 +250,7 @@ router.get('/imports/:id/preview', async (req, res) => {
       }
     }
 
-    res.json({ preview, totalRows: imp.total_rows });
+    res.json({ preview, totalRows: imp.total_rows, offset, limit });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

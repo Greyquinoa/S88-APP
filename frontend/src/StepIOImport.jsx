@@ -170,48 +170,107 @@ function SubTabs({ tab, setTab, importReady }) {
   );
 }
 
-// Preview table. Memoized because it can render thousands of rows — without this
-// every column toggle rebuilds the whole grid and blocks the paint for seconds.
+// Preview grid.
+//
+// Virtualized (AG Grid, infinite row model) rather than a plain <table>: a raw
+// DOM table renders every cell, so a 3k-row × 20-col import is 60k nodes and a
+// 50k-row one is a million — enough to block paint for seconds on every mount
+// and to run the tab out of memory at the top end. Here the DOM cost is the
+// ~30 visible rows regardless of import size, and rows stream in a page at a
+// time from GET /imports/:id/preview.
+//
+// Still memoized: without it every column toggle would tear down the grid.
+const PREVIEW_PAGE_SIZE = 200;
+
 const PreviewTable = memo(function PreviewTable({ preview, visibleHeaders }) {
+  const gridRef = useRef(null);
+
+  const theme = useMemo(
+    () => themeQuartz.withParams({
+      fontSize: 11, rowHeight: 28, headerHeight: 36,
+      fontFamily: 'system-ui, -apple-system, sans-serif',
+      accentColor: '#0C447C', browserColorScheme: 'light',
+    }),
+    [],
+  );
+
+  const defaultColDef = useMemo(() => ({
+    sortable: false, resizable: true, minWidth: 120,
+    cellStyle: { fontFamily: 'var(--font-mono)', color: 'var(--color-text-primary)' },
+  }), []);
+
+  const columnDefs = useMemo(() => visibleHeaders.map(h => {
+    const suggestion = preview.suggestions?.[h];
+    return {
+      colId: h,
+      headerName: suggestion
+        ? `${h} →${INTERNAL_FIELD_LABELS[suggestion] ?? suggestion}`
+        : h,
+      headerTooltip: suggestion
+        ? `${h} → ${INTERNAL_FIELD_LABELS[suggestion] ?? suggestion}`
+        : h,
+      headerClass: suggestion ? 'io-preview-header-mapped' : undefined,
+      // Raw Excel headers can collide with AG Grid's field path syntax (dots,
+      // brackets), so read the value explicitly instead of using `field`.
+      valueGetter: p => (p.data?.[h] != null ? String(p.data[h]) : ''),
+    };
+  }), [visibleHeaders, preview.suggestions]);
+
+  // Fetch a page at a time. The first page already came back with the upload /
+  // selection response, so serve it from memory instead of re-requesting it.
+  const datasource = useMemo(() => ({
+    rowCount: preview.totalRows ?? undefined,
+    getRows: async (params) => {
+      const { startRow, endRow } = params;
+      try {
+        let rows;
+        if (startRow === 0 && (preview.preview?.length ?? 0) >= Math.min(endRow, preview.totalRows ?? endRow)) {
+          rows = preview.preview.slice(startRow, endRow);
+        } else {
+          const resp = await getIOPreview(preview.importId, {
+            offset: startRow,
+            limit: endRow - startRow,
+          });
+          rows = resp.preview || [];
+        }
+        const total = preview.totalRows ?? 0;
+        // lastRow tells the grid where to stop; -1 means "not known yet".
+        const lastRow = total > 0 ? total : (rows.length < endRow - startRow ? startRow + rows.length : -1);
+        params.successCallback(rows, lastRow);
+      } catch (_) {
+        params.failCallback();
+      }
+    },
+  }), [preview.importId, preview.preview, preview.totalRows]);
+
+  // Swapping the datasource is how the infinite model is told to refetch.
+  useEffect(() => {
+    gridRef.current?.api?.setGridOption('datasource', datasource);
+  }, [datasource]);
+
   return (
     <div style={{ ...panelSx, flex: 1 }}>
-      <div style={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
-        <table style={{ borderCollapse: 'collapse', fontSize: 11, width: '100%' }}>
-          <thead>
-            <tr style={{ background: '#FBF8F0', position: 'sticky', top: 0, zIndex: 1 }}>
-              {visibleHeaders.map(h => (
-                <th key={h} style={{ padding: '12px 16px', textAlign: 'left', whiteSpace: 'nowrap',
-                    fontSize: 12, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.04em',
-                    borderBottom: '1px solid rgba(28,27,25,0.08)',
-                    color: preview.suggestions?.[h] ? '#0C447C' : '#6B6862' }}>
-                  {h}
-                  {preview.suggestions?.[h] && (
-                    <span style={{ marginLeft: 4, fontSize: 9, color: '#0C447C', textTransform: 'none' }}>
-                      →{INTERNAL_FIELD_LABELS[preview.suggestions[h]] ?? preview.suggestions[h]}
-                    </span>
-                  )}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {(preview.preview || []).map((row, i) => (
-              <tr key={i} style={{ borderBottom: '1px solid rgba(28,27,25,0.08)' }}>
-                {visibleHeaders.map(h => (
-                  <td key={h} style={{ padding: '5px 10px', fontFamily: 'var(--font-mono)',
-                      whiteSpace: 'nowrap', color: 'var(--color-text-primary)' }}>
-                    {row[h] != null ? String(row[h]) : ''}
-                  </td>
-                ))}
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      <div className="ig-grid-wrap" style={{ flex: 1, minHeight: 0 }}>
+        <AgGridReact
+          ref={gridRef}
+          theme={theme}
+          columnDefs={columnDefs}
+          defaultColDef={defaultColDef}
+          rowModelType="infinite"
+          datasource={datasource}
+          cacheBlockSize={PREVIEW_PAGE_SIZE}
+          // Bound the cache so scrolling a 50k-row import cannot grow the row
+          // cache without limit.
+          maxBlocksInCache={10}
+          infiniteInitialRowCount={Math.min(preview.totalRows || 1, PREVIEW_PAGE_SIZE)}
+          animateRows={false}
+          suppressCellFocus
+        />
       </div>
       <div style={{ padding: '12px 16px', fontSize: 11, color: 'var(--color-text-secondary)',
           borderTop: '1px solid rgba(28,27,25,0.08)',
           background: '#FBF8F0', flexShrink: 0 }}>
-        Showing all {preview.totalRows} rows
+        {preview.totalRows} rows
       </div>
     </div>
   );
@@ -221,12 +280,12 @@ const PreviewTable = memo(function PreviewTable({ preview, visibleHeaders }) {
 // TAB 1 — UPLOAD
 // ═══════════════════════════════════════════════════════════════════════════════
 function TabUpload({ projectId, imports, onImported, onSelectImport, onDeleteImport,
-    selectedImportId, columnMaps, allHeaders, activeHeaders, onActiveHeadersChange, setError }) {
+    selectedImportId, columnMaps, allHeaders, activeHeaders, onActiveHeadersChange, setError,
+    preview, setPreview }) {
   const fileRef          = useRef();
   const reimportRef      = useRef();
   const [busy, setBusy]  = useState(false);
   const [reimportId, setReimportId] = useState(null);  // import being replaced
-  const [preview, setPreview] = useState(null);
   const [availSheets, setAvailSheets] = useState([]);  // sheets from current file
   const [selSheet, setSelSheet]   = useState('');
   const [selColMap, setSelColMap] = useState('');
@@ -240,17 +299,23 @@ function TabUpload({ projectId, imports, onImported, onSelectImport, onDeleteImp
     if (h) setRowH(h);
   }, [imports, selectedImportId]);
 
-  // Load preview data when an import is selected from the list
+  // Load the first page of preview data when an import is selected from the
+  // list. The grid pages in the rest on scroll. Skipped when the cached preview
+  // is already for this import — switching tabs must not refetch.
   useEffect(() => {
     if (!selectedImportId) {
       setPreview(null);
       return;
     }
+    if (preview?.importId === selectedImportId) return;
+
+    let cancelled = false;
     (async () => {
       try {
         const headerResp = await getIOHeaders(selectedImportId);
         const headers_ = headerResp.headers || [];
-        const previewResp = await getIOPreview(selectedImportId);
+        const previewResp = await getIOPreview(selectedImportId, { offset: 0, limit: PREVIEW_PAGE_SIZE });
+        if (cancelled) return;
         setPreview({
           importId: selectedImportId,
           headers: headers_,
@@ -258,10 +323,11 @@ function TabUpload({ projectId, imports, onImported, onSelectImport, onDeleteImp
           totalRows: previewResp.totalRows || 0,
         });
       } catch (_) {
-        setPreview(null);
+        if (!cancelled) setPreview(null);
       }
     })();
-  }, [selectedImportId]);
+    return () => { cancelled = true; };
+  }, [selectedImportId, preview?.importId, setPreview]);
 
   async function handleFile(f) {
     if (!f) return;
@@ -270,7 +336,8 @@ function TabUpload({ projectId, imports, onImported, onSelectImport, onDeleteImp
     try {
       const r = await uploadIOList(projectId, f, selSheet || null, selColMap || null);
       setAvailSheets(r.sheets || []);
-      setPreview(r);
+      // importId must be present — the grid's datasource pages against it.
+      setPreview({ ...r, importId: r.importId });
       onImported(r.importId);
     } catch (e) { setError(e.message); }
     finally { setBusy(false); }
@@ -282,7 +349,8 @@ function TabUpload({ projectId, imports, onImported, onSelectImport, onDeleteImp
     setPreview(null);
     try {
       const r = await reimportIOList(reimportId, f);
-      setPreview(r);
+      // The reimport response carries no importId; the grid's datasource needs it.
+      setPreview({ ...r, importId: reimportId });
       onImported(reimportId, { preserveHeaders: true });
     } catch (e) { setError(e.message); }
     finally { setBusy(false); setReimportId(null); reimportRef.current.value = ''; }
@@ -2112,6 +2180,9 @@ export default function StepIOImport({ savedProjectId, cmtProfiles, compositeCmT
   const [activeHeaders, setActiveHeaders] = useState(null); // Set of user-selected column names
   const [columnMaps, setColumnMaps]     = useState([]);
   const [functionMaps, setFunctionMaps] = useState([]);
+  // Held here rather than in TabUpload so it survives tab switches — otherwise
+  // every return to Upload refetches and rebuilds the preview from scratch.
+  const [preview, setPreview]           = useState(null);
 
   const loadImports = useCallback(async () => {
     if (!savedProjectId) return;
@@ -2266,13 +2337,18 @@ export default function StepIOImport({ savedProjectId, cmtProfiles, compositeCmT
 
       {/* Tab content */}
       <div style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
-        {tab === 'upload' && (
+        {/* Upload stays mounted and is hidden with CSS. Unmounting it would tear
+            down the preview grid and force a refetch on every return to the tab;
+            the other tabs are cheap enough to mount on demand. */}
+        <div style={{ display: tab === 'upload' ? 'block' : 'none', height: '100%', minHeight: 0 }}>
           <TabUpload {...tabProps} imports={imports}
             onImported={handleImported}
             onSelectImport={id => { setSelectedImportId(id); }}
             onDeleteImport={handleDeleteImport}
-            selectedImportId={selectedImportId} />
-        )}
+            selectedImportId={selectedImportId}
+            preview={preview}
+            setPreview={setPreview} />
+        </div>
         {tab === 'colmap' && (
           <UnifiedColumnMappingScreen
             projectId={savedProjectId}
