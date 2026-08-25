@@ -4449,6 +4449,14 @@ function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName,
   const folderOptions  = allFolderOptions(hierarchy || []);
   const hasHierarchy   = (hierarchy?.length || 0) > 0;
   const folderMissing  = hasHierarchy && instances.some(i => !i.folderId);
+  // Every instance must belong to a user project — generation groups instances by
+  // their userProject field and filters by it. Instances without it contribute
+  // zero rows to every group and cause generation to fail.
+  const userProjectMissing = useMemo(
+    () => instances.filter(i => !i.userProject).map(i => i.instanceName),
+    [instances]
+  );
+  const hasUserProjectMissing = userProjectMissing.length > 0;
   const [compModal, setCompModal] = useState(false);
   const [reconData, setReconData] = useState({});
   const [reconInstances, setReconInstances] = useState([]);
@@ -4535,7 +4543,7 @@ function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName,
         </Btn>
         <Btn primary onClick={onGenerate}
             disabled={!instances.length || !!loading || generating || noUserProjects
-              || instances.some(i => !i.userProject) || folderMissing}>
+              || hasUserProjectMissing || folderMissing}>
           <i className="ti ti-code" /> {generating ? "Generating…" : (loading || "Generate XML")}
         </Btn>
       </div>
@@ -4556,6 +4564,16 @@ function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName,
           onClose={() => setReconModal(false)}
           onDataUpdate={loadReconData}
         />
+      )}
+
+      {hasUserProjectMissing && (
+        <div style={{ background: "#FEE2E2", border: "1px solid #FCA5A5", borderRadius: "var(--border-radius-md)",
+            padding: "7px 12px", marginBottom: "0.5rem", fontSize: 12, color: "#991B1B", flexShrink: 0 }}>
+          <b>{userProjectMissing.length} instance{userProjectMissing.length === 1 ? "" : "s"} without a user project assignment.</b>{" "}
+          Assign a user project via the <b>Controller</b> column before generating:{" "}
+          {userProjectMissing.slice(0, 8).join(", ")}
+          {userProjectMissing.length > 8 && ` … and ${userProjectMissing.length - 8} more`}
+        </div>
       )}
 
       {noUserProjects && (

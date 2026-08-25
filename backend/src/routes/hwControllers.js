@@ -10,7 +10,7 @@ const WRITABLE = [
   'T16_Controller_TagName', 'T16_Station_Type', 'T24_Program_Container',
   'INT_Controller_No', 'T8_Version', 'T15_IP_Address',
   'T50_Rack_Order_No', 'T50_Rack_Name', 'T50_PS_Order_No', 'T50_PS_Name',
-  'YN_Redundant', 'YN_Slave', 'MEM_Doc_Change',
+  'YN_Redundant', 'YN_Slave', 'MEM_Doc_Change', 'user_project',
 ];
 
 // Postgres folds unquoted identifiers to lowercase, so hw_controllers columns
@@ -62,15 +62,22 @@ router.get('/:id', async (req, res) => {
 // PUT /api/hw-controllers/:id
 router.put('/:id', async (req, res) => {
   const db = getDb();
-  const existing = await db.prepare('SELECT * FROM hw_controllers WHERE id = ?').get(Number(req.params.id));
+  const controllerId = Number(req.params.id);
+  const existing = await db.prepare('SELECT * FROM hw_controllers WHERE id = ?').get(controllerId);
   if (!existing) return res.status(404).json({ error: 'Not found' });
   const data = pick(req.body);
   if (Object.keys(data).length === 0) return res.status(400).json({ error: 'No writable fields' });
   const setClause = Object.keys(data).map(c => `${c} = ?`).join(', ');
   await db.prepare(
     `UPDATE hw_controllers SET ${setClause}, updated_at = NOW() WHERE id = ?`
-  ).run([...Object.values(data), Number(req.params.id)]);
-  const updated = await db.prepare('SELECT * FROM hw_controllers WHERE id = ?').get(Number(req.params.id));
+  ).run([...Object.values(data), controllerId]);
+  // If user_project changed, cascade to all instances assigned to this controller.
+  if ('user_project' in data) {
+    await db.prepare(
+      'UPDATE project_instances SET user_project = ? WHERE hw_controller_id = ?'
+    ).run(data.user_project || '', controllerId);
+  }
+  const updated = await db.prepare('SELECT * FROM hw_controllers WHERE id = ?').get(controllerId);
   res.json(toCanonical(updated));
 });
 
