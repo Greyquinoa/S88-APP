@@ -20,6 +20,9 @@ backend/.env
 # Database (local data)
 backend/data/*.db
 
+# Database backups (large, machine-local — not source-controlled)
+db-backups/
+
 # Claude Code workspace
 .claude/
 
