@@ -4546,10 +4546,18 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, hwC
   }
   useEffect(() => { loadConnStatus(); }, [savedProjectId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const tabInstances = instances.filter(i => {
-    const p = cmtProfiles.find(x => x.id === i.profileId);
-    return p?.libType === libType;
-  });
+  // Memoized — this used to be a plain filter recomputed on every render
+  // (every keystroke/edit anywhere in the grid calls setInstances upstream),
+  // doing an O(instances x profiles) scan each time. At a few thousand
+  // instances that was enough synchronous work per render to make typing
+  // and editing visibly laggy.
+  const tabInstances = useMemo(
+    () => instances.filter(i => {
+      const p = cmtProfiles.find(x => x.id === i.profileId);
+      return p?.libType === libType;
+    }),
+    [instances, cmtProfiles, libType]
+  );
   const showRolePane = libType === "EquipmentModule" || libType === "EquipmentPhase";
 
   const selectedInst = showRolePane ? tabInstances.find(i => i.id === selectedId) : null;
