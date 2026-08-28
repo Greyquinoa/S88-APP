@@ -14,40 +14,44 @@ const INTERNAL_FIELDS = [
  * Given an io_import's raw rows (already in io_tags) and a mapping config
  * { "CUST_COL": "internal_field", ... }, update the resolved columns on each tag.
  * Mapping values not in INTERNAL_FIELDS are ignored (raw_data always preserved).
+ *
+ * Does the extraction in a single UPDATE via jsonb ->> instead of looping
+ * row-by-row in JS — one round-trip instead of one per row, which is what
+ * made this the slowest step of import on large IO lists (~2ms/row before,
+ * i.e. minutes at 50k+ rows). raw_data is stored as `text`, not native
+ * jsonb, so it's cast inline per row. Column names come from user-uploaded
+ * spreadsheet headers, so they're bound as query parameters (not
+ * interpolated into the SQL) the same as any other user-supplied value.
  */
 async function applyMapping(db, importId, mappings) {
-  // mappings: { customerCol → internalField }
-  const tags = await db.prepare(
-    'SELECT id, raw_data FROM io_tags WHERE import_id = ?'
-  ).all(importId);
-
   // Invert: internalField → customerCol  (for quick lookup)
   const fieldToCol = {};
   for (const [col, field] of Object.entries(mappings)) {
     if (INTERNAL_FIELDS.includes(field)) fieldToCol[field] = col;
   }
 
-  const update = db.prepare(`
-    UPDATE io_tags SET
-      tag_name=?, instrument_tag=?, function_val=?, hierarchy=?, assignment=?,
-      updated_at=NOW()
-    WHERE id=?
-  `);
+  // NULLIF(...,'') collapses '' to NULL, matching the old
+  // `String(v).trim() || null` behavior for values present in raw_data.
+  const expr = field => fieldToCol[field]
+    ? `NULLIF(TRIM(BOTH FROM (raw_data::jsonb ->> ?)), '')`
+    : 'NULL';
 
   await db.transaction(async () => {
-    for (const tag of tags) {
-      const raw = JSON.parse(tag.raw_data || '{}');
-      const get = field => {
-        const col = fieldToCol[field];
-        if (!col) return null;
-        const v = raw[col];
-        return v != null ? String(v).trim() || null : null;
-      };
-      await update.run(
-        get('tag_name'), get('instrument_tag'), get('function_val'), get('hierarchy'), get('assignment'),
-        tag.id
-      );
-    }
+    const params = [];
+    const setClauses = INTERNAL_FIELDS.map(field => {
+      const col = fieldToCol[field];
+      if (col) params.push(col);
+      return `${field}=${expr(field)}`;
+    });
+    params.push(importId);
+
+    await db.prepare(`
+      UPDATE io_tags SET
+        ${setClauses.join(', ')},
+        updated_at=NOW()
+      WHERE import_id=?
+    `).run(...params);
+
     await db.prepare(
       `UPDATE io_imports SET status='mapped' WHERE id=?`
     ).run(importId);
