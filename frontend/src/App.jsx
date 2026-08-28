@@ -8,7 +8,7 @@ import {
   getLibraryStatus, previewLibraryUpload, computeLibraryDiff, importLibrary,
   getCmTypes, getCmTypeBlocks, getCmTypeBlockPrefs, saveCmTypeBlockPrefs, patchVarDefault, patchVarValid, toggleBlockConditional,
   generateXML, generateXMLStream, getHistory,
-  listProjects, getProject, saveProject, deleteProject, deleteProjectInstance,
+  listProjects, getProject, saveProject, deleteProject, deleteProjectInstance, deleteProjectInstances,
   deleteCmType,
   getUnitTypes, getUnitType, createUnitType, updateUnitType, deleteUnitType,
   getUnitTypeConnections, saveUnitTypeConnections, deleteUnitTypeConnection, getCmTypeVariablesForUnit,
@@ -611,6 +611,28 @@ export default function App() {
 
     // Only remove from UI after successful database deletion
     setInstances(p => p.filter(i => i.id !== id));
+  }
+  // Multi-select delete — one bulk request instead of one DELETE per instance.
+  // Firing N individual requests (the old removeInstance loop) was the whole
+  // reason deleting a couple thousand instances took 15+ seconds.
+  async function removeInstances(ids) {
+    const idSet = new Set(ids);
+    const targets = instances.filter(i => idSet.has(i.id));
+    if (!targets.length) return;
+
+    if (savedProjectId) {
+      const names = targets.filter(i => i.instanceName).map(i => i.instanceName);
+      if (names.length) {
+        try {
+          await deleteProjectInstances(savedProjectId, names);
+        } catch (err) {
+          setError(`Failed to delete instances: ${err.message}`);
+          return; // Don't remove from UI if delete failed
+        }
+      }
+    }
+
+    setInstances(p => p.filter(i => !idSet.has(i.id)));
   }
   function updateInstance(id,k,v) {
     setInstances(p => p.map(i => {
@@ -4499,7 +4521,7 @@ function RolePanel({ inst, profile, instances, cmtProfiles, updateInstanceRole }
 
 // ── Instance sub-tab (list + optional role panel) ─────────────────────────────
 function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, hwControllers, folderOptions, hasHierarchy,
-    addInstance, removeInstance, updateInstance, updateInstanceRole, ensureLoaded, savedProjectId, saveProjectNow, setError = () => {}, getCompositeCmType, extractMemberConnections, setInstances, compositeCmTypes, valveCommands, loadProjectIntoState,
+    addInstance, removeInstance, removeInstances, updateInstance, updateInstanceRole, ensureLoaded, savedProjectId, saveProjectNow, setError = () => {}, getCompositeCmType, extractMemberConnections, setInstances, compositeCmTypes, valveCommands, loadProjectIntoState,
     reconData, setReconData, reconModal, setReconModal, reconSummary, setReconSummary,
     onAddComposite, onRunReconciliation, onViewOverview }) {
   const [selectedId, setSelectedId] = useState(null);
@@ -4595,6 +4617,7 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, hwC
             folderOptions={folderOptions}
             onRowUpdate={(id, field, value) => updateInstance(id, field, value)}
             onRowDelete={(id) => removeInstance(id)}
+            onBulkDelete={(ids) => removeInstances(ids)}
             onRowAdd={() => addInstance(libType)}
             onRowSelect={showRolePane ? (id) => setSelectedId(id === selectedId ? null : id) : undefined}
             selectedId={selectedId}
@@ -4824,21 +4847,20 @@ function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName,
       + 'mappings and resolved connections. This cannot be undone.'
     )) return;
     setPurgingOrphans(true);
-    const failed = [];
     try {
-      for (const name of orphanNames) {
-        try { await deleteProjectInstance(savedProjectId, name); }
-        catch (err) { failed.push(`${name} (${err.message})`); }
-      }
+      // One bulk request instead of one DELETE per orphan — the previous
+      // sequential per-name loop was slow the same way multi-select delete was.
+      await deleteProjectInstances(savedProjectId, orphanNames);
       await loadReconData();
-      if (failed.length) setError(`Failed to delete: ${failed.join('; ')}`);
+    } catch (err) {
+      setError(`Failed to delete orphans: ${err.message}`);
     } finally {
       setPurgingOrphans(false);
     }
   }
 
   const commonTabProps = { instances, cmtProfiles, userProjects, hwControllers: controllerOptions, folderOptions, hasHierarchy,
-    addInstance, removeInstance, updateInstance, updateInstanceRole, ensureLoaded, savedProjectId,
+    addInstance, removeInstance, removeInstances, updateInstance, updateInstanceRole, ensureLoaded, savedProjectId,
     saveProjectNow, setError, getCompositeCmType, extractMemberConnections, setInstances, compositeCmTypes, valveCommands, loadProjectIntoState,
     reconData, setReconData, reconModal, setReconModal, reconSummary, setReconSummary,
     onAddComposite: compositeCmTypes?.length > 0 && !noUserProjects ? () => setCompModal(true) : undefined,

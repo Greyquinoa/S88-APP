@@ -96,13 +96,9 @@ async function buildHierarchy(db, importId, levelMap) {
       (import_id, parent_id, level, name, s88_type, sort_order)
     VALUES (?, ?, ?, ?, ?, ?)
   `);
-
-  // Node inserts must stay sequential (children need their parent's freshly
-  // assigned id), but tag-linking doesn't depend on insert order — collected
-  // here and flushed in batches after the node tree is built, instead of one
-  // UPDATE per source tag (this was the loop that made hierarchy building on
-  // large imports as slow as the per-row insert loop it sits next to).
-  const tagLinks = []; // { tagId, nodeId }
+  const linkTag = db.prepare(
+    'UPDATE io_tags SET hierarchy_node_id=?, updated_at=NOW() WHERE id=?'
+  );
 
   await db.transaction(async () => {
     for (const node of sorted) {
@@ -113,16 +109,12 @@ async function buildHierarchy(db, importId, levelMap) {
       );
       dbIds[node.key] = row.lastInsertRowid;
 
+      // Link source tags to their CM node
       if (node.level === 'ControlModule') {
         for (const tid of node.sourceTagIds) {
-          tagLinks.push({ tagId: tid, nodeId: row.lastInsertRowid });
+          await linkTag.run(row.lastInsertRowid, tid);
         }
       }
-    }
-
-    const LINK_BATCH_SIZE = 500;
-    for (let i = 0; i < tagLinks.length; i += LINK_BATCH_SIZE) {
-      await linkTagBatch(db, tagLinks.slice(i, i + LINK_BATCH_SIZE));
     }
   })();
 
@@ -131,21 +123,6 @@ async function buildHierarchy(db, importId, levelMap) {
   for (const node of registry.values()) levels[node.level] = (levels[node.level] || 0) + 1;
 
   return { nodeCount: registry.size, levels, effectiveLevelMap: map };
-}
-
-// One UPDATE ... FROM (VALUES ...) for up to a batch's worth of tag→node
-// links, instead of one UPDATE per tag.
-async function linkTagBatch(db, rows) {
-  if (!rows.length) return;
-  const values = rows.map(() => '(?::int,?::int)').join(',');
-  const params = rows.flatMap(r => [r.tagId, r.nodeId]);
-  await db.prepare(`
-    UPDATE io_tags AS t SET
-      hierarchy_node_id = v.node_id,
-      updated_at         = NOW()
-    FROM (VALUES ${values}) AS v(tag_id, node_id)
-    WHERE t.id = v.tag_id
-  `).run(...params);
 }
 
 function topoSort(nodes) {

@@ -218,6 +218,10 @@ export async function getProject(id)                          { return request('
 export async function saveProject(payload)                    { return request('POST',   '/projects', payload); }
 export async function deleteProject(id)                       { return request('DELETE', `/projects/${id}`); }
 export async function deleteProjectInstance(projectId, name)  { return request('DELETE', `/projects/${projectId}/instances/${encodeURIComponent(name)}`); }
+// Bulk variant — deletes many instances in one request instead of one request
+// per instance (multi-select delete on a large grid was firing hundreds/
+// thousands of individual DELETEs). Returns { success, deletedCount }.
+export async function deleteProjectInstances(projectId, names) { return request('POST',   `/projects/${projectId}/instances/bulk-delete`, { instanceNames: names }); }
 
 // ── Unit Types (project-scoped) ───────────────────────────────────────────────
 export async function getUnitTypes(projectId)             { return request('GET',    `/unit-types/project/${projectId}/types`); }

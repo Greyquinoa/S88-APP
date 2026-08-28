@@ -64,6 +64,10 @@ interface InstancesGridProps {
   folderOptions: FolderOption[];
   onRowUpdate: (id: string, field: keyof InstanceRow, value: string) => void;
   onRowDelete: (id: string) => void;
+  /** Optional bulk delete for multi-select — one request for all ids instead
+   *  of calling onRowDelete once per row. Falls back to looping onRowDelete
+   *  when not provided. */
+  onBulkDelete?: (ids: string[]) => void;
   onRowAdd: () => void;
   /** Called when a row is clicked — used by EM/EPH role pane */
   onRowSelect?: (id: string) => void;
@@ -259,6 +263,7 @@ export default function InstancesGrid({
   folderOptions,
   onRowUpdate,
   onRowDelete,
+  onBulkDelete,
   onRowAdd,
   onRowSelect,
   selectedId,
@@ -294,9 +299,15 @@ export default function InstancesGrid({
       `Delete ${selectedRows.length} instance${selectedRows.length !== 1 ? 's' : ''}?`
     );
     if (!confirmed) return;
-    selectedRows.forEach(row => onRowDelete(row.id));
+    // One bulk request beats firing onRowDelete once per row — that loop is
+    // what made deleting a couple thousand instances take 15+ seconds.
+    if (onBulkDelete) {
+      onBulkDelete(selectedRows.map(row => row.id));
+    } else {
+      selectedRows.forEach(row => onRowDelete(row.id));
+    }
     setSelectedRows([]);
-  }, [selectedRows, onRowDelete]);
+  }, [selectedRows, onRowDelete, onBulkDelete]);
 
   // Profiles filtered to matching libType
   const filteredProfiles = useMemo(

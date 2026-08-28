@@ -727,4 +727,65 @@ router.delete('/:projectId/instances/:instanceName', async (req, res) => {
   }
 });
 
+// ── POST /api/projects/:projectId/instances/bulk-delete ──────────────────────
+// Delete many instances (and all their related data) in one request. Same
+// tables/order as the single-instance DELETE above, but each step runs once
+// against the whole batch (WHERE ... IN (...)) instead of once per instance —
+// multi-selecting hundreds/thousands of rows in the grid and deleting them
+// used to fire one HTTP request + 6 sequential queries per instance, which at
+// a couple thousand instances took 15+ seconds. Body: { instanceNames: [...] }.
+router.post('/:projectId/instances/bulk-delete', async (req, res) => {
+  try {
+    const db = getDb();
+    const { projectId } = req.params;
+    const { instanceNames } = req.body || {};
+
+    if (!Array.isArray(instanceNames) || !instanceNames.length) {
+      return res.status(400).json({ error: 'instanceNames array required' });
+    }
+
+    const deletedCount = await db.transaction(async () => {
+      const placeholders = instanceNames.map(() => '?').join(',');
+
+      const instances = await db.prepare(
+        `SELECT id FROM project_instances WHERE project_id = ? AND instance_name IN (${placeholders})`
+      ).all(projectId, ...instanceNames);
+      const instanceIds = instances.map(i => i.id);
+
+      await db.prepare(
+        `DELETE FROM instance_ios WHERE project_id = ? AND instance_name IN (${placeholders})`
+      ).run(projectId, ...instanceNames);
+
+      await db.prepare(
+        `DELETE FROM instance_derived_values WHERE project_id = ? AND instance_name IN (${placeholders})`
+      ).run(projectId, ...instanceNames);
+
+      await db.prepare(
+        `DELETE FROM instance_matrix_overrides WHERE project_id = ? AND instance_name IN (${placeholders})`
+      ).run(projectId, ...instanceNames);
+
+      await db.prepare(
+        `DELETE FROM signal_mappings WHERE project_id = ? AND instance_name IN (${placeholders})`
+      ).run(projectId, ...instanceNames);
+
+      if (instanceIds.length) {
+        const idPlaceholders = instanceIds.map(() => '?').join(',');
+        await db.prepare(
+          `DELETE FROM unit_resolved_connections WHERE project_id = ? AND unit_instance_id IN (${idPlaceholders})`
+        ).run(projectId, ...instanceIds);
+      }
+
+      const result = await db.prepare(
+        `DELETE FROM project_instances WHERE project_id = ? AND instance_name IN (${placeholders})`
+      ).run(projectId, ...instanceNames);
+
+      return result.rowCount;
+    })();
+
+    res.json({ success: true, deletedCount });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;
