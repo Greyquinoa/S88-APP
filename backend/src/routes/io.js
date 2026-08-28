@@ -516,20 +516,24 @@ router.post('/imports/:id/approve-all', async (req, res) => {
 
 // ── Column Mapping Configs ────────────────────────────────────────────────────
 
-router.get('/column-maps', async (req, res) => {
+// ── Column Mappings (project-scoped) ──────────────────────────────────────────
+
+router.get('/project/:projectId/column-maps', async (req, res) => {
   try {
-    res.json(await getDb().prepare('SELECT * FROM io_column_mappings ORDER BY name').all());
+    const projectId = parseInt(req.params.projectId, 10);
+    res.json(await getDb().prepare('SELECT * FROM io_column_mappings WHERE project_id=? ORDER BY name').all(projectId));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-router.post('/column-maps', async (req, res) => {
+router.post('/project/:projectId/column-maps', async (req, res) => {
   try {
     const db = getDb();
+    const projectId = parseInt(req.params.projectId, 10);
     const { name, description, mappings, included } = req.body || {};
     if (!name?.trim()) return err(res, 400, 'name required');
     const row = await db.prepare(
-      `INSERT INTO io_column_mappings (name, description, mappings, included) VALUES (?,?,?,?)`
-    ).run(name.trim(), description || '', JSON.stringify(mappings || {}), included ?? null);
+      `INSERT INTO io_column_mappings (project_id, name, description, mappings, included) VALUES (?,?,?,?,?)`
+    ).run(projectId, name.trim(), description || '', JSON.stringify(mappings || {}), included ?? null);
     res.json({ id: row.lastInsertRowid, name: name.trim(), description: description || '', mappings: mappings || {}, included: included ?? null });
   } catch (e) {
     if (e.message?.toLowerCase().includes('unique') || e.code === '23505') return err(res, 409, 'Name already exists');
@@ -537,21 +541,23 @@ router.post('/column-maps', async (req, res) => {
   }
 });
 
-router.put('/column-maps/:id', async (req, res) => {
+router.put('/project/:projectId/column-maps/:id', async (req, res) => {
   try {
     const db = getDb();
+    const projectId = parseInt(req.params.projectId, 10);
     const { name, description, mappings, included } = req.body || {};
     if (!name?.trim()) return err(res, 400, 'name required');
     await db.prepare(
-      `UPDATE io_column_mappings SET name=?, description=?, mappings=?, included=?, updated_at=NOW() WHERE id=?`
-    ).run(name.trim(), description || '', JSON.stringify(mappings || {}), included ?? null, req.params.id);
+      `UPDATE io_column_mappings SET name=?, description=?, mappings=?, included=?, updated_at=NOW() WHERE id=? AND project_id=?`
+    ).run(name.trim(), description || '', JSON.stringify(mappings || {}), included ?? null, req.params.id, projectId);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-router.delete('/column-maps/:id', async (req, res) => {
+router.delete('/project/:projectId/column-maps/:id', async (req, res) => {
   try {
-    await getDb().prepare('DELETE FROM io_column_mappings WHERE id=?').run(req.params.id);
+    const projectId = parseInt(req.params.projectId, 10);
+    await getDb().prepare('DELETE FROM io_column_mappings WHERE id=? AND project_id=?').run(req.params.id, projectId);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -612,24 +618,26 @@ router.post('/imports/:id/set-source-column-map', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Function Mapping Configs ──────────────────────────────────────────────────
+// ── Function Mapping Configs (project-scoped) ─────────────────────────────────
 
-router.get('/function-maps', async (req, res) => {
+router.get('/project/:projectId/function-maps', async (req, res) => {
   try {
+    const projectId = parseInt(req.params.projectId, 10);
     const db   = getDb();
-    const cfgs = await db.prepare('SELECT * FROM io_function_map_configs ORDER BY name').all();
+    const cfgs = await db.prepare('SELECT * FROM io_function_map_configs WHERE project_id=? ORDER BY name').all(projectId);
     res.json(cfgs);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-router.post('/function-maps', async (req, res) => {
+router.post('/project/:projectId/function-maps', async (req, res) => {
   try {
     const db = getDb();
+    const projectId = parseInt(req.params.projectId, 10);
     const { name, description } = req.body || {};
     if (!name?.trim()) return err(res, 400, 'name required');
     const row = await db.prepare(
-      `INSERT INTO io_function_map_configs (name, description) VALUES (?,?)`
-    ).run(name.trim(), description || '');
+      `INSERT INTO io_function_map_configs (project_id, name, description) VALUES (?,?,?)`
+    ).run(projectId, name.trim(), description || '');
     res.json({ id: row.lastInsertRowid, name: name.trim(), description: description || '' });
   } catch (e) {
     if (e.message?.toLowerCase().includes('unique') || e.code === '23505') return err(res, 409, 'Name already exists');
@@ -637,13 +645,13 @@ router.post('/function-maps', async (req, res) => {
   }
 });
 
-router.put('/function-maps/:id', async (req, res) => {
+router.put('/project/:projectId/function-maps/:id', async (req, res) => {
   try {
     const db = getDb();
+    const projectId = parseInt(req.params.projectId, 10);
     const { name, description } = req.body || {};
 
-    // Patch semantics: only touch the fields the caller actually sent. A rename
-    // posts { name } alone, and an unconditional SET would blank the description.
+    // Patch semantics: only touch the fields the caller actually sent
     const sets = [], vals = [];
     if (name !== undefined)        { sets.push('name=?');        vals.push(name?.trim() || ''); }
     if (description !== undefined) { sets.push('description=?'); vals.push(description || ''); }
@@ -651,24 +659,26 @@ router.put('/function-maps/:id', async (req, res) => {
 
     sets.push('updated_at=NOW()');
     vals.push(req.params.id);
-    await db.prepare(`UPDATE io_function_map_configs SET ${sets.join(', ')} WHERE id=?`).run(...vals);
+    vals.push(projectId);
+    await db.prepare(`UPDATE io_function_map_configs SET ${sets.join(', ')} WHERE id=? AND project_id=?`).run(...vals);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-router.delete('/function-maps/:id', async (req, res) => {
+router.delete('/project/:projectId/function-maps/:id', async (req, res) => {
   try {
     const db = getDb();
+    const projectId = parseInt(req.params.projectId, 10);
     await db.transaction(async () => {
       await db.prepare('DELETE FROM io_function_mappings WHERE config_id=?').run(req.params.id);
-      await db.prepare('DELETE FROM io_function_map_configs WHERE id=?').run(req.params.id);
+      await db.prepare('DELETE FROM io_function_map_configs WHERE id=? AND project_id=?').run(req.params.id, projectId);
     })();
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// GET /api/io/function-maps/:id/mappings
-router.get('/function-maps/:id/mappings', async (req, res) => {
+// GET /api/projects/:projectId/io/function-maps/:id/mappings
+router.get('/project/:projectId/function-maps/:id/mappings', async (req, res) => {
   try {
     res.json(await getDb().prepare(
       'SELECT * FROM io_function_mappings WHERE config_id=? ORDER BY priority DESC, function_value'
@@ -676,8 +686,8 @@ router.get('/function-maps/:id/mappings', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// PUT /api/io/function-maps/:id/mappings — full replace
-router.put('/function-maps/:id/mappings', async (req, res) => {
+// PUT /api/projects/:projectId/io/function-maps/:id/mappings — full replace
+router.put('/project/:projectId/function-maps/:id/mappings', async (req, res) => {
   try {
     const db = getDb();
     const { mappings } = req.body || {};

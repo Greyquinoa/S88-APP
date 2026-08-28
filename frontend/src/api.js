@@ -28,19 +28,19 @@ async function request(method, path, body, isFile = false) {
   return data;
 }
 
-// ── Library ───────────────────────────────────────────────────────────────────
-export async function getLibraryStatus() {
-  return request('GET', '/library/status');
+// ── Library (project-scoped) ──────────────────────────────────────────────────
+export async function getLibraryStatus(projectId) {
+  return request('GET', `/projects/${projectId}/library/status`);
 }
 
 // Returns { token, preview: [{name, cm_type, comment, blockCount, varCount}] }
-export async function previewLibraryUpload(file, onProgress) {
+export async function previewLibraryUpload(projectId, file, onProgress) {
   const fd = new FormData();
   fd.append('library', file);
   // Use XMLHttpRequest so we can track upload progress on large files
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', `${BASE}/library/upload`);
+    xhr.open('POST', `${BASE}/projects/${projectId}/library/upload`);
     xhr.onload = () => {
       try {
         const data = JSON.parse(xhr.responseText);
@@ -54,40 +54,94 @@ export async function previewLibraryUpload(file, onProgress) {
   });
 }
 
-export async function computeLibraryDiff(token) {
-  return request('POST', '/library/compute-diff', { token });
+export async function computeLibraryDiff(projectId, token) {
+  return request('POST', `/projects/${projectId}/library/compute-diff`, { token });
 }
 
-export async function importLibrary(token, selectedNames) {
-  return request('POST', '/library/import', { token, selectedNames });
+export async function importLibrary(projectId, token, selectedNames) {
+  return request('POST', `/projects/${projectId}/library/import`, { token, selectedNames });
 }
 
-export async function deleteCmType(name) {
-  return request('DELETE', `/cm-types/${encodeURIComponent(name)}`);
+export async function deleteCmType(projectId, name) {
+  return request('DELETE', `/projects/${projectId}/cm-types/${encodeURIComponent(name)}`);
 }
 
-// ── CM Types ──────────────────────────────────────────────────────────────────
-export async function getCmTypes() {
-  return request('GET', '/cm-types');
+// ── Library — Full Export / Import (CM types + Composites + Matrix modes) ─────
+// Triggers a browser download of the full library as a JSON file.
+export async function downloadLibraryExport(projectId) {
+  const res = await fetch(`${BASE}/projects/${projectId}/library/export`);
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `HTTP ${res.status}`);
+  }
+  const blob = await res.blob();
+  const cd = res.headers.get('Content-Disposition') || '';
+  const fnMatch = cd.match(/filename="?([^"]+)"?/);
+  const filename = fnMatch ? fnMatch[1] : `library-export-${Date.now()}.json`;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
 }
 
-export async function getCmTypeBlocks(cmTypeName) {
-  return request('GET', `/cm-types/${encodeURIComponent(cmTypeName)}/blocks`);
+// Returns { token, cmTypes: {summary, items}, composites: {summary, items}, meta }
+export async function previewLibraryImport(projectId, file) {
+  const fd = new FormData();
+  fd.append('file', file);
+  return request('POST', `/projects/${projectId}/library/import2/preview`, fd, true);
 }
-export async function getCmTypeBlockPrefs(cmTypeName) {
-  return request('GET', `/cm-types/${encodeURIComponent(cmTypeName)}/block-prefs`);
+
+export async function commitLibraryImport(projectId, token, selectedCmNames, selectedCompositeNames) {
+  return request('POST', `/projects/${projectId}/library/import2/commit`, { token, selectedCmNames, selectedCompositeNames });
 }
-export async function saveCmTypeBlockPrefs(cmTypeName, enabledBlocks) {
-  return request('PUT', `/cm-types/${encodeURIComponent(cmTypeName)}/block-prefs`, { enabledBlocks });
+
+// ── Library — Audit Log ──────────────────────────────────────────────────────
+export async function getLibraryAuditLog(projectId, params = {}) {
+  const qs = new URLSearchParams(
+    Object.fromEntries(Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== ''))
+  ).toString();
+  return request('GET', `/projects/${projectId}/library/audit-log${qs ? `?${qs}` : ''}`);
 }
-export async function patchVarDefault(cmTypeName, varId, val) {
-  return request('PATCH', `/cm-types/${encodeURIComponent(cmTypeName)}/vars/${varId}`, { val });
+
+export async function getEntityAuditLog(projectId, entityType, entityId) {
+  return request('GET', `/projects/${projectId}/library/audit-log/${encodeURIComponent(entityType)}/${entityId}`);
 }
-export async function patchVarValid(cmTypeName, varId, isValid) {
-  return request('PATCH', `/cm-types/${encodeURIComponent(cmTypeName)}/vars/${varId}`, { is_valid: isValid });
+
+// ── CM Types (project-scoped) ─────────────────────────────────────────────────
+export async function getCmTypes(projectId) {
+  return request('GET', `/projects/${projectId}/cm-types`);
 }
-export async function toggleBlockConditional(blockId, isConditional) {
-  return request('PATCH', `/cm-types/block/${blockId}/conditional`, { isConditional });
+
+export async function getCmTypeBlocks(projectId, cmTypeName) {
+  return request('GET', `/projects/${projectId}/cm-types/${encodeURIComponent(cmTypeName)}/blocks`);
+}
+export async function getCmTypeBlockPrefs(projectId, cmTypeName) {
+  return request('GET', `/projects/${projectId}/cm-types/${encodeURIComponent(cmTypeName)}/block-prefs`);
+}
+export async function saveCmTypeBlockPrefs(projectId, cmTypeName, enabledBlocks) {
+  return request('PUT', `/projects/${projectId}/cm-types/${encodeURIComponent(cmTypeName)}/block-prefs`, { enabledBlocks });
+}
+export async function patchVarDefault(projectId, cmTypeName, varId, val) {
+  return request('PATCH', `/projects/${projectId}/cm-types/${encodeURIComponent(cmTypeName)}/vars/${varId}`, { val });
+}
+export async function patchVarValid(projectId, cmTypeName, varId, isValid) {
+  return request('PATCH', `/projects/${projectId}/cm-types/${encodeURIComponent(cmTypeName)}/vars/${varId}`, { is_valid: isValid });
+}
+export async function toggleBlockConditional(projectId, blockId, isConditional) {
+  return request('PATCH', `/projects/${projectId}/cm-types/block/${blockId}/conditional`, { isConditional });
+}
+
+// ── SIMIT Export ──────────────────────────────────────────────────────────────
+// Downloads SIMIT.xlsm for the given project. Uses a direct anchor-click so the
+// browser handles the file-save dialog without requiring blob juggling.
+export function exportSimit(projectId) {
+  const url = `${BASE}/simit-export/${projectId}`;
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = '';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
 }
 
 // ── Generate ──────────────────────────────────────────────────────────────────
@@ -159,33 +213,34 @@ export async function getHistoryDetail(id) {
 }
 
 // ── Projects ──────────────────────────────────────────────────────────────────
-export async function listProjects()       { return request('GET',    '/projects'); }
-export async function getProject(id)       { return request('GET',    `/projects/${id}`); }
-export async function saveProject(payload) { return request('POST',   '/projects', payload); }
-export async function deleteProject(id)    { return request('DELETE', `/projects/${id}`); }
+export async function listProjects()                          { return request('GET',    '/projects'); }
+export async function getProject(id)                          { return request('GET',    `/projects/${id}`); }
+export async function saveProject(payload)                    { return request('POST',   '/projects', payload); }
+export async function deleteProject(id)                       { return request('DELETE', `/projects/${id}`); }
+export async function deleteProjectInstance(projectId, name)  { return request('DELETE', `/projects/${projectId}/instances/${encodeURIComponent(name)}`); }
 
-// ── Unit Types (global library) ───────────────────────────────────────────────
-export async function getUnitTypes()             { return request('GET',    '/unit-types'); }
-export async function getUnitType(id)            { return request('GET',    `/unit-types/${id}`); }
-export async function createUnitType(data)        { return request('POST',   '/unit-types', data); }
-export async function updateUnitType(id, data)    { return request('PUT',    `/unit-types/${id}`, data); }
-export async function deleteUnitType(id)          { return request('DELETE', `/unit-types/${id}`); }
+// ── Unit Types (project-scoped) ───────────────────────────────────────────────
+export async function getUnitTypes(projectId)             { return request('GET',    `/unit-types/project/${projectId}/types`); }
+export async function getUnitType(projectId, id)          { return request('GET',    `/unit-types/project/${projectId}/types/${id}`); }
+export async function createUnitType(projectId, data)     { return request('POST',   `/unit-types/project/${projectId}/types`, data); }
+export async function updateUnitType(projectId, id, data) { return request('PUT',    `/unit-types/project/${projectId}/types/${id}`, data); }
+export async function deleteUnitType(projectId, id)       { return request('DELETE', `/unit-types/project/${projectId}/types/${id}`); }
 
 // ── Unit Type Connections ─────────────────────────────────────────────────────
-export async function getUnitTypeConnections(unitTypeId) {
-  return request('GET', `/unit-types/${unitTypeId}/connections`);
+export async function getUnitTypeConnections(projectId, unitTypeId) {
+  return request('GET', `/unit-types/project/${projectId}/types/${unitTypeId}/connections`);
 }
 
-export async function saveUnitTypeConnections(unitTypeId, connections, validateCycles = true) {
-  return request('POST', `/unit-types/${unitTypeId}/connections`, { connections, validateCycles });
+export async function saveUnitTypeConnections(projectId, unitTypeId, connections, validateCycles = true) {
+  return request('POST', `/unit-types/project/${projectId}/types/${unitTypeId}/connections`, { connections, validateCycles });
 }
 
-export async function deleteUnitTypeConnection(unitTypeId, connId) {
-  return request('DELETE', `/unit-types/${unitTypeId}/connections/${connId}`);
+export async function deleteUnitTypeConnection(projectId, unitTypeId, connId) {
+  return request('DELETE', `/unit-types/project/${projectId}/types/${unitTypeId}/connections/${connId}`);
 }
 
-export async function getCmTypeVariablesForUnit(unitTypeId) {
-  return request('GET', `/unit-types/${unitTypeId}/cm-type-variables`);
+export async function getCmTypeVariablesForUnit(projectId, unitTypeId) {
+  return request('GET', `/unit-types/project/${projectId}/types/${unitTypeId}/cm-type-variables`);
 }
 
 // ── Unit Instances (per project) ──────────────────────────────────────────────
@@ -256,10 +311,10 @@ export async function saveIOColumnPrefs(importId, activeColumns) {
   return request('PUT', `/io/imports/${importId}/column-prefs`, { activeColumns });
 }
 
-export async function getIOColumnMaps()           { return request('GET',    '/io/column-maps'); }
-export async function createIOColumnMap(data)      { return request('POST',   '/io/column-maps', data); }
-export async function updateIOColumnMap(id, data)  { return request('PUT',    `/io/column-maps/${id}`, data); }
-export async function deleteIOColumnMap(id)        { return request('DELETE', `/io/column-maps/${id}`); }
+export async function getIOColumnMaps(projectId)           { return request('GET',    `/io/project/${projectId}/column-maps`); }
+export async function createIOColumnMap(projectId, data)      { return request('POST',   `/io/project/${projectId}/column-maps`, data); }
+export async function updateIOColumnMap(projectId, id, data)  { return request('PUT',    `/io/project/${projectId}/column-maps/${id}`, data); }
+export async function deleteIOColumnMap(projectId, id)        { return request('DELETE', `/io/project/${projectId}/column-maps/${id}`); }
 export async function applyIOColumnMap(importId, column_map_id) {
   return request('POST', `/io/imports/${importId}/apply-column-map`, { column_map_id });
 }
@@ -269,13 +324,13 @@ export async function setIOSourceColumnMap(importId, column_map_id) {
   return request('POST', `/io/imports/${importId}/set-source-column-map`, { column_map_id });
 }
 
-export async function getIOFunctionMaps()              { return request('GET',    '/io/function-maps'); }
-export async function createIOFunctionMap(data)         { return request('POST',   '/io/function-maps', data); }
-export async function updateIOFunctionMap(id, data)     { return request('PUT',    `/io/function-maps/${id}`, data); }
-export async function deleteIOFunctionMap(id)           { return request('DELETE', `/io/function-maps/${id}`); }
-export async function getIOFunctionMapMappings(id)      { return request('GET',    `/io/function-maps/${id}/mappings`); }
-export async function saveIOFunctionMapMappings(id, mappings) {
-  return request('PUT', `/io/function-maps/${id}/mappings`, { mappings });
+export async function getIOFunctionMaps(projectId)              { return request('GET',    `/io/project/${projectId}/function-maps`); }
+export async function createIOFunctionMap(projectId, data)         { return request('POST',   `/io/project/${projectId}/function-maps`, data); }
+export async function updateIOFunctionMap(projectId, id, data)     { return request('PUT',    `/io/project/${projectId}/function-maps/${id}`, data); }
+export async function deleteIOFunctionMap(projectId, id)           { return request('DELETE', `/io/project/${projectId}/function-maps/${id}`); }
+export async function getIOFunctionMapMappings(projectId, id)      { return request('GET',    `/io/project/${projectId}/function-maps/${id}/mappings`); }
+export async function saveIOFunctionMapMappings(projectId, id, mappings) {
+  return request('PUT', `/io/project/${projectId}/function-maps/${id}/mappings`, { mappings });
 }
 
 export async function buildIOHierarchy(importId, levelMap) {
@@ -381,6 +436,15 @@ export async function parseUserProjectXml(projectId, userProjectName, file) {
 }
 export async function saveUserProjectConfigWithWarning(projectId, userProjectName, config, targetUserProject) {
   return request('POST', `/projects/${projectId}/user-projects/${encodeURIComponent(userProjectName)}/pcs7-config/save-with-warning`, { config, targetUserProject });
+}
+export async function addUserProjectDevice(projectId, userProjectName, device) {
+  return request('POST', `/projects/${projectId}/user-projects/${encodeURIComponent(userProjectName)}/pcs7-config/devices`, device);
+}
+export async function updateUserProjectDevice(projectId, userProjectName, deviceId, device) {
+  return request('PUT', `/projects/${projectId}/user-projects/${encodeURIComponent(userProjectName)}/pcs7-config/devices/${deviceId}`, device);
+}
+export async function deleteUserProjectDevice(projectId, userProjectName, deviceId) {
+  return request('DELETE', `/projects/${projectId}/user-projects/${encodeURIComponent(userProjectName)}/pcs7-config/devices/${deviceId}`);
 }
 
 // ── Valve / Mode Commands ─────────────────────────────────────────────────────
@@ -610,6 +674,9 @@ export async function updateHwController(id, data) {
 export async function deleteHwController(id) {
   return request('DELETE', `/hw-controllers/${id}`);
 }
+export async function copyHwController(id) {
+  return request('POST', `/hw-controllers/${id}/copy`);
+}
 
 // ── HW Fieldbuses (migrated from App2) ───────────────────────────────────────
 export async function listHwFieldbuses(controllerId) {
@@ -667,19 +734,19 @@ export async function mrpDownloadCfg(importId) {
   URL.revokeObjectURL(url);
 }
 
-// ── Composite CM Types ────────────────────────────────────────────────────────
-export async function listCompositeCmTypes()           { return request('GET',    '/composite-cm-types'); }
-export async function getCompositeCmType(id)           { return request('GET',    `/composite-cm-types/${id}`); }
-export async function createCompositeCmType(data)       { return request('POST',   '/composite-cm-types', data); }
-export async function updateCompositeCmType(id, data)   { return request('PUT',    `/composite-cm-types/${id}`, data); }
-export async function deleteCompositeCmType(id)         { return request('DELETE', `/composite-cm-types/${id}`); }
+// ── Composite CM Types (project-scoped) ───────────────────────────────────────
+export async function listCompositeCmTypes(projectId)           { return request('GET',    `/projects/${projectId}/composite-cm-types`); }
+export async function getCompositeCmType(projectId, id)         { return request('GET',    `/projects/${projectId}/composite-cm-types/${id}`); }
+export async function createCompositeCmType(projectId, data)    { return request('POST',   `/projects/${projectId}/composite-cm-types`, data); }
+export async function updateCompositeCmType(projectId, id, data){ return request('PUT',    `/projects/${projectId}/composite-cm-types/${id}`, data); }
+export async function deleteCompositeCmType(projectId, id)      { return request('DELETE', `/projects/${projectId}/composite-cm-types/${id}`); }
 
-// ── IO Connection Rules (lib_io_connections) ──────────────────────────────────
-export async function getIoConnections(cmTypeId) {
-  return request('GET', `/io-connections/cm-type/${cmTypeId}`);
+// ── IO Connection Rules (lib_io_connections, project-scoped) ─────────────────
+export async function getIoConnections(projectId, cmTypeId) {
+  return request('GET', `/io-connections/project/${projectId}/cm-type/${cmTypeId}`);
 }
-export async function createIoConnection(cmTypeId, data) {
-  return request('POST', `/io-connections/cm-type/${cmTypeId}`, data);
+export async function createIoConnection(projectId, cmTypeId, data) {
+  return request('POST', `/io-connections/project/${projectId}/cm-type/${cmTypeId}`, data);
 }
 export async function updateIoConnection(id, data) {
   return request('PUT', `/io-connections/${id}`, data);
@@ -687,8 +754,8 @@ export async function updateIoConnection(id, data) {
 export async function deleteIoConnection(id) {
   return request('DELETE', `/io-connections/${id}`);
 }
-export async function reorderIoConnections(cmTypeId, ids) {
-  return request('PATCH', `/io-connections/cm-type/${cmTypeId}/reorder`, { ids });
+export async function reorderIoConnections(projectId, cmTypeId, ids) {
+  return request('PATCH', `/io-connections/project/${projectId}/cm-type/${cmTypeId}/reorder`, { ids });
 }
 
 // ── Signal-to-Instance Mapping ────────────────────────────────────────────────
@@ -773,22 +840,22 @@ export async function rejectEphEmRow(importId, rowId) {
   return request('DELETE', `/eph-em/imports/${importId}/rows/${rowId}`);
 }
 
-export async function getEphEmColumnMaps() { return request('GET', '/eph-em/column-maps'); }
-export async function createEphEmColumnMap(data) { return request('POST', '/eph-em/column-maps', data); }
-export async function updateEphEmColumnMap(id, data) { return request('PUT', `/eph-em/column-maps/${id}`, data); }
-export async function deleteEphEmColumnMap(id) { return request('DELETE', `/eph-em/column-maps/${id}`); }
+export async function getEphEmColumnMaps(projectId) { return request('GET', `/eph-em/project/${projectId}/column-maps`); }
+export async function createEphEmColumnMap(projectId, data) { return request('POST', `/eph-em/project/${projectId}/column-maps`, data); }
+export async function updateEphEmColumnMap(projectId, id, data) { return request('PUT', `/eph-em/project/${projectId}/column-maps/${id}`, data); }
+export async function deleteEphEmColumnMap(projectId, id) { return request('DELETE', `/eph-em/project/${projectId}/column-maps/${id}`); }
 
 export async function applyEphEmColumnMap(importId, mappings, headers) {
   return request('POST', `/eph-em/imports/${importId}/apply-column-map`, { mappings, headers });
 }
 
-export async function getEphEmFunctionMapConfigs() { return request('GET', '/eph-em/function-map-configs'); }
-export async function createEphEmFunctionMapConfig(data) { return request('POST', '/eph-em/function-map-configs', data); }
+export async function getEphEmFunctionMapConfigs(projectId) { return request('GET', `/eph-em/project/${projectId}/function-map-configs`); }
+export async function createEphEmFunctionMapConfig(projectId, data) { return request('POST', `/eph-em/project/${projectId}/function-map-configs`, data); }
 
-export async function getEphEmTypeMappingConfigs() { return request('GET', '/eph-em/type-mapping-configs'); }
-export async function createEphEmTypeMappingConfig(data) { return request('POST', '/eph-em/type-mapping-configs', data); }
-export async function updateEphEmTypeMappingConfig(id, data) { return request('PATCH', `/eph-em/type-mapping-configs/${id}`, data); }
-export async function deleteEphEmTypeMappingConfig(id) { return request('DELETE', `/eph-em/type-mapping-configs/${id}`); }
+export async function getEphEmTypeMappingConfigs(projectId) { return request('GET', `/eph-em/project/${projectId}/type-mapping-configs`); }
+export async function createEphEmTypeMappingConfig(projectId, data) { return request('POST', `/eph-em/project/${projectId}/type-mapping-configs`, data); }
+export async function updateEphEmTypeMappingConfig(projectId, id, data) { return request('PATCH', `/eph-em/project/${projectId}/type-mapping-configs/${id}`, data); }
+export async function deleteEphEmTypeMappingConfig(projectId, id) { return request('DELETE', `/eph-em/project/${projectId}/type-mapping-configs/${id}`); }
 
 export async function runEphEmAssignment(importId, type_column_mappings) {
   return request('POST', `/eph-em/imports/${importId}/assign`, { type_column_mappings });

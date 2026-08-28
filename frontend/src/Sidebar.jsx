@@ -1,6 +1,11 @@
 import React, { useState } from 'react';
 import { BookMarked, FileText, FolderTree, Cpu, Boxes, BookOpenCheck, Home, ArrowDownToLine, LayoutPanelTop } from 'lucide-react';
 
+// Set to link the sidebar brand back to the landing page; renders as plain
+// text/image (today's behavior) when unset.
+const HOME_URL = import.meta.env.VITE_HOME_URL;
+const LOGO_SRC = `${import.meta.env.BASE_URL}pcs7-logo.png`;
+
 // ids index into App.jsx's STEPS array — keep the two in sync.
 const STEPS_CONFIG = [
   { id: 0, label: 'Projects', icon: null, component: Home },
@@ -23,7 +28,13 @@ export default function Sidebar({ activeStep, onStepChange, libStatus, projectNa
       {expanded && (
         <div className="sidebar-panel-expanded">
           <div className="sidebar-header pcs7-header">
-            <h1>S88X</h1>
+            {HOME_URL ? (
+              <a href={HOME_URL} style={{ textDecoration: 'none', color: 'inherit' }} title="Back to home">
+                <h1>S88X</h1>
+              </a>
+            ) : (
+              <h1>S88X</h1>
+            )}
             <button
               className="sidebar-collapse-btn"
               onClick={() => setExpanded(false)}
@@ -94,7 +105,13 @@ export default function Sidebar({ activeStep, onStepChange, libStatus, projectNa
       {!expanded && (
         <div style={{ position: 'relative' }}>
           <div className="sidebar-rail">
-            <img src="/pcs7-logo.png" alt="S88X" style={{ marginBottom: '1rem', width: '40px', height: '40px', objectFit: 'contain' }} />
+            {HOME_URL ? (
+              <a href={HOME_URL} title="Back to home">
+                <img src={LOGO_SRC} alt="S88X" style={{ marginBottom: '1rem', width: '40px', height: '40px', objectFit: 'contain' }} />
+              </a>
+            ) : (
+              <img src={LOGO_SRC} alt="S88X" style={{ marginBottom: '1rem', width: '40px', height: '40px', objectFit: 'contain' }} />
+            )}
 
             {STEPS_CONFIG.map(step => (
               <button

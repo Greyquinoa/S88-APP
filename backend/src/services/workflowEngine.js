@@ -220,9 +220,16 @@ async function executeWorkflow(db, { importId, projectId, functionMapId }, onPro
           "SELECT COUNT(*) AS n FROM hw_signals WHERE hw_import_id = ? AND module_order_no != 'PLACEHOLDER'"
         ).get(t.hw_import_id);
         if (Number(sig?.n || 0) === 0) {
-          cfgErrors.push({ hwImportId: t.hw_import_id, controllerName: name,
-                           error: 'no hardware signals after sync' });
-          report(hi, 'hardware', `${name}: CFG skipped — no hardware signals`);
+          // Skip this controller if it has no signals — either no rows in the IO import,
+          // or the sync found no new signals to import.
+          if (syncResult.signalCount === 0 && syncResult.stationCount === 0) {
+            cfgSkipped.push({ hwImportId: t.hw_import_id, reason: `${name}: no IO rows for this controller in the import` });
+            report(hi, 'hardware', `${name}: CFG skipped — no IO rows assigned to this controller`);
+          } else {
+            cfgErrors.push({ hwImportId: t.hw_import_id, controllerName: name,
+                             error: 'no hardware signals after sync' });
+            report(hi, 'hardware', `${name}: CFG skipped — no hardware signals`);
+          }
           continue;
         }
 
@@ -324,7 +331,7 @@ async function executeWorkflow(db, { importId, projectId, functionMapId }, onPro
     }
 
     // Build connection groups for composite wiring
-    const getCmType = db.prepare('SELECT * FROM lib_cm_types WHERE name = ?');
+    const getCmType = db.prepare('SELECT * FROM lib_cm_types WHERE name = ? AND project_id = ?');
     const getBlocks = db.prepare(`
       SELECT b.*, STRING_AGG(DISTINCT v.lib_id, ',') AS var_lib_ids
       FROM lib_blocks b
@@ -348,7 +355,7 @@ async function executeWorkflow(db, { importId, projectId, functionMapId }, onPro
     async function resolveInstance(inst) {
       let resolved = cmCache.get(inst.cm_type);
       if (!resolved) {
-        const cmRow = await getCmType.get(inst.cm_type);
+        const cmRow = await getCmType.get(inst.cm_type, projectId);
         if (!cmRow) throw new Error(`CM type not found: ${inst.cm_type}`);
         const blockRows = await getBlocks.all(cmRow.id);
         const blocks = [];

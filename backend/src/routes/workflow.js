@@ -44,9 +44,9 @@ router.post('/execute', async (req, res) => {
       return;
     }
 
-    const funcMap = await db.prepare('SELECT id FROM io_function_map_configs WHERE id = ?').get(functionMapId);
+    const funcMap = await db.prepare('SELECT id FROM io_function_map_configs WHERE id = ? AND project_id = ?').get(functionMapId, projectId);
     if (!funcMap) {
-      send({ error: 'Function map not found' });
+      send({ error: 'Function map not found or does not belong to this project' });
       res.end();
       return;
     }

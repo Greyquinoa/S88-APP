@@ -47,9 +47,14 @@ async function runGeneration(db, body, onProgress) {
   // Instances whose reconciliation left them as unaccepted DUMMY are excluded
   // from the export — they exist only in unit-type generation, not the IO list.
   let excludedDummies = [];
+  // Resolved once here and reused everywhere below (incl. the lib_cm_types lookup
+  // in resolveInstance) so a CM type name resolves within the correct project's
+  // scope now that the library is project-scoped, not global.
+  let genProjectId = null;
   if (projectName) {
       const proj = await db.prepare(`SELECT id FROM projects WHERE name = ?`).get(projectName);
       if (proj) {
+        genProjectId = proj.id;
         const dummyRows = await db.prepare(
           `SELECT instance_name FROM project_instances WHERE project_id = ? AND reconciliation_status = 'DUMMY'`
         ).all(proj.id);
@@ -102,6 +107,24 @@ async function runGeneration(db, body, onProgress) {
           `SELECT * FROM project_config WHERE project_id = ? AND user_project IS NOT NULL`
         ).all(proj.id);
         for (const r of cfgRows) configByUserProject[r.user_project] = r;
+
+        // Per-device hardware IDs (one row per controller in the user project's
+        // PCS7 export). generateXML emits one <Device> block per row; with none
+        // stored it falls back to the single-device layout.
+        const devRows = await db.prepare(
+          `SELECT d.*, c.id AS hw_controller_id
+             FROM project_config_devices d
+             LEFT JOIN hw_controllers c
+               ON c.project_id = d.project_id
+              AND c.user_project = d.user_project
+              AND c.T16_Controller_TagName = d.device_name
+            WHERE d.project_id = ?
+            ORDER BY d.user_project, d.sort_order`
+        ).all(proj.id);
+        for (const d of devRows) {
+          const cfg = configByUserProject[d.user_project];
+          if (cfg) (cfg.devices ||= []).push(d);
+        }
         signalMaps = await loadMappingsForProject(db, proj.id);
 
         // Per-instance matrix overrides — applied to matrix CM instances below.
@@ -236,7 +259,7 @@ async function runGeneration(db, body, onProgress) {
 
     report(3, 'setup', 'Loading project…');
 
-    const getCmType = db.prepare(`SELECT * FROM lib_cm_types WHERE name = ?`);
+    const getCmType = db.prepare(`SELECT * FROM lib_cm_types WHERE name = ? AND project_id = ?`);
     const getBlocks = db.prepare(`
       SELECT
         b.*,
@@ -316,6 +339,9 @@ async function runGeneration(db, body, onProgress) {
           return {
             isMatrix:     true,
             instanceName: inst.instanceName,
+            // Which controller owns this instance — drives the <Device> its
+            // ControllerTargetAssignment points at in multi-controller projects.
+            hwControllerId: inst.hwControllerId ?? inst.hw_controller_id ?? null,
             matrixDef: {
               instanceName: inst.instanceName,
               samplingTime: inst.samplingTime || '100',
@@ -328,7 +354,7 @@ async function runGeneration(db, body, onProgress) {
 
       let resolved = cmCache.get(inst.cmType);
       if (!resolved) {
-        const cm = await getCmType.get(inst.cmType);
+        const cm = await getCmType.get(inst.cmType, genProjectId);
         if (!cm) throw new Error(`CM type not found: ${inst.cmType}`);
         const blockRows = await getBlocks.all(cm.id);
         const blocks = [];
@@ -380,6 +406,9 @@ async function runGeneration(db, body, onProgress) {
         cascadeOmitBlocks: cascadeOmitByInstance[inst.instanceName] || null,
         samplingTime:   inst.samplingTime  || cm.sampling_time || '1000',
         roleAssignments: inst.roleAssignments || {},
+        // Which controller owns this instance — drives the <Device> its
+        // ControllerTargetAssignment points at in multi-controller projects.
+        hwControllerId: inst.hwControllerId ?? inst.hw_controller_id ?? null,
       };
     }
 
@@ -443,29 +472,24 @@ async function runGeneration(db, body, onProgress) {
     // grouping above. Repackage each into a connGroup whose memberInstanceNames maps
     // synthetic indices (0 = source, 1 = destination) to the resolved instance names,
     // which buildWireSpecs() in the XML generator consumes the same way.
-    let genProjectId = null;
-    if (projectName) {
-      const proj = await db.prepare(`SELECT id FROM projects WHERE name = ?`).get(projectName);
-      if (proj) {
-        genProjectId = proj.id;
-        const resolved = await db.prepare(
-          `SELECT from_instance, from_var_name, to_instance, to_var_name, conn_type, static_value
-           FROM unit_resolved_connections WHERE project_id = ? ORDER BY sort_order, id`
-        ).all(proj.id);
-        for (const rc of resolved) {
-          connGroups.push({
-            compositeId: null,
-            connections: [{
-              conn_type:      rc.conn_type || 'interconnection',
-              from_member_idx: 0,
-              from_var_name:   rc.from_var_name,
-              to_member_idx:   1,
-              to_var_name:     rc.to_var_name,
-              static_value:    rc.static_value,
-            }],
-            memberInstanceNames: { 0: rc.from_instance, 1: rc.to_instance },
-          });
-        }
+    if (genProjectId != null) {
+      const resolved = await db.prepare(
+        `SELECT from_instance, from_var_name, to_instance, to_var_name, conn_type, static_value
+         FROM unit_resolved_connections WHERE project_id = ? ORDER BY sort_order, id`
+      ).all(genProjectId);
+      for (const rc of resolved) {
+        connGroups.push({
+          compositeId: null,
+          connections: [{
+            conn_type:      rc.conn_type || 'interconnection',
+            from_member_idx: 0,
+            from_var_name:   rc.from_var_name,
+            to_member_idx:   1,
+            to_var_name:     rc.to_var_name,
+            static_value:    rc.static_value,
+          }],
+          memberInstanceNames: { 0: rc.from_instance, 1: rc.to_instance },
+        });
       }
     }
 

@@ -167,7 +167,7 @@ router.get('/:projectId/:instanceName/exported-blocks', async (req, res) => {
     const inst = await db.prepare(
       `SELECT i.id, i.cm_type, c.id AS cm_type_id
        FROM project_instances i
-       JOIN lib_cm_types c ON c.name = i.cm_type
+       JOIN lib_cm_types c ON c.name = i.cm_type AND c.project_id = i.project_id
        WHERE i.project_id = ? AND i.instance_name = ?`
     ).get(projectId, instanceName);
     if (!inst) return err(res, 404, 'Instance not found');

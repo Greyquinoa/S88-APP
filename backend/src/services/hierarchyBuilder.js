@@ -211,7 +211,10 @@ async function promoteToProject(db, importId, projectId) {
   ).get(projectId))?.m || 0;
   let instSO = maxInstSO + 1;
 
-  let foldersCreated = 0, instancesCreated = 0, userProjectsCreated = 0;
+  let foldersCreated = 0, instancesCreated = 0;
+  // AS values in the import that match no controller — reported back so the user
+  // knows which instances arrived without a controller assignment.
+  let unmatchedAs = [];
 
   await db.transaction(async () => {
     // Helper: Find or create a folder by path
@@ -279,32 +282,50 @@ async function promoteToProject(db, importId, projectId) {
       ).run(nodeToFolderId[node.id], node.id);
     }
 
-    // Collect distinct AS assignments to register in project_user_projects
-    const distinctAssignments = [...new Set(
-      approvedTags.map(t => (t.assignment || '').trim()).filter(Boolean)
+    // ── AS assignment → controller ──────────────────────────────────────────
+    // The AS column names a *controller* (e.g. "AS01"), matching
+    // hw_controllers.T16_Controller_TagName — it is NOT a user project. The user
+    // project is a property of the controller, so it is read from the matched
+    // controller rather than invented from the AS string. This is why the AS
+    // value is no longer auto-registered into project_user_projects: doing so
+    // created phantom user projects (an "AS101" project that no controller and
+    // no PCS7 export ever referred to).
+    //
+    // An AS with no matching controller resolves to null. The instance is still
+    // created, shows as unassigned in the grid, and blocks generation until the
+    // user picks a controller — better than guessing the wrong one.
+    const controllerRows = await db.prepare(
+      `SELECT id, T16_Controller_TagName AS tag_name, user_project
+         FROM hw_controllers WHERE project_id = ?`
+    ).all(projectId);
+    const controllerByAs = new Map(
+      controllerRows
+        .filter(c => c.tag_name)
+        .map(c => [String(c.tag_name).trim().toUpperCase(), c])
+    );
+    const controllerFor = asgn => {
+      const key = (asgn || '').trim().toUpperCase();
+      return key ? (controllerByAs.get(key) ?? null) : null;
+    };
+    const controllerIdFor = asgn => controllerFor(asgn)?.id ?? null;
+    // user_project comes from the controller; unmatched AS values contribute
+    // nothing rather than fabricating a project name.
+    const userProjectFor = asgn => controllerFor(asgn)?.user_project || '';
+
+    // Surface AS values that match no controller so the import result can tell
+    // the user which ones need attention, instead of failing silently.
+    unmatchedAs = [...new Set(
+      approvedTags
+        .map(t => (t.assignment || '').trim())
+        .filter(Boolean)
+        .filter(a => !controllerFor(a))
     )];
-
-    // Upsert each AS assignment into project_user_projects so it appears in the dropdown
-    const maxUpSO = (await db.prepare(
-      'SELECT MAX(sort_order) AS m FROM project_user_projects WHERE project_id=?'
-    ).get(projectId))?.m || 0;
-    let upSO = maxUpSO + 1;
-
-    const upsertUp = db.prepare(`
-      INSERT INTO project_user_projects (project_id, name, sort_order)
-      VALUES (?,?,?)
-      ON CONFLICT (project_id, name) DO NOTHING
-    `);
-    for (const asgn of distinctAssignments) {
-      const r = await upsertUp.run(projectId, asgn, upSO++);
-      if (r.rowCount > 0) userProjectsCreated++;
-    }
 
     // Cache composite CM type lookups by name (assigned_cm_type is now a composite name)
     const compositeCache = new Map();
     async function resolveComposite(name) {
       if (compositeCache.has(name)) return compositeCache.get(name);
-      const comp = await db.prepare('SELECT * FROM composite_cm_types WHERE name=?').get(name);
+      const comp = await db.prepare('SELECT * FROM composite_cm_types WHERE name=? AND project_id=?').get(name, projectId);
       if (!comp) { compositeCache.set(name, null); return null; }
       const members = await db.prepare(
         'SELECT * FROM composite_cm_members WHERE composite_id=? ORDER BY sort_order, id'
@@ -427,15 +448,16 @@ async function promoteToProject(db, importId, projectId) {
           const connections = getIOConnectionsForMember(composite, mi);
           await db.prepare(`
             INSERT INTO project_instances
-              (project_id, cm_type, instance_name, sampling_time, user_project, folder_id, sort_order,
+              (project_id, cm_type, instance_name, sampling_time, user_project, hw_controller_id, folder_id, sort_order,
                composite_group_id, composite_id, member_idx, source, connections, is_imported)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
           `).run(
             projectId,
             m.cm_type_name,
             instName,
             '1000',
-            tag.assignment || '',
+            userProjectFor(tag.assignment),
+            controllerIdFor(tag.assignment),
             memberFolderId,
             instSO++,
             groupId,
@@ -453,14 +475,15 @@ async function promoteToProject(db, importId, projectId) {
         // there is nothing further to insert.
         await db.prepare(`
           INSERT INTO project_instances
-            (project_id, cm_type, instance_name, sampling_time, user_project, folder_id, sort_order, source, connections, is_imported)
-          VALUES (?,?,?,?,?,?,?,?,?,?)
+            (project_id, cm_type, instance_name, sampling_time, user_project, hw_controller_id, folder_id, sort_order, source, connections, is_imported)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?)
         `).run(
           projectId,
           tag.assigned_cm_type,
           tag.node_name,
           '1000',
-          tag.assignment || '',
+          userProjectFor(tag.assignment),
+          controllerIdFor(tag.assignment),
           folderId,
           instSO++,
           'imported',
@@ -475,7 +498,14 @@ async function promoteToProject(db, importId, projectId) {
     await db.prepare(`UPDATE io_imports SET status='promoted' WHERE id=?`).run(importId);
   })();
 
-  return { folders: foldersCreated, instances: instancesCreated, userProjects: userProjectsCreated };
+  return {
+    folders: foldersCreated,
+    instances: instancesCreated,
+    // AS values with no matching controller. Those instances were still created
+    // but have no controller, so the Instances grid flags them and generation
+    // stays blocked until the user assigns one.
+    unmatchedAs,
+  };
 }
 
 module.exports = { buildHierarchy, loadHierarchyTree, promoteToProject, VALID_LEVELS };

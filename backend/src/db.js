@@ -110,6 +110,11 @@ async function tableColumns(tableName) {
   return rows.map(r => r.name);
 }
 
+async function columnExists(table, column) {
+  const cols = await tableColumns(table);
+  return cols.includes(column);
+}
+
 async function addColumnIfMissing(table, column, ddl) {
   const cols = await tableColumns(table);
   if (!cols.includes(column)) {
@@ -122,7 +127,7 @@ async function ensureSchema() {
   const stmts = [
     `CREATE TABLE IF NOT EXISTS lib_cm_types (
       id            SERIAL PRIMARY KEY,
-      name          TEXT NOT NULL UNIQUE,
+      name          TEXT NOT NULL,
       cm_type       TEXT,
       comment       TEXT,
       sampling_time TEXT,
@@ -175,6 +180,26 @@ async function ensureSchema() {
       sort_order  INTEGER NOT NULL DEFAULT 0
     )`,
     `CREATE INDEX IF NOT EXISTS idx_em_roles_cm ON lib_em_roles(cm_type_id)`,
+    // Append-only change history for project data (pilot: Library module).
+    // No UPDATE/DELETE statement against this table exists anywhere in the
+    // codebase — do not add one. See services/auditLog.js.
+    `CREATE TABLE IF NOT EXISTS audit_log (
+      id            BIGSERIAL PRIMARY KEY,
+      project_id    INTEGER,
+      batch_id      UUID,
+      entity_type   TEXT NOT NULL,
+      entity_id     INTEGER NOT NULL,
+      action        TEXT NOT NULL,
+      field_changes JSONB,
+      description   TEXT NOT NULL,
+      changed_by    TEXT NOT NULL DEFAULT 'System',
+      reason        TEXT,
+      source        TEXT NOT NULL,
+      changed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_audit_entity      ON audit_log(entity_type, entity_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_audit_batch       ON audit_log(batch_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_audit_changed_at  ON audit_log(changed_at)`,
     `CREATE TABLE IF NOT EXISTS audit_generations (
       id             SERIAL PRIMARY KEY,
       project_name   TEXT NOT NULL,
@@ -246,7 +271,7 @@ async function ensureSchema() {
     // ── Unit Type System ──────────────────────────────────────────────────────
     `CREATE TABLE IF NOT EXISTS unit_types (
       id          SERIAL PRIMARY KEY,
-      name        TEXT NOT NULL UNIQUE,
+      name        TEXT NOT NULL,
       description TEXT,
       created_at  TIMESTAMPTZ DEFAULT NOW()
     )`,
@@ -278,7 +303,7 @@ async function ensureSchema() {
     // ── Composite CM Type System ──────────────────────────────────────────────
     `CREATE TABLE IF NOT EXISTS composite_cm_types (
       id          SERIAL PRIMARY KEY,
-      name        TEXT NOT NULL UNIQUE,
+      name        TEXT NOT NULL,
       description TEXT,
       created_at  TIMESTAMPTZ DEFAULT NOW()
     )`,
@@ -405,15 +430,39 @@ async function ensureSchema() {
   )`);
   await rawRun(`CREATE INDEX IF NOT EXISTS idx_cmm_comp ON composite_matrix_modes(composite_id)`);
   await rawRun(`CREATE TABLE IF NOT EXISTS composite_matrix_cells (
+    id           SERIAL PRIMARY KEY,
     mode_id      INTEGER NOT NULL REFERENCES composite_matrix_modes(id),
     column_name  TEXT NOT NULL,
     value        INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (mode_id, column_name)
+    UNIQUE(mode_id, column_name)
   )`);
   await rawRun(`CREATE INDEX IF NOT EXISTS idx_cmc_mode ON composite_matrix_cells(mode_id)`);
 
+  // Migration: add id column to composite_matrix_cells if missing (was using composite PK before)
+  {
+    const cellCols = await tableColumns('composite_matrix_cells');
+    if (!cellCols.includes('id')) {
+      try {
+        // Drop the old composite primary key constraint
+        await rawRun('ALTER TABLE composite_matrix_cells DROP CONSTRAINT IF EXISTS composite_matrix_cells_pkey');
+        // Add the id column as the new primary key
+        await rawRun('ALTER TABLE composite_matrix_cells ADD COLUMN id SERIAL PRIMARY KEY');
+        // Add unique constraint for the old composite key
+        await rawRun('ALTER TABLE composite_matrix_cells ADD CONSTRAINT composite_matrix_cells_mode_id_column_name_key UNIQUE(mode_id, column_name)');
+        console.log('[DB] Migration: Added id column to composite_matrix_cells');
+      } catch (e) {
+        console.log('[DB] Migration: composite_matrix_cells already has id or constraint error:', e.message);
+      }
+    }
+  }
+
   // Migration: add is_valid to lib_variables (marks a variable as exposed for composite wiring)
   await addColumnIfMissing('lib_variables', 'is_valid', 'is_valid BOOLEAN NOT NULL DEFAULT FALSE');
+
+  // Migration: structured location/object columns on audit_log (grid display support)
+  await addColumnIfMissing('audit_log', 'location', 'location TEXT');
+  await addColumnIfMissing('audit_log', 'object_label', 'object_label TEXT');
+  await addColumnIfMissing('audit_log', 'context_cm_type', 'context_cm_type TEXT');
 
   // Migration: add project_config table (per-project PCS7 hardware IDs)
   await rawRun(`CREATE TABLE IF NOT EXISTS project_config (
@@ -433,6 +482,25 @@ async function ensureSchema() {
     unit_author      TEXT,
     updated_at       TIMESTAMPTZ DEFAULT NOW()
   )`);
+
+  // Per-device hardware IDs from the user project's PCS7 export. One config
+  // upload covers a whole user project, which may contain several controllers
+  // (AS01 + AS02), each with its own rack / CPU / IOTag folder. The project-level
+  // fields stay in project_config; only the repeating per-device IDs live here.
+  await rawRun(`CREATE TABLE IF NOT EXISTS project_config_devices (
+    id           SERIAL PRIMARY KEY,
+    project_id   INTEGER NOT NULL REFERENCES projects(id),
+    user_project TEXT,
+    device_name  TEXT,
+    device_id    TEXT,
+    cpu_id       TEXT,
+    rack_id      TEXT,
+    iotag_id     TEXT,
+    sort_order   INTEGER DEFAULT 0,
+    updated_at   TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await rawRun(`CREATE INDEX IF NOT EXISTS idx_pcd_proj_userproj
+    ON project_config_devices(project_id, user_project)`);
 
   // ── IO Import System ──────────────────────────────────────────────
   const ioStmts = [
@@ -478,14 +546,17 @@ async function ensureSchema() {
     )`,
     `CREATE TABLE IF NOT EXISTS io_column_mappings (
       id          SERIAL PRIMARY KEY,
-      name        TEXT NOT NULL UNIQUE,
+      project_id  INTEGER NOT NULL REFERENCES projects(id),
+      name        TEXT NOT NULL,
       description TEXT,
       mappings    TEXT NOT NULL DEFAULT '{}',
       created_at  TIMESTAMPTZ DEFAULT NOW(),
-      updated_at  TIMESTAMPTZ DEFAULT NOW()
+      updated_at  TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(project_id, name)
     )`,
     `CREATE TABLE IF NOT EXISTS io_hierarchy_configs (
       id                    SERIAL PRIMARY KEY,
+      project_id            INTEGER NOT NULL REFERENCES projects(id),
       column_map_id         INTEGER NOT NULL REFERENCES io_column_mappings(id),
       process_cell_col      TEXT,
       unit_col              TEXT,
@@ -495,10 +566,12 @@ async function ensureSchema() {
     )`,
     `CREATE TABLE IF NOT EXISTS io_function_map_configs (
       id          SERIAL PRIMARY KEY,
-      name        TEXT NOT NULL UNIQUE,
+      project_id  INTEGER NOT NULL REFERENCES projects(id),
+      name        TEXT NOT NULL,
       description TEXT,
       created_at  TIMESTAMPTZ DEFAULT NOW(),
-      updated_at  TIMESTAMPTZ DEFAULT NOW()
+      updated_at  TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(project_id, name)
     )`,
     `CREATE TABLE IF NOT EXISTS io_function_mappings (
       id             SERIAL PRIMARY KEY,
@@ -554,32 +627,140 @@ async function ensureSchema() {
   ];
   for (const s of ioStmts) await rawRun(s);
 
+  // Migration: add project_id to IO mapping config tables (PASS 2 scoping)
+  // Guard: only run if project_id column doesn't exist, to avoid re-running on every startup
+  const ioCmHasProjectId = await columnExists('io_column_mappings', 'project_id');
+  if (!ioCmHasProjectId) {
+    // First, add the project_id column to all IO mapping tables (nullable for now)
+    await rawRun('ALTER TABLE io_column_mappings ADD COLUMN IF NOT EXISTS project_id INTEGER REFERENCES projects(id)');
+    await rawRun('ALTER TABLE io_function_map_configs ADD COLUMN IF NOT EXISTS project_id INTEGER REFERENCES projects(id)');
+    await rawRun('ALTER TABLE io_hierarchy_configs ADD COLUMN IF NOT EXISTS project_id INTEGER REFERENCES projects(id)');
+
+    // Clone existing global mapping configs into every project
+    const projects = await rawAll('SELECT id FROM projects ORDER BY id');
+
+    // io_column_mappings: no child tables to remap, just insert direct clones
+    const globalCms = await rawAll('SELECT id, name, description, mappings, included, created_at, updated_at FROM io_column_mappings WHERE project_id IS NULL');
+    for (const proj of projects) {
+      for (const cm of globalCms) {
+        await rawRun(
+          `INSERT INTO io_column_mappings (project_id, name, description, mappings, included, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [proj.id, cm.name, cm.description, cm.mappings, cm.included, cm.created_at, cm.updated_at]
+        );
+      }
+    }
+
+    // io_function_map_configs + io_function_mappings: must remap config_id FKs
+    const globalFmcs = await rawAll('SELECT id, name, description, created_at, updated_at FROM io_function_map_configs WHERE project_id IS NULL');
+    for (const proj of projects) {
+      const fmcIdMap = new Map(); // old id -> new id per project
+      for (const fmc of globalFmcs) {
+        const newFmcRes = await rawRun(
+          `INSERT INTO io_function_map_configs (project_id, name, description, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?) RETURNING id`,
+          [proj.id, fmc.name, fmc.description, fmc.created_at, fmc.updated_at]
+        );
+        const newFmcId = newFmcRes.lastInsertRowid;
+        fmcIdMap.set(fmc.id, newFmcId);
+
+        // Clone child mappings with remapped config_id
+        const mappings = await rawAll('SELECT function_value, cm_type_name, priority, match_mode, match_pattern, notes FROM io_function_mappings WHERE config_id = ?', [fmc.id]);
+        for (const m of mappings) {
+          await rawRun(
+            `INSERT INTO io_function_mappings (config_id, function_value, cm_type_name, priority, match_mode, match_pattern, notes)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [newFmcId, m.function_value, m.cm_type_name, m.priority, m.match_mode, m.match_pattern, m.notes]
+          );
+        }
+      }
+    }
+
+    // io_hierarchy_configs: must remap column_map_id FKs
+    const globalHcs = await rawAll('SELECT id, column_map_id, process_cell_col, unit_col, equipment_module_col, area_col, cm_group_rule FROM io_hierarchy_configs WHERE project_id IS NULL');
+    for (const proj of projects) {
+      // Build a mapping of global column_map_id -> per-project ids
+      const cmIdMap = new Map();
+      const globalCmRows = await rawAll('SELECT id FROM io_column_mappings WHERE project_id IS NULL');
+      const projCmRows = await rawAll('SELECT id FROM io_column_mappings WHERE project_id = ? ORDER BY name', [proj.id]);
+      // Assume order matches when cloned; safer to match by name
+      const globalCmsByName = await rawAll('SELECT id, name FROM io_column_mappings WHERE project_id IS NULL');
+      const projCmsByName = await rawAll('SELECT id, name FROM io_column_mappings WHERE project_id = ?', [proj.id]);
+      const projCmByName = new Map(projCmsByName.map(r => [r.name, r.id]));
+      for (const g of globalCmsByName) {
+        const projId = projCmByName.get(g.name);
+        if (projId) cmIdMap.set(g.id, projId);
+      }
+
+      for (const hc of globalHcs) {
+        const newCmId = cmIdMap.get(hc.column_map_id);
+        if (newCmId) {
+          await rawRun(
+            `INSERT INTO io_hierarchy_configs (project_id, column_map_id, process_cell_col, unit_col, equipment_module_col, area_col, cm_group_rule)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [proj.id, newCmId, hc.process_cell_col, hc.unit_col, hc.equipment_module_col, hc.area_col, hc.cm_group_rule]
+          );
+        }
+      }
+    }
+
+    // Drop the old global rows (those with project_id = NULL after migration)
+    // They're now redundant since we've cloned them into every project
+    await rawRun('DELETE FROM io_function_mappings WHERE config_id IN (SELECT id FROM io_function_map_configs WHERE project_id IS NULL)');
+    await rawRun('DELETE FROM io_hierarchy_configs WHERE project_id IS NULL');
+    await rawRun('DELETE FROM io_function_map_configs WHERE project_id IS NULL');
+    await rawRun('DELETE FROM io_column_mappings WHERE project_id IS NULL');
+
+    // Add NOT NULL constraint
+    await rawRun('ALTER TABLE io_column_mappings ALTER COLUMN project_id SET NOT NULL');
+    await rawRun('ALTER TABLE io_function_map_configs ALTER COLUMN project_id SET NOT NULL');
+    await rawRun('ALTER TABLE io_hierarchy_configs ALTER COLUMN project_id SET NOT NULL');
+  }
+
   // Migration: add included column to io_column_mappings
   await addColumnIfMissing('io_column_mappings', 'included', `included TEXT`);
+
+  // Repair: assign any orphaned IO mapping config rows (project_id IS NULL) to the
+  // first project. These can be left behind if the Pass-2 migration ran before the
+  // ALTER TABLE ADD COLUMN statements were reordered to the top of the block.
+  {
+    const firstProject = await rawGet('SELECT id FROM projects ORDER BY id LIMIT 1');
+    if (firstProject) {
+      await rawRun('UPDATE io_function_map_configs SET project_id=? WHERE project_id IS NULL', [firstProject.id]);
+      await rawRun('UPDATE io_column_mappings       SET project_id=? WHERE project_id IS NULL', [firstProject.id]);
+      await rawRun('UPDATE io_hierarchy_configs     SET project_id=? WHERE project_id IS NULL', [firstProject.id]);
+    }
+  }
 
   // ── EPH/EM Import System ──────────────────────────────────────────────────────
   const ephEmStmts = [
     `CREATE TABLE IF NOT EXISTS eph_em_type_mapping_configs (
       id          SERIAL PRIMARY KEY,
-      name        TEXT NOT NULL UNIQUE,
+      project_id  INTEGER NOT NULL REFERENCES projects(id),
+      name        TEXT NOT NULL,
       mappings    TEXT NOT NULL DEFAULT '{}',
       created_at  TIMESTAMPTZ DEFAULT NOW(),
-      updated_at  TIMESTAMPTZ DEFAULT NOW()
+      updated_at  TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(project_id, name)
     )`,
     `CREATE TABLE IF NOT EXISTS eph_em_column_mappings (
       id          SERIAL PRIMARY KEY,
-      name        TEXT NOT NULL UNIQUE,
+      project_id  INTEGER NOT NULL REFERENCES projects(id),
+      name        TEXT NOT NULL,
       description TEXT,
       mappings    TEXT NOT NULL DEFAULT '{}',
       created_at  TIMESTAMPTZ DEFAULT NOW(),
-      updated_at  TIMESTAMPTZ DEFAULT NOW()
+      updated_at  TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(project_id, name)
     )`,
     `CREATE TABLE IF NOT EXISTS eph_em_function_map_configs (
       id          SERIAL PRIMARY KEY,
-      name        TEXT NOT NULL UNIQUE,
+      project_id  INTEGER NOT NULL REFERENCES projects(id),
+      name        TEXT NOT NULL,
       description TEXT,
       created_at  TIMESTAMPTZ DEFAULT NOW(),
-      updated_at  TIMESTAMPTZ DEFAULT NOW()
+      updated_at  TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(project_id, name)
     )`,
     `CREATE TABLE IF NOT EXISTS eph_em_function_mappings (
       id              SERIAL PRIMARY KEY,
@@ -630,6 +811,89 @@ async function ensureSchema() {
   ];
   for (const s of ephEmStmts) await rawRun(s);
 
+  // Migration: add project_id to EPH/EM mapping config tables (PASS 2 scoping)
+  // Guard: only run if project_id column doesn't exist
+  const ephEmCmHasProjectId = await columnExists('eph_em_column_mappings', 'project_id');
+  if (!ephEmCmHasProjectId) {
+    // First, add the project_id column to all EPH/EM mapping tables (nullable for now)
+    await rawRun('ALTER TABLE eph_em_column_mappings ADD COLUMN IF NOT EXISTS project_id INTEGER REFERENCES projects(id)');
+    await rawRun('ALTER TABLE eph_em_type_mapping_configs ADD COLUMN IF NOT EXISTS project_id INTEGER REFERENCES projects(id)');
+    await rawRun('ALTER TABLE eph_em_function_map_configs ADD COLUMN IF NOT EXISTS project_id INTEGER REFERENCES projects(id)');
+
+    const projects = await rawAll('SELECT id FROM projects ORDER BY id');
+
+    // eph_em_column_mappings: no child tables, direct clones
+    const globalEcms = await rawAll('SELECT id, name, description, mappings, created_at, updated_at FROM eph_em_column_mappings WHERE project_id IS NULL');
+    for (const proj of projects) {
+      for (const ecm of globalEcms) {
+        await rawRun(
+          `INSERT INTO eph_em_column_mappings (project_id, name, description, mappings, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [proj.id, ecm.name, ecm.description, ecm.mappings, ecm.created_at, ecm.updated_at]
+        );
+      }
+    }
+
+    // eph_em_type_mapping_configs: no child tables, direct clones
+    const globalEtms = await rawAll('SELECT id, name, mappings, created_at, updated_at FROM eph_em_type_mapping_configs WHERE project_id IS NULL');
+    for (const proj of projects) {
+      for (const etm of globalEtms) {
+        await rawRun(
+          `INSERT INTO eph_em_type_mapping_configs (project_id, name, mappings, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?)`,
+          [proj.id, etm.name, etm.mappings, etm.created_at, etm.updated_at]
+        );
+      }
+    }
+
+    // eph_em_function_map_configs + eph_em_function_mappings: must remap config_id FKs
+    const globalEfmcs = await rawAll('SELECT id, name, description, created_at, updated_at FROM eph_em_function_map_configs WHERE project_id IS NULL');
+    for (const proj of projects) {
+      const efmcIdMap = new Map();
+      for (const efmc of globalEfmcs) {
+        const newEfmcRes = await rawRun(
+          `INSERT INTO eph_em_function_map_configs (project_id, name, description, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?) RETURNING id`,
+          [proj.id, efmc.name, efmc.description, efmc.created_at, efmc.updated_at]
+        );
+        const newEfmcId = newEfmcRes.lastInsertRowid;
+        efmcIdMap.set(efmc.id, newEfmcId);
+
+        // Clone child mappings with remapped config_id
+        const mappings = await rawAll('SELECT eph_em_type, cm_type_name, naming_template, priority, match_mode, match_pattern, notes FROM eph_em_function_mappings WHERE config_id = ?', [efmc.id]);
+        for (const m of mappings) {
+          await rawRun(
+            `INSERT INTO eph_em_function_mappings (config_id, eph_em_type, cm_type_name, naming_template, priority, match_mode, match_pattern, notes)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [newEfmcId, m.eph_em_type, m.cm_type_name, m.naming_template, m.priority, m.match_mode, m.match_pattern, m.notes]
+          );
+        }
+      }
+    }
+
+    // Delete global rows (those with project_id = NULL after migration)
+    await rawRun('DELETE FROM eph_em_function_mappings WHERE config_id IN (SELECT id FROM eph_em_function_map_configs WHERE project_id IS NULL)');
+    await rawRun('DELETE FROM eph_em_function_map_configs WHERE project_id IS NULL');
+    await rawRun('DELETE FROM eph_em_type_mapping_configs WHERE project_id IS NULL');
+    await rawRun('DELETE FROM eph_em_column_mappings WHERE project_id IS NULL');
+
+    // Add NOT NULL constraint
+    await rawRun('ALTER TABLE eph_em_column_mappings ALTER COLUMN project_id SET NOT NULL');
+    await rawRun('ALTER TABLE eph_em_type_mapping_configs ALTER COLUMN project_id SET NOT NULL');
+    await rawRun('ALTER TABLE eph_em_function_map_configs ALTER COLUMN project_id SET NOT NULL');
+  }
+
+  // Repair: assign any orphaned EPH/EM mapping config rows (project_id IS NULL) to
+  // the first project, mirroring the IO repair above.
+  {
+    const firstProject = await rawGet('SELECT id FROM projects ORDER BY id LIMIT 1');
+    if (firstProject) {
+      await rawRun('UPDATE eph_em_column_mappings       SET project_id=? WHERE project_id IS NULL', [firstProject.id]);
+      await rawRun('UPDATE eph_em_type_mapping_configs  SET project_id=? WHERE project_id IS NULL', [firstProject.id]);
+      await rawRun('UPDATE eph_em_function_map_configs  SET project_id=? WHERE project_id IS NULL', [firstProject.id]);
+    }
+  }
+
   // Migration: add columns metadata to eph_em_imports for persistent storage
   await addColumnIfMissing('eph_em_imports', 'columns', `columns TEXT DEFAULT '[]'`);
 
@@ -647,6 +911,14 @@ async function ensureSchema() {
                      'assigned_by', 'assigned_at', 'override_reason', 'validation_flags']) {
     await rawRun(`ALTER TABLE eph_em_import_rows DROP COLUMN IF EXISTS ${col}`);
   }
+
+  // Indexes for project-scoped mapping config tables (PASS 2 scoping)
+  await rawRun('CREATE INDEX IF NOT EXISTS idx_iocm_project ON io_column_mappings(project_id)');
+  await rawRun('CREATE INDEX IF NOT EXISTS idx_iofmc_project ON io_function_map_configs(project_id)');
+  await rawRun('CREATE INDEX IF NOT EXISTS idx_iohc_project ON io_hierarchy_configs(project_id)');
+  await rawRun('CREATE INDEX IF NOT EXISTS idx_ephemcm_project ON eph_em_column_mappings(project_id)');
+  await rawRun('CREATE INDEX IF NOT EXISTS idx_ephemtmc_project ON eph_em_type_mapping_configs(project_id)');
+  await rawRun('CREATE INDEX IF NOT EXISTS idx_ephemfmc_project ON eph_em_function_map_configs(project_id)');
 
   // Migrations: add instrument_tag, hierarchy, assignment columns to io_tags
   await addColumnIfMissing('io_tags', 'instrument_tag', 'instrument_tag TEXT');
@@ -903,6 +1175,7 @@ async function ensureSchema() {
     YN_Redundant           BOOLEAN DEFAULT FALSE,
     YN_Slave               BOOLEAN DEFAULT FALSE,
     MEM_Doc_Change         TEXT,
+    user_project           TEXT,
     created_at             TIMESTAMPTZ DEFAULT NOW(),
     updated_at             TIMESTAMPTZ DEFAULT NOW()
   )`);
@@ -920,6 +1193,17 @@ async function ensureSchema() {
     updated_at          TIMESTAMPTZ DEFAULT NOW()
   )`);
   await rawRun(`CREATE INDEX IF NOT EXISTS idx_hwfb_ctrl ON hw_fieldbuses(hw_controller_id)`);
+
+  // Migration: hw_imports.hw_controller_id and its uniqueness constraints were
+  // previously applied only to the live database via one-off scripts
+  // (backend/fix-neon-indexes.js), never declared here — a fresh database
+  // setup would silently diverge and be missing per-controller import scoping
+  // entirely. Declared here now, after hw_controllers exists so the FK resolves.
+  await addColumnIfMissing('hw_imports', 'hw_controller_id', 'hw_controller_id INTEGER REFERENCES hw_controllers(id)');
+  await rawRun(`CREATE UNIQUE INDEX IF NOT EXISTS uq_hwi_proj_ctrl
+    ON hw_imports(project_id, hw_controller_id) WHERE (hw_controller_id IS NOT NULL)`);
+  await rawRun(`CREATE UNIQUE INDEX IF NOT EXISTS uq_hwctrl_proj_name
+    ON hw_controllers(project_id, T16_Controller_TagName) WHERE (T16_Controller_TagName IS NOT NULL)`);
 
   // Seed common module templates. Idempotent via ON CONFLICT DO NOTHING: order_no+hw_category
   // is UNIQUE, so a row already present is left untouched.
@@ -1343,8 +1627,7 @@ async function ensureSchema() {
     id            SERIAL PRIMARY KEY,
     cm_type_name  TEXT NOT NULL,
     enabled_blocks TEXT NOT NULL DEFAULT '[]',
-    updated_at    TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(cm_type_name)
+    updated_at    TIMESTAMPTZ DEFAULT NOW()
   )`);
 
   // User preferences for selected columns in IO imports
@@ -1489,7 +1772,533 @@ async function ensureSchema() {
     }
   }
 
+  // ── Migration: link hw_controllers to user_projects (many controllers per user project) ──
+  await addColumnIfMissing('hw_controllers', 'user_project', 'user_project TEXT');
+  await addColumnIfMissing('project_instances', 'hw_controller_id', 'hw_controller_id INTEGER REFERENCES hw_controllers(id)');
+  await rawRun(`CREATE INDEX IF NOT EXISTS idx_pi_hw_controller ON project_instances(hw_controller_id)`);
+
+  // Backfill: existing instances predate hw_controller_id and would all show a
+  // blank Controller column (blocking generation). Historically user_project held
+  // either an AS/controller name (IO import wrote the AS value straight in) or a
+  // real user-project name, so try both readings — never overwriting a value the
+  // user already set, and never guessing when the answer is ambiguous.
+  try {
+    // (a) user_project actually holds a controller tag name (e.g. "AS01").
+    const byTag = await rawRun(`
+      UPDATE project_instances pi
+         SET hw_controller_id = c.id
+        FROM hw_controllers c
+       WHERE pi.hw_controller_id IS NULL
+         AND pi.user_project IS NOT NULL
+         AND c.project_id = pi.project_id
+         AND UPPER(TRIM(c.T16_Controller_TagName)) = UPPER(TRIM(pi.user_project))
+    `);
+
+    // (b) user_project is a genuine user project — usable only when that project
+    // owns exactly one controller. With several (AS01 + AS02 in "S88xTest") there
+    // is no correct answer, so those stay NULL for the user to choose.
+    const byProject = await rawRun(`
+      UPDATE project_instances pi
+         SET hw_controller_id = sole.id
+        FROM (
+          SELECT project_id, UPPER(TRIM(user_project)) AS up, MIN(id) AS id
+            FROM hw_controllers
+           WHERE user_project IS NOT NULL AND TRIM(user_project) <> ''
+           GROUP BY project_id, UPPER(TRIM(user_project))
+          HAVING COUNT(*) = 1
+        ) sole
+       WHERE pi.hw_controller_id IS NULL
+         AND pi.user_project IS NOT NULL
+         AND sole.project_id = pi.project_id
+         AND sole.up = UPPER(TRIM(pi.user_project))
+    `);
+
+    const n = (byTag?.rowCount || 0) + (byProject?.rowCount || 0);
+    if (n > 0) console.log(`[DB] Migration: linked ${n} instance(s) to their controller`);
+  } catch (e) {
+    console.log('[DB] Migration: instance→controller backfill skipped:', e.message);
+  }
+
+  // ── Migration: scope Library / Composite CM Types / Unit Types to a project ──
+  // Previously global (one shared pool for every project). Each project now owns
+  // its own copy — cm_type_name references from composites/unit-types are only
+  // unambiguous within one project's scope, so all three move together.
+  //
+  // Guarded like every other one-off migration in this file: check whether
+  // lib_cm_types.project_id already exists before doing any work, so this never
+  // re-clones on a later boot. For any project created AFTER this migration has
+  // already run once, project_id already has NOT NULL — nothing to backfill for it.
+  await migrateLibraryToProjectScope();
+
   console.log('[DB] Schema ready');
+}
+
+async function migrateLibraryToProjectScope() {
+  // Defensive cleanup: an earlier, since-fixed version of this migration could
+  // exit partway through (e.g. mid-clone), leaving duplicate project-scoped
+  // clones of the same original row behind (re-running from scratch each boot
+  // until it reached NOT NULL). Detect and collapse those duplicates before
+  // doing anything else, unconditionally — cheap no-op once clean, and this
+  // must run even when the guard below decides there is nothing left to clone.
+  await dedupePartialProjectClones();
+
+  // Migration is considered "done" only once project_id is both present AND
+  // NOT NULL on every one of the four tables (the final step below). Any one
+  // of them still missing or nullable means an earlier boot bailed out
+  // partway through — re-enter so it gets finished.
+  const tablesToCheck = ['lib_cm_types', 'composite_cm_types', 'unit_types', 'user_cm_block_prefs'];
+  let allDone = true;
+  for (const t of tablesToCheck) {
+    const cols = await rawAll(
+      `SELECT is_nullable FROM information_schema.columns WHERE table_name = ? AND column_name = 'project_id'`,
+      [t]
+    );
+    if (!cols.length || cols[0].is_nullable === 'YES') { allDone = false; break; }
+  }
+  if (allDone) return;
+
+  const projects = await rawAll('SELECT id FROM projects ORDER BY id');
+  console.log(`[DB] Migration: scoping library/composites/unit-types to ${projects.length} project(s)…`);
+
+  // 1) Add the column nullable first (existing global rows have no owner yet).
+  await rawRun('ALTER TABLE lib_cm_types        ADD COLUMN IF NOT EXISTS project_id INTEGER REFERENCES projects(id)');
+  await rawRun('ALTER TABLE composite_cm_types  ADD COLUMN IF NOT EXISTS project_id INTEGER REFERENCES projects(id)');
+  await rawRun('ALTER TABLE unit_types          ADD COLUMN IF NOT EXISTS project_id INTEGER REFERENCES projects(id)');
+  await rawRun('ALTER TABLE user_cm_block_prefs ADD COLUMN IF NOT EXISTS project_id INTEGER REFERENCES projects(id)');
+
+  // Drop the old GLOBAL uniqueness up front — cloning the same name into every
+  // project's scope below would otherwise collide against it immediately.
+  // The new per-project unique indexes are added at the end, once every row
+  // has an owner.
+  await rawRun('ALTER TABLE lib_cm_types        DROP CONSTRAINT IF EXISTS lib_cm_types_name_key');
+  await rawRun('ALTER TABLE composite_cm_types  DROP CONSTRAINT IF EXISTS composite_cm_types_name_key');
+  await rawRun('ALTER TABLE unit_types          DROP CONSTRAINT IF EXISTS unit_types_name_key');
+  await rawRun('ALTER TABLE user_cm_block_prefs DROP CONSTRAINT IF EXISTS user_cm_block_prefs_cm_type_name_key');
+
+  // 2) Snapshot the current global trees before cloning starts overwriting nothing
+  // (all clones are INSERTs into the same tables, so read the ORIGINAL rows —
+  // the ones with project_id IS NULL — once, up front).
+  const origCmTypes = await rawAll('SELECT * FROM lib_cm_types WHERE project_id IS NULL ORDER BY id');
+  const origComposites = await rawAll('SELECT * FROM composite_cm_types WHERE project_id IS NULL ORDER BY id');
+  const origUnitTypes = await rawAll('SELECT * FROM unit_types WHERE project_id IS NULL ORDER BY id');
+  const origBlockPrefs = await rawAll('SELECT * FROM user_cm_block_prefs WHERE project_id IS NULL ORDER BY id');
+
+  console.log(`[DB] Migration: source snapshot — ${origCmTypes.length} lib_cm_types, ${origComposites.length} composite_cm_types, ${origUnitTypes.length} unit_types, ${origBlockPrefs.length} user_cm_block_prefs`);
+
+  if (projects.length === 0) {
+    // No projects exist yet — nothing to clone into. Leave the original (global)
+    // rows with project_id NULL for now; they'll simply be orphaned/unreachable
+    // once the NOT NULL constraint below is added on a later boot after a project
+    // exists. To avoid ever deadlocking (constraint added while rows are NULL),
+    // skip adding NOT NULL/UNIQUE here — a future boot will re-enter this function
+    // (project_id column already exists is only checked on lib_cm_types, so guard
+    // via a marker column count instead).
+    console.log('[DB] Migration: no projects exist yet — leaving global rows unscoped for now, will finish once a project is created.');
+    return;
+  }
+
+  // Preload full child trees for the original data once (shared across all
+  // per-project clones below).
+  const blocksByCmType = new Map();       // cmTypeId -> [block rows]
+  const varsByBlock = new Map();          // blockId -> [var rows]
+  const linksByVar = new Map();           // varId -> [target_lib_id]
+  const msgsByBlock = new Map();          // blockId -> [msg rows]
+  const rolesByCmType = new Map();        // cmTypeId -> [role rows]
+
+  for (const cm of origCmTypes) {
+    const blocks = await rawAll('SELECT * FROM lib_blocks WHERE cm_type_id = ? ORDER BY id', [cm.id]);
+    blocksByCmType.set(cm.id, blocks);
+    for (const blk of blocks) {
+      const vars = await rawAll('SELECT * FROM lib_variables WHERE block_id = ? ORDER BY id', [blk.id]);
+      varsByBlock.set(blk.id, vars);
+      for (const v of vars) {
+        const links = await rawAll('SELECT target_lib_id FROM lib_var_links WHERE var_id = ? ORDER BY id', [v.id]);
+        linksByVar.set(v.id, links.map(l => l.target_lib_id));
+      }
+      const msgs = await rawAll('SELECT * FROM lib_messages WHERE block_id = ? ORDER BY id', [blk.id]);
+      msgsByBlock.set(blk.id, msgs);
+    }
+    const roles = await rawAll('SELECT * FROM lib_em_roles WHERE cm_type_id = ? ORDER BY id', [cm.id]);
+    rolesByCmType.set(cm.id, roles);
+  }
+
+  const membersByComposite = new Map();   // compositeId -> [member rows]
+  const connsByComposite = new Map();     // compositeId -> [connection rows]
+  const matrixColsByComposite = new Map();// compositeId -> [column rows]
+  const matrixModesByComposite = new Map();// compositeId -> [{mode row, cells:[...]}]
+
+  for (const comp of origComposites) {
+    membersByComposite.set(comp.id, await rawAll('SELECT * FROM composite_cm_members WHERE composite_id = ? ORDER BY id', [comp.id]));
+    connsByComposite.set(comp.id, await rawAll('SELECT * FROM composite_cm_connections WHERE composite_id = ? ORDER BY id', [comp.id]));
+    matrixColsByComposite.set(comp.id, await rawAll('SELECT * FROM composite_matrix_columns WHERE composite_id = ? ORDER BY id', [comp.id]));
+    const modes = await rawAll('SELECT * FROM composite_matrix_modes WHERE composite_id = ? ORDER BY id', [comp.id]);
+    const modesWithCells = [];
+    for (const mode of modes) {
+      const cells = await rawAll('SELECT * FROM composite_matrix_cells WHERE mode_id = ? ORDER BY id', [mode.id]);
+      modesWithCells.push({ mode, cells });
+    }
+    matrixModesByComposite.set(comp.id, modesWithCells);
+  }
+
+  const membersByUnitType = new Map();      // unitTypeId -> [member rows]
+  const rolesByMember = new Map();          // memberId -> [role rows]
+  const connsByUnitType = new Map();        // unitTypeId -> [connection rows]
+
+  for (const ut of origUnitTypes) {
+    const members = await rawAll('SELECT * FROM unit_type_members WHERE unit_type_id = ? ORDER BY id', [ut.id]);
+    membersByUnitType.set(ut.id, members);
+    for (const m of members) {
+      rolesByMember.set(m.id, await rawAll('SELECT * FROM unit_type_member_roles WHERE member_id = ? ORDER BY id', [m.id]));
+    }
+    connsByUnitType.set(ut.id, await rawAll('SELECT * FROM unit_type_member_connections WHERE unit_type_id = ? ORDER BY id', [ut.id]));
+  }
+
+  // 3) Clone the whole tree into every project, remapping FKs as we go.
+  let totalCmClones = 0, totalCompClones = 0, totalUtClones = 0;
+
+  for (const proj of projects) {
+    // ── lib_cm_types tree ──
+    const cmIdMap = new Map(); // origCmTypeId -> new cloned id
+    for (const cm of origCmTypes) {
+      const row = await rawRun(
+        `INSERT INTO lib_cm_types (project_id, name, cm_type, comment, sampling_time, loaded_at)
+         VALUES (?,?,?,?,?,?)`,
+        [proj.id, cm.name, cm.cm_type, cm.comment, cm.sampling_time, cm.loaded_at]
+      );
+      const newCmId = row.lastInsertRowid;
+      cmIdMap.set(cm.id, newCmId);
+      totalCmClones++;
+
+      for (const blk of (blocksByCmType.get(cm.id) || [])) {
+        const blkRow = await rawRun(
+          `INSERT INTO lib_blocks (cm_type_id, name, comment, optional, sort_order, is_conditional)
+           VALUES (?,?,?,?,?,?)`,
+          [newCmId, blk.name, blk.comment, blk.optional, blk.sort_order, blk.is_conditional]
+        );
+        const newBlkId = blkRow.lastInsertRowid;
+
+        for (const v of (varsByBlock.get(blk.id) || [])) {
+          const varRow = await rawRun(
+            `INSERT INTO lib_variables
+               (block_id, lib_id, name, dir, dtype, val, comment, vtype, enumeration, negation, sort_order, is_valid)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+            [newBlkId, v.lib_id, v.name, v.dir, v.dtype, v.val, v.comment, v.vtype,
+             v.enumeration, v.negation, v.sort_order, v.is_valid]
+          );
+          const newVarId = varRow.lastInsertRowid;
+          for (const targetLibId of (linksByVar.get(v.id) || [])) {
+            await rawRun('INSERT INTO lib_var_links (var_id, target_lib_id) VALUES (?,?)', [newVarId, targetLibId]);
+          }
+        }
+
+        for (const m of (msgsByBlock.get(blk.id) || [])) {
+          await rawRun(
+            `INSERT INTO lib_messages (block_id, name, batch, cls, event, origin, osarea, prio, ack, sort_order)
+             VALUES (?,?,?,?,?,?,?,?,?,?)`,
+            [newBlkId, m.name, m.batch, m.cls, m.event, m.origin, m.osarea, m.prio, m.ack, m.sort_order]
+          );
+        }
+      }
+
+      for (const r of (rolesByCmType.get(cm.id) || [])) {
+        await rawRun(
+          'INSERT INTO lib_em_roles (cm_type_id, role, sort_order, role_kind) VALUES (?,?,?,?)',
+          [newCmId, r.role, r.sort_order, r.role_kind]
+        );
+      }
+    }
+
+    // ── user_cm_block_prefs (keyed by cm_type_name, not id — clone verbatim per project) ──
+    for (const p of origBlockPrefs) {
+      await rawRun(
+        `INSERT INTO user_cm_block_prefs (project_id, cm_type_name, enabled_blocks, updated_at)
+         VALUES (?,?,?,?)`,
+        [proj.id, p.cm_type_name, p.enabled_blocks, p.updated_at]
+      );
+    }
+
+    // ── composite_cm_types tree ──
+    const compIdMap = new Map(); // origCompositeId -> new cloned id
+    for (const comp of origComposites) {
+      const row = await rawRun(
+        `INSERT INTO composite_cm_types (project_id, name, description, created_at, is_matrix)
+         VALUES (?,?,?,?,?)`,
+        [proj.id, comp.name, comp.description, comp.created_at, comp.is_matrix]
+      );
+      const newCompId = row.lastInsertRowid;
+      compIdMap.set(comp.id, newCompId);
+      totalCompClones++;
+
+      for (const m of (membersByComposite.get(comp.id) || [])) {
+        await rawRun(
+          `INSERT INTO composite_cm_members
+             (composite_id, cm_type_name, hierarchy_folder, name_prefix, name_suffix, is_primary, sort_order, scope, roles)
+           VALUES (?,?,?,?,?,?,?,?,?)`,
+          [newCompId, m.cm_type_name, m.hierarchy_folder, m.name_prefix, m.name_suffix,
+           m.is_primary, m.sort_order, m.scope, m.roles]
+        );
+      }
+
+      for (const c of (connsByComposite.get(comp.id) || [])) {
+        await rawRun(
+          `INSERT INTO composite_cm_connections
+             (composite_id, from_member_idx, from_var_name, to_member_idx, to_var_name, sort_order, conn_type, static_value)
+           VALUES (?,?,?,?,?,?,?,?)`,
+          [newCompId, c.from_member_idx, c.from_var_name, c.to_member_idx, c.to_var_name,
+           c.sort_order, c.conn_type, c.static_value]
+        );
+      }
+
+      const colIdMap = new Map(); // not needed by name, but kept for symmetry/clarity
+      for (const col of (matrixColsByComposite.get(comp.id) || [])) {
+        await rawRun(
+          'INSERT INTO composite_matrix_columns (composite_id, column_name, sort_order) VALUES (?,?,?)',
+          [newCompId, col.column_name, col.sort_order]
+        );
+      }
+
+      for (const { mode, cells } of (matrixModesByComposite.get(comp.id) || [])) {
+        const modeRow = await rawRun(
+          'INSERT INTO composite_matrix_modes (composite_id, mode_nr, mode_name, sort_order) VALUES (?,?,?,?)',
+          [newCompId, mode.mode_nr, mode.mode_name, mode.sort_order]
+        );
+        const newModeId = modeRow.lastInsertRowid;
+        for (const cell of cells) {
+          await rawRun(
+            'INSERT INTO composite_matrix_cells (mode_id, column_name, value) VALUES (?,?,?)',
+            [newModeId, cell.column_name, cell.value]
+          );
+        }
+      }
+    }
+
+    // ── unit_types tree ──
+    for (const ut of origUnitTypes) {
+      const row = await rawRun(
+        `INSERT INTO unit_types (project_id, name, description, created_at)
+         VALUES (?,?,?,?)`,
+        [proj.id, ut.name, ut.description, ut.created_at]
+      );
+      const newUtId = row.lastInsertRowid;
+      totalUtClones++;
+
+      const memberIdMap = new Map(); // origMemberId -> new cloned member id
+      for (const m of (membersByUnitType.get(ut.id) || [])) {
+        const newCompositeCmId = m.composite_cm_id != null ? compIdMap.get(m.composite_cm_id) ?? null : null;
+        const mRow = await rawRun(
+          `INSERT INTO unit_type_members
+             (unit_type_id, alias, cm_type_name, hierarchy_folder, sort_order, composite_cm_id)
+           VALUES (?,?,?,?,?,?)`,
+          [newUtId, m.alias, m.cm_type_name, m.hierarchy_folder, m.sort_order, newCompositeCmId]
+        );
+        const newMemberId = mRow.lastInsertRowid;
+        memberIdMap.set(m.id, newMemberId);
+
+        for (const r of (rolesByMember.get(m.id) || [])) {
+          await rawRun(
+            `INSERT INTO unit_type_member_roles
+               (member_id, role, assigned_alias, source_member_idx, target_member_idx)
+             VALUES (?,?,?,?,?)`,
+            [newMemberId, r.role, r.assigned_alias, r.source_member_idx, r.target_member_idx]
+          );
+        }
+      }
+
+      for (const c of (connsByUnitType.get(ut.id) || [])) {
+        await rawRun(
+          `INSERT INTO unit_type_member_connections
+             (unit_type_id, from_alias, from_sub_idx, from_var_name, to_alias, to_sub_idx, to_var_name,
+              conn_type, static_value, sort_order, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+          [newUtId, c.from_alias, c.from_sub_idx, c.from_var_name, c.to_alias, c.to_sub_idx, c.to_var_name,
+           c.conn_type, c.static_value, c.sort_order, c.created_at]
+        );
+      }
+    }
+  }
+
+  console.log(`[DB] Migration: cloned ${totalCmClones} lib_cm_types, ${totalCompClones} composite_cm_types, ${totalUtClones} unit_types across ${projects.length} project(s)`);
+
+  // 4) Remove the now-superseded global (project_id IS NULL) rows. Deleting
+  // lib_cm_types/composite_cm_types/unit_types cascades to their children via
+  // FK ON DELETE CASCADE where declared; child tables without a project_id of
+  // their own (lib_blocks, composite_cm_members, unit_type_members, etc.) are
+  // only ever reached through these parents, so removing the orphaned parents
+  // is sufficient — nothing else references the old (NULL) rows once cloning
+  // above is complete.
+  for (const cm of origCmTypes) {
+    const blockIds = (await rawAll('SELECT id FROM lib_blocks WHERE cm_type_id = ?', [cm.id])).map(r => r.id);
+    for (const bid of blockIds) {
+      const varIds = (await rawAll('SELECT id FROM lib_variables WHERE block_id = ?', [bid])).map(r => r.id);
+      for (const vid of varIds) await rawRun('DELETE FROM lib_var_links WHERE var_id = ?', [vid]);
+      await rawRun('DELETE FROM lib_variables WHERE block_id = ?', [bid]);
+      await rawRun('DELETE FROM lib_messages WHERE block_id = ?', [bid]);
+    }
+    await rawRun('DELETE FROM lib_blocks WHERE cm_type_id = ?', [cm.id]);
+    await rawRun('DELETE FROM lib_em_roles WHERE cm_type_id = ?', [cm.id]);
+  }
+  await rawRun('DELETE FROM lib_cm_types WHERE project_id IS NULL');
+  await rawRun('DELETE FROM user_cm_block_prefs WHERE project_id IS NULL');
+
+  for (const comp of origComposites) {
+    const modeIds = (await rawAll('SELECT id FROM composite_matrix_modes WHERE composite_id = ?', [comp.id])).map(r => r.id);
+    for (const mid of modeIds) await rawRun('DELETE FROM composite_matrix_cells WHERE mode_id = ?', [mid]);
+    await rawRun('DELETE FROM composite_matrix_modes WHERE composite_id = ?', [comp.id]);
+    await rawRun('DELETE FROM composite_matrix_columns WHERE composite_id = ?', [comp.id]);
+    await rawRun('DELETE FROM composite_cm_connections WHERE composite_id = ?', [comp.id]);
+    await rawRun('DELETE FROM composite_cm_members WHERE composite_id = ?', [comp.id]);
+  }
+  await rawRun('DELETE FROM composite_cm_types WHERE project_id IS NULL');
+
+  // unit_instances.unit_type_id points at the original (soon-to-be-deleted) row.
+  // Repoint every instance to the first project's clone of its unit type before
+  // the originals are removed — an instance always belongs to exactly one
+  // project, so that project's own clone is the correct target.
+  for (const ut of origUnitTypes) {
+    const instances = await rawAll('SELECT id, project_id FROM unit_instances WHERE unit_type_id = ?', [ut.id]);
+    for (const inst of instances) {
+      const clone = await rawAll(
+        'SELECT id FROM unit_types WHERE project_id = ? AND name = ? LIMIT 1',
+        [inst.project_id, ut.name]
+      );
+      if (clone.length) {
+        await rawRun('UPDATE unit_instances SET unit_type_id = ? WHERE id = ?', [clone[0].id, inst.id]);
+      }
+    }
+  }
+
+  for (const ut of origUnitTypes) {
+    const memberIds = (await rawAll('SELECT id FROM unit_type_members WHERE unit_type_id = ?', [ut.id])).map(r => r.id);
+    for (const mid of memberIds) await rawRun('DELETE FROM unit_type_member_roles WHERE member_id = ?', [mid]);
+    await rawRun('DELETE FROM unit_type_members WHERE unit_type_id = ?', [ut.id]);
+    await rawRun('DELETE FROM unit_type_member_connections WHERE unit_type_id = ?', [ut.id]);
+  }
+  await rawRun('DELETE FROM unit_types WHERE project_id IS NULL');
+
+  // 5) Now that every row has an owner, enforce NOT NULL + the new per-project
+  // uniqueness. Old global UNIQUE(name) constraints are dropped first (their
+  // auto-generated names follow Postgres's default <table>_<col>_key pattern).
+  await rawRun('ALTER TABLE lib_cm_types ALTER COLUMN project_id SET NOT NULL');
+  await rawRun('ALTER TABLE lib_cm_types DROP CONSTRAINT IF EXISTS lib_cm_types_name_key');
+  await rawRun('CREATE UNIQUE INDEX IF NOT EXISTS uq_lib_cm_types_proj_name ON lib_cm_types(project_id, name)');
+
+  await rawRun('ALTER TABLE composite_cm_types ALTER COLUMN project_id SET NOT NULL');
+  await rawRun('ALTER TABLE composite_cm_types DROP CONSTRAINT IF EXISTS composite_cm_types_name_key');
+  await rawRun('CREATE UNIQUE INDEX IF NOT EXISTS uq_composite_cm_types_proj_name ON composite_cm_types(project_id, name)');
+
+  await rawRun('ALTER TABLE unit_types ALTER COLUMN project_id SET NOT NULL');
+  await rawRun('ALTER TABLE unit_types DROP CONSTRAINT IF EXISTS unit_types_name_key');
+  await rawRun('CREATE UNIQUE INDEX IF NOT EXISTS uq_unit_types_proj_name ON unit_types(project_id, name)');
+
+  await rawRun('ALTER TABLE user_cm_block_prefs ALTER COLUMN project_id SET NOT NULL');
+  await rawRun('ALTER TABLE user_cm_block_prefs DROP CONSTRAINT IF EXISTS user_cm_block_prefs_cm_type_name_key');
+  await rawRun('CREATE UNIQUE INDEX IF NOT EXISTS uq_user_cm_block_prefs_proj_name ON user_cm_block_prefs(project_id, cm_type_name)');
+
+  console.log('[DB] Migration: library/composites/unit-types are now project-scoped');
+}
+
+// Collapses duplicate (project_id, name) clones left behind by an interrupted
+// earlier run of migrateLibraryToProjectScope() — keeps the clone with the most
+// child rows (the most complete one) per (project_id, name) group and deletes
+// the rest, repointing unit_instances first so no FK is left dangling. A no-op
+// once the migration has run cleanly (there are never duplicates then).
+async function dedupePartialProjectClones() {
+  const hasProjectId = (await tableColumns('lib_cm_types')).includes('project_id');
+  if (!hasProjectId) return; // nothing to dedupe before project_id even exists
+
+  // lib_cm_types: keep the one with the most lib_blocks.
+  const cmDupes = await rawAll(`
+    SELECT project_id, name, array_agg(id ORDER BY id) AS ids
+    FROM lib_cm_types WHERE project_id IS NOT NULL
+    GROUP BY project_id, name HAVING COUNT(*) > 1
+  `);
+  for (const d of cmDupes) {
+    const scored = [];
+    for (const id of d.ids) {
+      const n = (await rawGet('SELECT COUNT(*) AS n FROM lib_blocks WHERE cm_type_id = ?', [id])).n;
+      scored.push({ id, n: Number(n) });
+    }
+    scored.sort((a, b) => b.n - a.n);
+    const [, ...losers] = scored;
+    for (const l of losers) {
+      const blockIds = (await rawAll('SELECT id FROM lib_blocks WHERE cm_type_id = ?', [l.id])).map(r => r.id);
+      for (const bid of blockIds) {
+        const varIds = (await rawAll('SELECT id FROM lib_variables WHERE block_id = ?', [bid])).map(r => r.id);
+        for (const vid of varIds) await rawRun('DELETE FROM lib_var_links WHERE var_id = ?', [vid]);
+        await rawRun('DELETE FROM lib_variables WHERE block_id = ?', [bid]);
+        await rawRun('DELETE FROM lib_messages WHERE block_id = ?', [bid]);
+      }
+      await rawRun('DELETE FROM lib_blocks WHERE cm_type_id = ?', [l.id]);
+      await rawRun('DELETE FROM lib_em_roles WHERE cm_type_id = ?', [l.id]);
+      await rawRun('DELETE FROM lib_cm_types WHERE id = ?', [l.id]);
+    }
+  }
+
+  // composite_cm_types: keep the one with the most composite_cm_members.
+  const compDupes = await rawAll(`
+    SELECT project_id, name, array_agg(id ORDER BY id) AS ids
+    FROM composite_cm_types WHERE project_id IS NOT NULL
+    GROUP BY project_id, name HAVING COUNT(*) > 1
+  `);
+  for (const d of compDupes) {
+    const scored = [];
+    for (const id of d.ids) {
+      const n = (await rawGet('SELECT COUNT(*) AS n FROM composite_cm_members WHERE composite_id = ?', [id])).n;
+      scored.push({ id, n: Number(n) });
+    }
+    scored.sort((a, b) => b.n - a.n);
+    const [, ...losers] = scored;
+    for (const l of losers) {
+      const modeIds = (await rawAll('SELECT id FROM composite_matrix_modes WHERE composite_id = ?', [l.id])).map(r => r.id);
+      for (const mid of modeIds) await rawRun('DELETE FROM composite_matrix_cells WHERE mode_id = ?', [mid]);
+      await rawRun('DELETE FROM composite_matrix_modes WHERE composite_id = ?', [l.id]);
+      await rawRun('DELETE FROM composite_matrix_columns WHERE composite_id = ?', [l.id]);
+      await rawRun('DELETE FROM composite_cm_connections WHERE composite_id = ?', [l.id]);
+      await rawRun('DELETE FROM composite_cm_members WHERE composite_id = ?', [l.id]);
+      await rawRun('DELETE FROM composite_cm_types WHERE id = ?', [l.id]);
+    }
+  }
+
+  // unit_types: keep the one with the most unit_type_members; repoint any
+  // unit_instances pointing at a loser to the winner first.
+  const utDupes = await rawAll(`
+    SELECT project_id, name, array_agg(id ORDER BY id) AS ids
+    FROM unit_types WHERE project_id IS NOT NULL
+    GROUP BY project_id, name HAVING COUNT(*) > 1
+  `);
+  for (const d of utDupes) {
+    const scored = [];
+    for (const id of d.ids) {
+      const n = (await rawGet('SELECT COUNT(*) AS n FROM unit_type_members WHERE unit_type_id = ?', [id])).n;
+      scored.push({ id, n: Number(n) });
+    }
+    scored.sort((a, b) => b.n - a.n);
+    const [winner, ...losers] = scored;
+    for (const l of losers) {
+      await rawRun('UPDATE unit_instances SET unit_type_id = ? WHERE unit_type_id = ?', [winner.id, l.id]);
+      const memberIds = (await rawAll('SELECT id FROM unit_type_members WHERE unit_type_id = ?', [l.id])).map(r => r.id);
+      for (const mid of memberIds) await rawRun('DELETE FROM unit_type_member_roles WHERE member_id = ?', [mid]);
+      await rawRun('DELETE FROM unit_type_members WHERE unit_type_id = ?', [l.id]);
+      await rawRun('DELETE FROM unit_type_member_connections WHERE unit_type_id = ?', [l.id]);
+      await rawRun('DELETE FROM unit_types WHERE id = ?', [l.id]);
+    }
+  }
+
+  // user_cm_block_prefs: keep any one (no children) — just collapse exact dupes.
+  const prefDupes = await rawAll(`
+    SELECT project_id, cm_type_name, array_agg(id ORDER BY id) AS ids
+    FROM user_cm_block_prefs WHERE project_id IS NOT NULL
+    GROUP BY project_id, cm_type_name HAVING COUNT(*) > 1
+  `);
+  for (const d of prefDupes) {
+    const [, ...losers] = d.ids;
+    for (const id of losers) await rawRun('DELETE FROM user_cm_block_prefs WHERE id = ?', [id]);
+  }
+
+  const total = cmDupes.length + compDupes.length + utDupes.length + prefDupes.length;
+  if (total > 0) {
+    console.log(`[DB] Migration: cleaned up ${total} duplicate clone group(s) left by an earlier partial run`);
+  }
 }
 
 module.exports = { initDb, getDb, ensureSchema };

@@ -8,7 +8,7 @@ import {
   getLibraryStatus, previewLibraryUpload, computeLibraryDiff, importLibrary,
   getCmTypes, getCmTypeBlocks, getCmTypeBlockPrefs, saveCmTypeBlockPrefs, patchVarDefault, patchVarValid, toggleBlockConditional,
   generateXML, generateXMLStream, getHistory,
-  listProjects, getProject, saveProject, deleteProject,
+  listProjects, getProject, saveProject, deleteProject, deleteProjectInstance,
   deleteCmType,
   getUnitTypes, getUnitType, createUnitType, updateUnitType, deleteUnitType,
   getUnitTypeConnections, saveUnitTypeConnections, deleteUnitTypeConnection, getCmTypeVariablesForUnit,
@@ -17,9 +17,11 @@ import {
   listCompositeCmTypes, getCompositeCmType, createCompositeCmType, updateCompositeCmType, deleteCompositeCmType,
   getProjectConfig, saveProjectConfig, parseProjectXml,
   getUserProjectConfig, saveUserProjectConfig, parseUserProjectXml,
+  addUserProjectDevice, updateUserProjectDevice, deleteUserProjectDevice,
   getValveCommands, saveValveCommands,
   getIoConnections, createIoConnection, updateIoConnection, deleteIoConnection,
-  generateConnections, getConnectionIOs,
+  generateConnections, getConnectionIOs, exportSimit,
+  listHwControllers,
   ingestIoRowsSplitByAs,
   getLatestIoImport, getIOHeaders,
   runReconciliation, getReconciliationInstances,
@@ -33,6 +35,8 @@ import SignalMappingModal from "./SignalMappingModal.jsx";
 import ExportPreviewModal from "./ExportPreviewModal.jsx";
 import UnitConnectionsEditor from "./UnitConnectionsEditor.jsx";
 import LibraryImportReview from "./LibraryImportReview.jsx";
+import LibraryAuditLog from "./LibraryAuditLog.jsx";
+import LibraryExportImportPanel from "./LibraryExportImport.jsx";
 import UnitTypeImportModal from "./UnitTypeImportModal.jsx";
 import InstanceConflictModal from "./InstanceConflictModal.jsx";
 import UnitTypeSpirograph from "./UnitTypeSpirograph.jsx";
@@ -108,6 +112,7 @@ export default function App() {
   const [valveCommands, setValveCommands]   = useState([]);    // user-editable mode command lookup
   const [userProjectConfigModal, setUserProjectConfigModal] = useState(null); // { userProjectName, projectId }
   const [userProjectConfigRefresh, setUserProjectConfigRefresh] = useState({}); // userProjectName -> bump counter
+  const [hwControllers, setHwControllers] = useState([]); // hw_controllers rows for the active project
 
   // ── Unit Connections state ─────────────────────────────────────────────────
   const [unitConnections, setUnitConnections]           = useState({});     // unitTypeId -> connections[]
@@ -129,9 +134,19 @@ export default function App() {
     }
   }, [location.pathname]);
 
-  // Check library status on mount + load unit types + composite types
+  // Load hw controllers for the Instances grid's controller picker. Refreshed on
+  // entering Instances (6) or HW Config (7) so edits made in HW Config show up.
   useEffect(() => {
-    getLibraryStatus()
+    if (!savedProjectId || (step !== 6 && step !== 7)) return;
+    listHwControllers(savedProjectId).then(setHwControllers).catch(() => setHwControllers([]));
+  }, [savedProjectId, step]);
+
+  // Check library status + load unit types + composite types whenever the
+  // active project changes. These are all project-scoped now, so nothing to
+  // load until a project is selected/saved (savedProjectId becomes non-null).
+  useEffect(() => {
+    if (!savedProjectId) return;
+    getLibraryStatus(savedProjectId)
       .then(s => {
         setLibStatus(s);
         if (s.cm_count > 0) loadCmTypes();
@@ -140,7 +155,7 @@ export default function App() {
     loadUnitTypes();
     loadCompositeCmTypesList();
     loadValveCommands();
-  }, []);
+  }, [savedProjectId]);
 
   // Two-phase render for the Instances tab (step 6): the grid renders 2000 rows
   // synchronously, which blocks the main thread for several seconds and prevents
@@ -165,11 +180,13 @@ export default function App() {
   }
 
   async function loadUnitTypes() {
-    try { setUnitTypes(await getUnitTypes()); } catch (_) {}
+    if (!savedProjectId) { setUnitTypes([]); return; }
+    try { setUnitTypes(await getUnitTypes(savedProjectId)); } catch (_) {}
   }
 
   async function loadCompositeCmTypesList() {
-    try { setCompositeCmTypes(await listCompositeCmTypes()); } catch (_) {}
+    if (!savedProjectId) { setCompositeCmTypes([]); return; }
+    try { setCompositeCmTypes(await listCompositeCmTypes(savedProjectId)); } catch (_) {}
   }
 
   async function loadUnitInstances(projectId) {
@@ -186,8 +203,8 @@ export default function App() {
   async function loadUnitTypeConnections(unitTypeId) {
     try {
       const [conns, vars] = await Promise.all([
-        getUnitTypeConnections(unitTypeId),
-        getCmTypeVariablesForUnit(unitTypeId)
+        getUnitTypeConnections(savedProjectId, unitTypeId),
+        getCmTypeVariablesForUnit(savedProjectId, unitTypeId)
       ]);
       setUnitConnections(prev => ({ ...prev, [unitTypeId]: conns }));
       setCmTypeVarCache(vars);
@@ -199,7 +216,7 @@ export default function App() {
   async function saveUnitConnectionsEditor(unitTypeId, connections) {
     setError("");
     try {
-      await saveUnitTypeConnections(unitTypeId, connections, true);
+      await saveUnitTypeConnections(savedProjectId, unitTypeId, connections, true);
       setUnitConnections(prev => ({ ...prev, [unitTypeId]: connections }));
     } catch (err) {
       const msg = `Failed to save connections: ${err.message}`;
@@ -209,7 +226,7 @@ export default function App() {
   }
 
   async function loadCmTypes() {
-    const types = await getCmTypes();
+    const types = await getCmTypes(savedProjectId);
     setCmTypes(types);
     setProfiles(types.map(cm => ({
       id:            cm.name,
@@ -230,13 +247,13 @@ export default function App() {
   async function ensureBlocksLoaded(cmTypeName) {
     const existing = cmtProfiles.find(p => p.id === cmTypeName);
     if (existing?.subBlocks && existing?.roles !== null) return existing; // already fully loaded
-    const detail = await getCmTypeBlocks(cmTypeName);
+    const detail = await getCmTypeBlocks(savedProjectId, cmTypeName);
 
     // Load saved user preferences for enabled blocks
     let enabledBlocks = existing?.enabledBlocks;
     if (!enabledBlocks) {
       try {
-        const prefs = await getCmTypeBlockPrefs(cmTypeName);
+        const prefs = await getCmTypeBlockPrefs(savedProjectId, cmTypeName);
         if (prefs?.enabledBlocks?.length > 0) {
           enabledBlocks = prefs.enabledBlocks;
         }
@@ -264,10 +281,10 @@ export default function App() {
     setError("");
     setImportDiff(null);
     try {
-      const r = await previewLibraryUpload(file, pct => setLoading(`Uploading… ${pct}%`));
+      const r = await previewLibraryUpload(savedProjectId, file, pct => setLoading(`Uploading… ${pct}%`));
       setLoading("Computing diff…");
       // Compute diff to show what will change
-      const diff = await computeLibraryDiff(r.token);
+      const diff = await computeLibraryDiff(savedProjectId, r.token);
       setLoading("");
       setImportPreview({ token: r.token });
       setImportDiff(diff);
@@ -281,12 +298,12 @@ export default function App() {
     setLoading("Importing selected types…");
     setError("");
     try {
-      const r = await importLibrary(importPreview.token, [...selectedNames]);
+      const r = await importLibrary(savedProjectId, importPreview.token, [...selectedNames]);
       setImportPreview(null);
       setImportDiff(null);
       setLoading(`Imported ${r.new} new, ${r.updated} updated, ${r.blocks} blocks, ${r.vars} vars`);
       await loadCmTypes();
-      const status = await getLibraryStatus();
+      const status = await getLibraryStatus(savedProjectId);
       setLibStatus(status);
       setTimeout(() => { setLoading(""); }, 1200);
     } catch (e) {
@@ -298,11 +315,11 @@ export default function App() {
   async function handleDeleteCmType(name) {
     if (!window.confirm(`Remove "${name}" from the library?`)) return;
     try {
-      await deleteCmType(name);
-      const types = await getCmTypes();
+      await deleteCmType(savedProjectId, name);
+      const types = await getCmTypes(savedProjectId);
       setCmTypes(types);
       setProfiles(prev => prev.filter(p => p.id !== name));
-      const status = await getLibraryStatus();
+      const status = await getLibraryStatus(savedProjectId);
       setLibStatus(status);
     } catch (e) {
       setError(e.message);
@@ -351,6 +368,7 @@ export default function App() {
           instanceName:     i.instance_name,
           samplingTime:     i.sampling_time || "1000",
           userProject:      i.user_project || "",
+          hwControllerId:   i.hw_controller_id != null ? String(i.hw_controller_id) : "",
           folderId:         i.folder_id != null ? dbToClient[i.folder_id] || "" : "",
           roleAssignments:  i.role_assignments || {},
           compositeGroupId: i.composite_group_id ?? undefined,
@@ -401,6 +419,7 @@ export default function App() {
         instance_name:      i.instanceName,
         sampling_time:      i.samplingTime,
         user_project:       i.userProject || null,
+        hw_controller_id:   i.hwControllerId ? Number(i.hwControllerId) : null,
         folder_client_id:   i.folderId || null,
         role_assignments:   i.roleAssignments || {},
         composite_group_id: i.compositeGroupId ?? null,
@@ -458,7 +477,7 @@ export default function App() {
         ? p.enabledBlocks.filter(b => b !== blockName)
         : [...(p.enabledBlocks || []), blockName];
       // Save to database
-      saveCmTypeBlockPrefs(profileId, nextEnabled).catch(err => {
+      saveCmTypeBlockPrefs(savedProjectId, profileId, nextEnabled).catch(err => {
         console.error('Failed to save block preferences:', err);
       });
       return { ...p, enabledBlocks: nextEnabled };
@@ -502,7 +521,7 @@ export default function App() {
   // memberFolders: { memberIdx -> folderId } – each member's assigned folder (manual placement, no hierarchy rules)
   // When manually adding (not from import/generation), ignore composite type's hierarchy_folder rules
   async function addCompositeInstances({ compositeId, baseName, memberFolders = {}, userProject }) {
-    const detail = await getCompositeCmType(compositeId);
+    const detail = await getCompositeCmType(savedProjectId, compositeId);
 
     const members = detail.members || [];
     if (!members.length) return;
@@ -524,12 +543,15 @@ export default function App() {
       if (existingNames.has(name)) return; // skip duplicate (e.g. shared project-scope instance)
       existingNames.add(name);
       const memberConnections = extractMemberConnections(detail, i);
+      const resolvedUserProject = userProject || userProjects[0] || "";
+      const matchingController = hwControllers.find(c => c.user_project === resolvedUserProject);
       newInstances.push({
         id:              groupId + i,
         profileId:       m.cm_type_name || cmtProfiles[0]?.id || "",
         instanceName:    name,
         samplingTime:    "1000",
-        userProject:     userProject || userProjects[0] || "",
+        userProject:     resolvedUserProject,
+        hwControllerId:  matchingController ? String(matchingController.id) : "",
         folderId:        memberFolderIds[i] || "",
         roleAssignments: {},
         source:          "manual",
@@ -558,20 +580,50 @@ export default function App() {
         const p = cmtProfiles.find(x => x.id === i.profileId);
         return !preferredLibType || p?.libType === preferredLibType;
       });
+      // Default to the first controller (if any); userProject is derived from it.
+      const defaultController = hwControllers[0];
       return [...prev, {
         id:              Date.now(),
         profileId:       defaultProfile?.id || "",
         instanceName:    `${prefix}${String(sameType.length + 1).padStart(3, "0")}`,
         samplingTime:    "1000",
-        userProject:     userProjects[0] || "",
+        userProject:     defaultController?.user_project || "",
+        hwControllerId:  defaultController ? String(defaultController.id) : "",
         folderId:        leaves[0]?.id || "",
         roleAssignments: {},
         source:          "manual",
       }];
     });
   }
-  function removeInstance(id)     { setInstances(p => p.filter(i => i.id !== id)); }
-  function updateInstance(id,k,v) { setInstances(p => p.map(i => i.id === id ? {...i,[k]:v} : i)); }
+  async function removeInstance(id) {
+    const inst = instances.find(i => i.id === id);
+    if (!inst) return;
+
+    // Delete from database first if instance has been saved
+    if (savedProjectId && inst.instanceName) {
+      try {
+        await deleteProjectInstance(savedProjectId, inst.instanceName);
+      } catch (err) {
+        setError(`Failed to delete instance: ${err.message}`);
+        return; // Don't remove from UI if delete failed
+      }
+    }
+
+    // Only remove from UI after successful database deletion
+    setInstances(p => p.filter(i => i.id !== id));
+  }
+  function updateInstance(id,k,v) {
+    setInstances(p => p.map(i => {
+      if (i.id !== id) return i;
+      // Picking a controller also derives userProject from it — generation still
+      // groups instances by that string, so the two must stay in sync client-side.
+      if (k === "hwControllerId") {
+        const ctrl = hwControllers.find(c => String(c.id) === String(v));
+        return { ...i, hwControllerId: v, userProject: ctrl?.user_project || "" };
+      }
+      return { ...i, [k]: v };
+    }));
+  }
   function updateInstanceRole(id, role, assignedInstanceName) {
     setInstances(p => p.map(i => {
       if (i.id !== id) return i;
@@ -587,7 +639,7 @@ export default function App() {
     setError("");
     try {
       if (!userProjects.length) throw new Error("Define at least one user project");
-      if (instances.some(i => !i.userProject)) throw new Error("Every instance must be assigned to a user project");
+      if (instances.some(i => !i.userProject)) throw new Error("Every instance must be assigned to a controller that belongs to a user project — assign one in the Instances grid, or set the controller's user project in HW Config");
 
       // Build the payload — enabledBlocks must be loaded for each used CM type.
       // Keep each ensureBlocksLoaded() result: it calls setProfiles(), but that
@@ -615,6 +667,8 @@ export default function App() {
           instanceName:     inst.instanceName,
           samplingTime:     inst.samplingTime,
           userProject:      inst.userProject,
+          // Routes this instance to its controller's <Device> during generation.
+          hwControllerId:   inst.hwControllerId ? Number(inst.hwControllerId) : null,
           folderId:         folderClientToDb[inst.folderId] ?? null,
           enabledBlocks:    profile?.enabledBlocks || [],
           roleAssignments:  inst.roleAssignments || {},
@@ -812,12 +866,13 @@ export default function App() {
           )}
           {step === 3 && (
             <StepLibrary libStatus={libStatus} loading={loading}
+              projectId={savedProjectId}
               onUpload={handleUpload}
               cmtProfiles={cmtProfiles} ensureLoaded={ensureBlocksLoaded} toggleBlock={toggleBlock}
               onDelete={handleDeleteCmType}
               onCompositesChange={loadCompositeCmTypesList}
               onToggleConditional={async (blockId, isConditional) => {
-                await toggleBlockConditional(blockId, isConditional);
+                await toggleBlockConditional(savedProjectId, blockId, isConditional);
                 setProfiles(prev => prev.map(p => {
                   if (!p.subBlocks) return p;
                   return { ...p, subBlocks: p.subBlocks.map(b =>
@@ -844,7 +899,14 @@ export default function App() {
                 }));
               }}
               valveCommands={valveCommands}
-              onValveCommandsChange={loadValveCommands} />
+              onValveCommandsChange={loadValveCommands}
+              onLibraryImported={async () => {
+                // loadCmTypes() resets each profile's enabledBlocks/subBlocks to null,
+                // which is what forces ensureBlocksLoaded to refetch from the server.
+                await loadCmTypes();
+                await loadCompositeCmTypesList();
+                try { setLibStatus(await getLibraryStatus(savedProjectId)); } catch (_) {}
+              }} />
           )}
           {importDiff && (
             <LibraryImportReview
@@ -914,6 +976,7 @@ export default function App() {
             <StepInstances instances={instances} cmtProfiles={cmtProfiles}
               userProjects={userProjects} savedProjectName={savedProjectName}
               savedProjectId={savedProjectId}
+              hwControllers={hwControllers}
               hierarchy={hierarchy}
               compositeCmTypes={compositeCmTypes}
               addInstance={addInstance} removeInstance={removeInstance}
@@ -924,7 +987,7 @@ export default function App() {
               saveProjectNow={saveProjectNow}
               onGenerate={handleGenerate}
               setError={setError}
-              getCompositeCmType={getCompositeCmType}
+              getCompositeCmType={(id) => getCompositeCmType(savedProjectId, id)}
               extractMemberConnections={extractMemberConnections}
               valveCommands={valveCommands}
               setInstances={setInstances}
@@ -935,6 +998,7 @@ export default function App() {
               projectId={savedProjectId}
               pendingHwMapping={pendingHwMapping}
               onPendingHwMappingConsumed={() => setPendingHwMapping(null)}
+              userProjects={userProjects}
             />
           )}
           {step === 8 && (
@@ -1229,14 +1293,8 @@ function StepProjects({ loading, savedProjectName, savedProjectId,
 const PCS7_CONFIG_FIELDS = [
   { key: "project_name",    label: "Project Name"    },
   { key: "project_id_val",  label: "Project ID"      },
-  { key: "device_name",     label: "Device Name"     },
-  { key: "device_id",       label: "Device ID"       },
-  { key: "cpu_id",          label: "CPU ID"          },
   { key: "process_cell",    label: "Process Cell"    },
   { key: "process_cell_id", label: "Process Cell ID" },
-  { key: "unit_name",       label: "Unit Name"       },
-  { key: "unit_id",         label: "Unit ID"         },
-  { key: "cm_folder_id",    label: "CM Folder ID"    },
   { key: "export_user",     label: "Export User"     },
   { key: "unit_author",     label: "Unit Author"     },
 ];
@@ -1244,9 +1302,12 @@ const PCS7_CONFIG_FIELDS = [
 function Pcs7ConfigPanel({ projectId, userProjectName, refreshToken, setError }) {
   const [expanded, setExpanded] = useState(false);
   const [config, setConfig]     = useState(null);
+  const [devices, setDevices]   = useState([]);
   const [loaded, setLoaded]     = useState(false);
-  const [draft, setDraft]       = useState(null);  // editing state
+  const [draft, setDraft]       = useState(null);  // editing project-level fields
+  const [deviceDraft, setDeviceDraft] = useState(null);  // editing a controller row { id, device_name, device_id, cpu_id }
   const [saving, setSaving]     = useState(false);
+  const [deviceSaving, setDeviceSaving] = useState(false);
   const [parseMsg, setParseMsg] = useState("");
   const fileRef = useRef(null);
 
@@ -1257,6 +1318,7 @@ function Pcs7ConfigPanel({ projectId, userProjectName, refreshToken, setError })
     try {
       const c = await getUserProjectConfig(projectId, userProjectName);
       setConfig(c);
+      setDevices(c?.devices || []);
     } catch (e) { setError(e.message); }
     finally { setLoaded(true); }
   }
@@ -1294,6 +1356,7 @@ function Pcs7ConfigPanel({ projectId, userProjectName, refreshToken, setError })
           setParseMsg(`Project Name in XML ('${response.extractedName}') does not match '${userProjectName}' — use the upload button to resolve.`);
         } else {
           setConfig(response.config);
+          setDevices(response.devices || []);
           setParseMsg(response.missing?.length
             ? `Loaded. Not found in XML: ${response.missing.join(", ")}`
             : "All fields extracted successfully.");
@@ -1304,6 +1367,48 @@ function Pcs7ConfigPanel({ projectId, userProjectName, refreshToken, setError })
     } finally {
         e.target.value = "";
     }
+  }
+
+  async function handleAddDevice() {
+    if (!projectId || !deviceDraft?.device_name?.trim()) return;
+    setDeviceSaving(true);
+    try {
+      const response = await addUserProjectDevice(projectId, userProjectName, {
+        device_name: deviceDraft.device_name.trim(),
+        device_id: deviceDraft.device_id || null,
+        cpu_id: deviceDraft.cpu_id || null,
+      });
+      setDevices(response.devices || []);
+      setDeviceDraft(null);
+    } catch (e) { setError(e.message); }
+    finally { setDeviceSaving(false); }
+  }
+
+  async function handleUpdateDevice(deviceId) {
+    if (!projectId || !deviceDraft?.device_name?.trim() || deviceDraft.id !== deviceId) return;
+    setDeviceSaving(true);
+    try {
+      const response = await updateUserProjectDevice(projectId, userProjectName, deviceId, {
+        device_name: deviceDraft.device_name.trim(),
+        device_id: deviceDraft.device_id || null,
+        cpu_id: deviceDraft.cpu_id || null,
+      });
+      setDevices(response.devices || []);
+      setDeviceDraft(null);
+    } catch (e) { setError(e.message); }
+    finally { setDeviceSaving(false); }
+  }
+
+  async function handleDeleteDevice(deviceId) {
+    if (!projectId) return;
+    if (!window.confirm('Delete this controller?')) return;
+    setDeviceSaving(true);
+    try {
+      const response = await deleteUserProjectDevice(projectId, userProjectName, deviceId);
+      setDevices(response.devices || []);
+      if (deviceDraft?.id === deviceId) setDeviceDraft(null);
+    } catch (e) { setError(e.message); }
+    finally { setDeviceSaving(false); }
   }
 
   if (!projectId) return null;
@@ -1352,7 +1457,145 @@ function Pcs7ConfigPanel({ projectId, userProjectName, refreshToken, setError })
               )}
             </div>
 
-            {/* Field table */}
+            {/* Controllers table (always visible, even while editing project fields) */}
+            {devices.length > 0 && (
+              <div style={{ marginBottom: 12 }}>
+                <div style={{ fontSize: 12, fontWeight: 500, color: "var(--color-text-secondary)", marginBottom: 6 }}>
+                  Controllers ({devices.length})
+                </div>
+                <div style={{ border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-md)",
+                    overflow: "hidden", marginBottom: 8 }}>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1.6fr 1.6fr 60px",
+                      background: "var(--color-background-secondary)",
+                      borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
+                    {["Device Name", "Device ID", "CPU ID", ""].map(h => (
+                      <div key={h} style={{ padding: "5px 10px", fontSize: 12, fontWeight: 500,
+                          color: "var(--color-text-secondary)" }}>
+                        {h}
+                      </div>
+                    ))}
+                  </div>
+                  {devices.map((d, idx) => {
+                    const isEditing = deviceDraft?.id === d.id;
+                    return (
+                      <div key={d.id ?? d.device_id ?? idx} style={{ display: "grid", gridTemplateColumns: "1fr 1.6fr 1.6fr 60px",
+                          borderBottom: idx < devices.length - 1 ? "0.5px solid var(--color-border-tertiary)" : "none", alignItems: "center" }}>
+                        <div style={{ padding: "5px 10px", fontSize: 12, fontFamily: "var(--font-mono)",
+                            borderLeft: idx > 0 ? "0.5px solid var(--color-border-tertiary)" : "none" }}>
+                          {isEditing ? (
+                            <input value={deviceDraft.device_name || ""} onChange={e => setDeviceDraft(d => ({ ...d, device_name: e.target.value }))}
+                              style={{ width: "100%", padding: "2px 4px", fontSize: 12, fontFamily: "var(--font-mono)",
+                                border: "0.5px solid var(--color-border-secondary)", borderRadius: "3px",
+                                background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
+                          ) : (
+                            <span style={{ color: "var(--color-text-primary)" }}>
+                              {d.device_name || <em style={{ color: "var(--color-text-secondary)" }}>— default</em>}
+                            </span>
+                          )}
+                        </div>
+                        <div style={{ padding: "5px 10px", fontSize: 12, fontFamily: "var(--font-mono)",
+                            borderLeft: "0.5px solid var(--color-border-tertiary)" }}>
+                          {isEditing ? (
+                            <input value={deviceDraft.device_id || ""} onChange={e => setDeviceDraft(d => ({ ...d, device_id: e.target.value }))}
+                              style={{ width: "100%", padding: "2px 4px", fontSize: 12, fontFamily: "var(--font-mono)",
+                                border: "0.5px solid var(--color-border-secondary)", borderRadius: "3px",
+                                background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
+                          ) : (
+                            <span style={{ color: "var(--color-text-primary)" }}>
+                              {d.device_id || <em style={{ color: "var(--color-text-secondary)" }}>— default</em>}
+                            </span>
+                          )}
+                        </div>
+                        <div style={{ padding: "5px 10px", fontSize: 12, fontFamily: "var(--font-mono)",
+                            borderLeft: "0.5px solid var(--color-border-tertiary)" }}>
+                          {isEditing ? (
+                            <input value={deviceDraft.cpu_id || ""} onChange={e => setDeviceDraft(d => ({ ...d, cpu_id: e.target.value }))}
+                              style={{ width: "100%", padding: "2px 4px", fontSize: 12, fontFamily: "var(--font-mono)",
+                                border: "0.5px solid var(--color-border-secondary)", borderRadius: "3px",
+                                background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
+                          ) : (
+                            <span style={{ color: "var(--color-text-primary)" }}>
+                              {d.cpu_id || <em style={{ color: "var(--color-text-secondary)" }}>— default</em>}
+                            </span>
+                          )}
+                        </div>
+                        <div style={{ padding: "5px 8px", fontSize: 12, display: "flex", gap: 4, justifyContent: "center",
+                            borderLeft: "0.5px solid var(--color-border-tertiary)" }}>
+                          {isEditing ? (
+                            <>
+                              <button onClick={() => handleUpdateDevice(d.id)} disabled={deviceSaving}
+                                style={{ background: "transparent", border: "none", cursor: deviceSaving ? "default" : "pointer",
+                                  color: deviceSaving ? "#999" : "#166534", fontSize: 14, padding: 0 }}
+                                title="Save">
+                                <i className="ti ti-check" />
+                              </button>
+                              <button onClick={() => setDeviceDraft(null)} disabled={deviceSaving}
+                                style={{ background: "transparent", border: "none", cursor: deviceSaving ? "default" : "pointer",
+                                  color: deviceSaving ? "#999" : "#6B6862", fontSize: 14, padding: 0 }}
+                                title="Cancel">
+                                <i className="ti ti-x" />
+                              </button>
+                            </>
+                          ) : (
+                            <>
+                              <button onClick={() => setDeviceDraft({ id: d.id, device_name: d.device_name || "", device_id: d.device_id || "", cpu_id: d.cpu_id || "" })}
+                                style={{ background: "transparent", border: "none", cursor: "pointer",
+                                  color: "#0891B2", fontSize: 14, padding: 0, transition: "color 0.2s" }}
+                                onMouseEnter={e => e.target.style.color = "#0369A1"}
+                                onMouseLeave={e => e.target.style.color = "#0891B2"}
+                                title="Edit">
+                                <i className="ti ti-pencil" />
+                              </button>
+                              <button onClick={() => handleDeleteDevice(d.id)}
+                                style={{ background: "transparent", border: "none", cursor: "pointer",
+                                  color: "#6B6862", fontSize: 14, padding: 0, transition: "color 0.2s" }}
+                                onMouseEnter={e => e.target.style.color = "#DC2626"}
+                                onMouseLeave={e => e.target.style.color = "#6B6862"}
+                                title="Delete">
+                                <i className="ti ti-trash" />
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Add controller inline form */}
+            {deviceDraft?.id === null ? (
+              <div style={{ marginBottom: 12 }}>
+                <div style={{ fontSize: 12, fontWeight: 500, color: "var(--color-text-secondary)", marginBottom: 6 }}>
+                  New Controller
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <input placeholder="Device Name" value={deviceDraft.device_name || ""} onChange={e => setDeviceDraft(d => ({ ...d, device_name: e.target.value }))}
+                    style={{ flex: 1, padding: "6px 8px", fontSize: 12, fontFamily: "var(--font-mono)",
+                      border: "0.5px solid var(--color-border-secondary)", borderRadius: "3px",
+                      background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
+                  <input placeholder="Device ID" value={deviceDraft.device_id || ""} onChange={e => setDeviceDraft(d => ({ ...d, device_id: e.target.value }))}
+                    style={{ flex: 1.2, padding: "6px 8px", fontSize: 12, fontFamily: "var(--font-mono)",
+                      border: "0.5px solid var(--color-border-secondary)", borderRadius: "3px",
+                      background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
+                  <input placeholder="CPU ID" value={deviceDraft.cpu_id || ""} onChange={e => setDeviceDraft(d => ({ ...d, cpu_id: e.target.value }))}
+                    style={{ flex: 1.2, padding: "6px 8px", fontSize: 12, fontFamily: "var(--font-mono)",
+                      border: "0.5px solid var(--color-border-secondary)", borderRadius: "3px",
+                      background: "var(--color-background-primary)", color: "var(--color-text-primary)" }} />
+                  <Btn primary onClick={handleAddDevice} disabled={deviceSaving}>
+                    {deviceSaving ? "…" : "Add"}
+                  </Btn>
+                  <Btn onClick={() => setDeviceDraft(null)}>Cancel</Btn>
+                </div>
+              </div>
+            ) : (
+              <Btn onClick={() => setDeviceDraft({ id: null, device_name: "", device_id: "", cpu_id: "" })} style={{ marginBottom: 12 }}>
+                <i className="ti ti-plus" /> Add Controller
+              </Btn>
+            )}
+
+            {/* Project-level fields table */}
             {draft ? (
               <>
                 <div style={{ display: "grid", gridTemplateColumns: "160px 1fr",
@@ -1409,6 +1652,7 @@ function Pcs7ConfigPanel({ projectId, userProjectName, refreshToken, setError })
                     );
                   })}
                 </div>
+
                 <Btn onClick={startEdit}><i className="ti ti-edit" /> Edit</Btn>
               </>
             )}
@@ -1424,9 +1668,11 @@ const LIBRARY_SUBTABS = [
   { key: "config",    label: "Type Configuration"   },
   { key: "composite", label: "Composite CM Types"   },
   { key: "commands",  label: "Mode Commands"        },
+  { key: "exportimport", label: "Export / Import"   },
+  { key: "audit",     label: "Audit Log"            },
 ];
 
-function StepLibrary({ libStatus, loading, onUpload, cmtProfiles, ensureLoaded, toggleBlock, onDelete, onVarDefaultChange, onVarValidChange, onCompositesChange, onToggleConditional, valveCommands, onValveCommandsChange }) {
+function StepLibrary({ libStatus, loading, onUpload, cmtProfiles, ensureLoaded, toggleBlock, onDelete, onVarDefaultChange, onVarValidChange, onCompositesChange, onToggleConditional, valveCommands, onValveCommandsChange, onLibraryImported, projectId }) {
   const [libSubTab, setLibSubTab] = useState("upload");
 
   return (
@@ -1458,13 +1704,20 @@ function StepLibrary({ libStatus, loading, onUpload, cmtProfiles, ensureLoaded, 
             toggleBlock={toggleBlock} onDelete={onDelete}
             onToggleConditional={onToggleConditional}
             onVarDefaultChange={onVarDefaultChange}
-            onVarValidChange={onVarValidChange} />
+            onVarValidChange={onVarValidChange}
+            projectId={projectId} />
         )}
         {libSubTab === "composite" && (
-          <CompositeCmPanel cmtProfiles={cmtProfiles} ensureLoaded={ensureLoaded} onCompositesChange={onCompositesChange} valveCommands={valveCommands} />
+          <CompositeCmPanel cmtProfiles={cmtProfiles} ensureLoaded={ensureLoaded} onCompositesChange={onCompositesChange} valveCommands={valveCommands} projectId={projectId} />
         )}
         {libSubTab === "commands" && (
           <ModeCommandsPanel valveCommands={valveCommands} onValveCommandsChange={onValveCommandsChange} />
+        )}
+        {libSubTab === "exportimport" && (
+          <LibraryExportImportPanel onImported={onLibraryImported} projectId={projectId} />
+        )}
+        {libSubTab === "audit" && (
+          <LibraryAuditLog projectId={projectId} />
         )}
     </div>
   );
@@ -1524,7 +1777,7 @@ const DETAIL_TABS = [
   { key: "outputs", label: "Outputs" },
 ];
 
-function CmtPanel({ cmtProfiles, ensureLoaded, toggleBlock, onDelete, onVarDefaultChange, onVarValidChange, onToggleConditional }) {
+function CmtPanel({ cmtProfiles, ensureLoaded, toggleBlock, onDelete, onVarDefaultChange, onVarValidChange, onToggleConditional, projectId }) {
   const [search, setSearch]         = useState("");
   const [libTab, setLibTab]         = useState("all");
   const [selected, setSelected]     = useState(cmtProfiles[0]?.id || "");
@@ -1734,6 +1987,7 @@ function CmtPanel({ cmtProfiles, ensureLoaded, toggleBlock, onDelete, onVarDefau
                           <VarTable
                             vars={detailTab === "inputs" ? inputVars : outputVars}
                             cmTypeName={profile.id}
+                            projectId={projectId}
                             editable={detailTab === "inputs"}
                             showValid={true}
                             onVarDefaultChange={(varId, newVal) => onVarDefaultChange?.(profile.id, varId, newVal)}
@@ -1767,7 +2021,7 @@ class VarTableErrorBoundary extends React.Component {
   }
 }
 
-function VarTable({ vars, cmTypeName, editable, showValid, onVarDefaultChange, onVarValidChange }) {
+function VarTable({ vars, cmTypeName, projectId, editable, showValid, onVarDefaultChange, onVarValidChange }) {
   const gridRef = useRef(null);
   const [validSaving, setValidSaving] = useState({});
   const draftsRef = useRef({});
@@ -1787,7 +2041,7 @@ function VarTable({ vars, cmTypeName, editable, showValid, onVarDefaultChange, o
     if (newVal === (v.val || "")) return;
     try {
         console.log(`[VarTable] Saving var ${v.id} (${v.name}) in ${cmTypeName}: "${v.val}" → "${newVal}"`);
-        const result = await patchVarDefault(cmTypeName, v.id, newVal);
+        const result = await patchVarDefault(projectId, cmTypeName, v.id, newVal);
         console.log(`[VarTable] Save successful:`, result);
         onVarDefaultChange?.(v.id, newVal);
     } catch (err) {
@@ -1820,7 +2074,7 @@ function VarTable({ vars, cmTypeName, editable, showValid, onVarDefaultChange, o
     const next = !v.isValid;
     setValidSaving(s => ({ ...s, [v.id]: true }));
     try {
-        await patchVarValid(cmTypeName, v.id, next);
+        await patchVarValid(projectId, cmTypeName, v.id, next);
         onVarValidChange?.(v.id, next);
     } catch (_) {}
     finally { setValidSaving(s => { const n = {...s}; delete n[v.id]; return n; }); }
@@ -1942,6 +2196,9 @@ function VarTable({ vars, cmTypeName, editable, showValid, onVarDefaultChange, o
   }, [validSaving, editable, showValid, vars]);
 
   const getRowId = useCallback(p => String(p.data.id || p.data.name), []);
+  const getRowClass = useCallback(p => {
+    return p.data.isValid ? 'ag-row-valid-for-wiring' : '';
+  }, []);
 
   return (
     <div className="ig-root" style={{ width: '100%', height: '100%', overflowY: 'auto', background: '#FFFFFF' }}>
@@ -1953,6 +2210,7 @@ function VarTable({ vars, cmTypeName, editable, showValid, onVarDefaultChange, o
         columnDefs={columnDefs}
         defaultColDef={defaultColDef}
         getRowId={getRowId}
+        getRowClass={getRowClass}
         animateRows={false}
       />
     </div>
@@ -2089,7 +2347,7 @@ function ModeCommandsPanel({ valveCommands, onValveCommandsChange }) {
 const EMPTY_COMPOSITE = { name: "", description: "", members: [], is_matrix: false, matrixColumns: [], matrixModes: [] };
 const EMPTY_MEMBER    = { cm_type_name: "", hierarchy_folder: "", name_prefix: "", name_suffix: "", scope: "unit", roles: {} };
 
-function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valveCommands }) {
+function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valveCommands, projectId }) {
   const [composites, setComposites]   = useState([]);
   const [selectedId, setSelectedId]   = useState(null);
   const [editing, setEditing]         = useState(null);   // draft being edited
@@ -2145,7 +2403,7 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
       for (const comp of composites) {
         if (comp.id === selectedId) continue; // Skip current composite
         try {
-          const detail = await getCompositeCmType(comp.id);
+          const detail = await getCompositeCmType(projectId, comp.id);
           for (const member of (detail.members || [])) {
             if (member.cm_type_name) {
               members.push({
@@ -2197,7 +2455,7 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
   });
 
   async function load() {
-    try { setComposites(await listCompositeCmTypes()); } catch (e) { setLocalErr(e.message); }
+    try { setComposites(await listCompositeCmTypes(projectId)); } catch (e) { setLocalErr(e.message); }
   }
 
   function startNew() {
@@ -2245,6 +2503,7 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
     const results = await Promise.all(
         missing.map(m =>
           getIoConnections(
+            projectId,
             // We need the lib_cm_types.id — look it up from cmtProfiles
             cmtProfiles.find(p => p.cmType === m.cm_type_name)?.id
           ).catch(() => null)
@@ -2262,7 +2521,7 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
     setLocalErr("");
     setWire({ type: "interconnection", fromIdx: "", fromVar: "", toIdx: "", toVar: "", staticValue: "", valueMode: "static", column: "", prefix: "", suffix: "" });
     try {
-        const detail = await getCompositeCmType(id);
+        const detail = await getCompositeCmType(projectId, id);
         const members = detail.members || [];
         setEditing({
           name:          detail.name,
@@ -2305,9 +2564,9 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
           matrixModes:   editing.is_matrix ? (editing.matrixModes || []) : [],
         };
         if (selectedId) {
-          await updateCompositeCmType(selectedId, payload);
+          await updateCompositeCmType(projectId, selectedId, payload);
         } else {
-          const r = await createCompositeCmType(payload);
+          const r = await createCompositeCmType(projectId, payload);
           setSelectedId(r.id);
         }
         await load();
@@ -2321,7 +2580,7 @@ function CompositeCmPanel({ cmtProfiles, ensureLoaded, onCompositesChange, valve
     if (!window.confirm(`Delete composite "${comp?.name}"?`)) return;
     setBusy(true);
     try {
-        await deleteCompositeCmType(id);
+        await deleteCompositeCmType(projectId, id);
         if (selectedId === id) { setSelectedId(null); setEditing(null); }
         await load();
         onCompositesChange?.();
@@ -3960,7 +4219,7 @@ function FolderRow({ folder, all, depth, onAdd, onUpdate, onDelete }) {
 
 // ── Instance row (shared across tabs) ────────────────────────────────────────
 // ── Composite instance creation modal ────────────────────────────────────────
-function CompositeInstanceModal({ compositeCmTypes, folderOptions, userProjects, onConfirm, onCancel }) {
+function CompositeInstanceModal({ compositeCmTypes, folderOptions, userProjects, onConfirm, onCancel, getCompositeCmType }) {
   const [compositeId, setCompositeId] = useState(compositeCmTypes[0]?.id?.toString() || "");
   const [baseName,    setBaseName]    = useState("");
   const [rootFolderId, setRootFolderId] = useState(folderOptions[0]?.id || "");
@@ -4239,9 +4498,10 @@ function RolePanel({ inst, profile, instances, cmtProfiles, updateInstanceRole }
 }
 
 // ── Instance sub-tab (list + optional role panel) ─────────────────────────────
-function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, folderOptions, hasHierarchy,
+function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, hwControllers, folderOptions, hasHierarchy,
     addInstance, removeInstance, updateInstance, updateInstanceRole, ensureLoaded, savedProjectId, saveProjectNow, setError = () => {}, getCompositeCmType, extractMemberConnections, setInstances, compositeCmTypes, valveCommands, loadProjectIntoState,
-    reconData, setReconData, reconModal, setReconModal, reconSummary, setReconSummary }) {
+    reconData, setReconData, reconModal, setReconModal, reconSummary, setReconSummary,
+    onAddComposite, onRunReconciliation, onViewOverview }) {
   const [selectedId, setSelectedId] = useState(null);
   const [mapInst, setMapInst] = useState(null);   // instance whose signal-mapping modal is open
   const [exportPreview, setExportPreview] = useState(null); // instance for export preview { projectId, instanceName, cmTypeName }
@@ -4331,6 +4591,7 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
             rowData={tabInstances}
             cmtProfiles={cmtProfiles}
             userProjects={userProjects}
+            hwControllers={hwControllers}
             folderOptions={folderOptions}
             onRowUpdate={(id, field, value) => updateInstance(id, field, value)}
             onRowDelete={(id) => removeInstance(id)}
@@ -4388,6 +4649,9 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
                 });
               }
             } : undefined}
+            onAddComposite={onAddComposite}
+            onRunReconciliation={onRunReconciliation}
+            onViewOverview={onViewOverview}
           />
         </div>
 
@@ -4442,6 +4706,7 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, fol
 }
 
 function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName, savedProjectId,
+    hwControllers,
     hierarchy, compositeCmTypes, addInstance, removeInstance, updateInstance,
     updateInstanceRole, addCompositeInstances, ensureLoaded, loading, generating, saveProjectNow, onGenerate, setError,
     getCompositeCmType, extractMemberConnections, valveCommands, setInstances, loadProjectIntoState }) {
@@ -4449,20 +4714,27 @@ function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName,
   const folderOptions  = allFolderOptions(hierarchy || []);
   const hasHierarchy   = (hierarchy?.length || 0) > 0;
   const folderMissing  = hasHierarchy && instances.some(i => !i.folderId);
-  // Every instance must belong to a user project — generation groups instances by
-  // their userProject field and filters by it. Instances without it contribute
-  // zero rows to every group and cause generation to fail.
-  const userProjectMissing = useMemo(
-    () => instances.filter(i => !i.userProject).map(i => i.instanceName),
+  // Every instance must name a controller — generation routes each one to that
+  // controller's <Device>. An unassigned instance would silently land nowhere,
+  // so block generation and name the offenders instead of guessing a default.
+  const unassignedInstances = useMemo(
+    () => instances.filter(i => !i.hwControllerId).map(i => i.instanceName),
     [instances]
   );
-  const hasUserProjectMissing = userProjectMissing.length > 0;
+  const controllerMissing = unassignedInstances.length > 0;
+  // Map raw hw_controllers rows to the {id, name, userProject} shape InstancesGrid expects.
+  const controllerOptions = useMemo(() => (hwControllers || []).map(c => ({
+    id: String(c.id),
+    name: c.T16_Controller_TagName || `Controller #${c.id}`,
+    userProject: c.user_project || null,
+  })), [hwControllers]);
   const [compModal, setCompModal] = useState(false);
   const [reconData, setReconData] = useState({});
   const [reconInstances, setReconInstances] = useState([]);
   const [reconModal, setReconModal] = useState(false);
   const [reconSummary, setReconSummary] = useState({});
   const [runningRecon, setRunningRecon] = useState(false);
+  const [reconLoading, setReconLoading] = useState(false);
 
   // Sub-tab state: CM | EM | EPH
   const [instTab, setInstTab] = useState("ControlModule");
@@ -4476,6 +4748,7 @@ function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName,
 
   async function loadReconData() {
     if (!savedProjectId) { setReconData({}); setReconInstances([]); setReconSummary({}); return; }
+    setReconLoading(true);
     try {
       const { summary, instances: insts } = await getReconciliationInstances(savedProjectId);
       setReconSummary(summary || {});
@@ -4494,10 +4767,25 @@ function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName,
     } catch (err) {
       console.error('Failed to load reconciliation data:', err);
       setReconData({}); setReconInstances([]); setReconSummary({});
+    } finally {
+      setReconLoading(false);
     }
   }
 
   useEffect(() => { loadReconData(); }, [savedProjectId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Re-read the DB whenever the grid's contents change. removeInstance() lives in a
+  // parent component and deletes rows without touching reconInstances, so without
+  // this the orphan diff below compares against a pre-delete snapshot and reports
+  // every just-deleted instance as an orphan. Keyed on the name list (not the array
+  // identity) so unrelated re-renders and in-place field edits don't refetch.
+  const instanceNameKey = useMemo(
+    () => instances.map(i => i.instanceName).sort().join(' '),
+    [instances]
+  );
+  useEffect(() => {
+    if (savedProjectId) loadReconData();
+  }, [instanceNameKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function handleRunReconciliation() {
     if (!savedProjectId || runningRecon) return;
@@ -4513,10 +4801,50 @@ function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName,
     }
   }
 
-  const commonTabProps = { instances, cmtProfiles, userProjects, folderOptions, hasHierarchy,
+  // Rows that exist in project_instances but are absent from this grid. The grid
+  // renders local state, so such rows are unreachable by removeInstance() — they
+  // survive "delete all" and then trip the workflow's duplicate-name gate with
+  // `Instance "X" already exists in project`. reconInstances is the live DB read.
+  const [purgingOrphans, setPurgingOrphans] = useState(false);
+  const orphanNames = useMemo(() => {
+    // Suppress while a read is in flight: reconInstances is still the pre-delete
+    // snapshot until it resolves, and showing it would name rows that are already
+    // gone. Better to show nothing for a moment than to accuse the wrong rows.
+    if (!savedProjectId || reconLoading || !reconInstances.length) return [];
+    const shown = new Set(instances.map(i => i.instanceName));
+    return reconInstances.map(r => r.instanceName).filter(n => n && !shown.has(n));
+  }, [reconInstances, instances, savedProjectId, reconLoading]);
+
+  async function handlePurgeOrphans() {
+    if (!savedProjectId || !orphanNames.length || purgingOrphans) return;
+    if (!window.confirm(
+      `Permanently delete ${orphanNames.length} orphaned instance(s) from the database?\n\n`
+      + orphanNames.join(', ')
+      + '\n\nThis also removes their IOs, derived values, matrix overrides, signal '
+      + 'mappings and resolved connections. This cannot be undone.'
+    )) return;
+    setPurgingOrphans(true);
+    const failed = [];
+    try {
+      for (const name of orphanNames) {
+        try { await deleteProjectInstance(savedProjectId, name); }
+        catch (err) { failed.push(`${name} (${err.message})`); }
+      }
+      await loadReconData();
+      if (failed.length) setError(`Failed to delete: ${failed.join('; ')}`);
+    } finally {
+      setPurgingOrphans(false);
+    }
+  }
+
+  const commonTabProps = { instances, cmtProfiles, userProjects, hwControllers: controllerOptions, folderOptions, hasHierarchy,
     addInstance, removeInstance, updateInstance, updateInstanceRole, ensureLoaded, savedProjectId,
     saveProjectNow, setError, getCompositeCmType, extractMemberConnections, setInstances, compositeCmTypes, valveCommands, loadProjectIntoState,
-    reconData, setReconData, reconModal, setReconModal, reconSummary, setReconSummary };
+    reconData, setReconData, reconModal, setReconModal, reconSummary, setReconSummary,
+    onAddComposite: compositeCmTypes?.length > 0 && !noUserProjects ? () => setCompModal(true) : undefined,
+    onRunReconciliation: instances.length > 0 && !!savedProjectId && !runningRecon ? handleRunReconciliation : undefined,
+    onViewOverview: instances.length > 0 && !!savedProjectId ? () => setReconModal(true) : undefined,
+  };
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
@@ -4530,20 +4858,15 @@ function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName,
             {instances.length} total · {hasHierarchy ? "folder assigned per instance" : "no hierarchy defined — all instances in default folder"}
           </div>
         </div>
-        {compositeCmTypes?.length > 0 && (
-          <Btn onClick={() => setCompModal(true)} disabled={noUserProjects}>
-            <i className="ti ti-layout-grid" /> Add Composite
+        {savedProjectId && (
+          <Btn onClick={() => exportSimit(savedProjectId)} disabled={!instances.length}
+            style={{ background: "#b7410e", color: "white", border: "none", fontWeight: 500 }}>
+            <i className="ti ti-file-spreadsheet" /> SIMIT Export
           </Btn>
         )}
-        <Btn onClick={handleRunReconciliation} disabled={!instances.length || !savedProjectId || runningRecon}>
-          <i className="ti ti-refresh" /> {runningRecon ? "Running…" : "Run Reconciliation"}
-        </Btn>
-        <Btn onClick={() => setReconModal(true)} disabled={!instances.length || !savedProjectId}>
-          <i className="ti ti-list-check" /> View Overview
-        </Btn>
         <Btn primary onClick={onGenerate}
             disabled={!instances.length || !!loading || generating || noUserProjects
-              || hasUserProjectMissing || folderMissing}>
+              || instances.some(i => !i.userProject) || folderMissing || controllerMissing}>
           <i className="ti ti-code" /> {generating ? "Generating…" : (loading || "Generate XML")}
         </Btn>
       </div>
@@ -4553,6 +4876,7 @@ function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName,
           compositeCmTypes={compositeCmTypes}
           folderOptions={folderOptions}
           userProjects={userProjects}
+          getCompositeCmType={getCompositeCmType}
           onConfirm={async (args) => { setCompModal(false); await addCompositeInstances(args); }}
           onCancel={() => setCompModal(false)} />
       )}
@@ -4566,13 +4890,13 @@ function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName,
         />
       )}
 
-      {hasUserProjectMissing && (
+      {controllerMissing && (
         <div style={{ background: "#FEE2E2", border: "1px solid #FCA5A5", borderRadius: "var(--border-radius-md)",
             padding: "7px 12px", marginBottom: "0.5rem", fontSize: 12, color: "#991B1B", flexShrink: 0 }}>
-          <b>{userProjectMissing.length} instance{userProjectMissing.length === 1 ? "" : "s"} without a user project assignment.</b>{" "}
-          Assign a user project via the <b>Controller</b> column before generating:{" "}
-          {userProjectMissing.slice(0, 8).join(", ")}
-          {userProjectMissing.length > 8 && ` … and ${userProjectMissing.length - 8} more`}
+          <b>{unassignedInstances.length} instance{unassignedInstances.length === 1 ? "" : "s"} without a controller.</b>{" "}
+          Assign one in the <b>Controller</b> column before generating:{" "}
+          {unassignedInstances.slice(0, 8).join(", ")}
+          {unassignedInstances.length > 8 && ` … and ${unassignedInstances.length - 8} more`}
         </div>
       )}
 
@@ -4580,6 +4904,22 @@ function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName,
         <div style={{ background: "#FEF3C7", border: "1px solid #FCD34D", borderRadius: "var(--border-radius-md)",
             padding: "7px 12px", marginBottom: "0.5rem", fontSize: 12, color: "#92400E", flexShrink: 0 }}>
           Define at least one user project on the Projects step before adding instances.
+        </div>
+      )}
+
+      {orphanNames.length > 0 && (
+        <div style={{ background: "#FEF3C7", border: "1px solid #FCD34D", borderRadius: "var(--border-radius-md)",
+            padding: "7px 12px", marginBottom: "0.5rem", fontSize: 12, color: "#92400E", flexShrink: 0,
+            display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ flex: 1 }}>
+            <b>{orphanNames.length} instance{orphanNames.length === 1 ? "" : "s"} in the database {orphanNames.length === 1 ? "is" : "are"} not shown in this grid.</b>{" "}
+            They will block the automated workflow with a duplicate-name error:{" "}
+            {orphanNames.slice(0, 8).join(", ")}
+            {orphanNames.length > 8 && ` … and ${orphanNames.length - 8} more`}
+          </div>
+          <Btn onClick={handlePurgeOrphans} disabled={purgingOrphans}>
+            <i className="ti ti-trash" /> {purgingOrphans ? "Removing…" : `Remove ${orphanNames.length}`}
+          </Btn>
         </div>
       )}
 
@@ -4821,7 +5161,7 @@ function StepUnitTypes({
   async function loadCompositeMeta(compositeId) {
     if (!compositeId) return;
     try {
-      const detail = await getCompositeCmType(compositeId);
+      const detail = await getCompositeCmType(savedProjectId, compositeId);
       setCompDetails(prev => ({ ...prev, [compositeId]: detail }));
       for (const cm of (detail.members || [])) {
         const prof = cmtProfiles.find(p => p.id === cm.cm_type_name);
@@ -4835,7 +5175,7 @@ function StepUnitTypes({
   async function selectType(id) {
     setSelectedTypeId(id);
     try {
-      const detail = await getUnitType(id);
+      const detail = await getUnitType(savedProjectId, id);
       setEditDraft({
         name:        detail.name,
         description: detail.description || "",
@@ -4864,7 +5204,7 @@ function StepUnitTypes({
     const name = `Unit Type ${unitTypes.length + 1}`;
     setBusy(true);
     try {
-      const ut = await createUnitType({ name, description: "" });
+      const ut = await createUnitType(savedProjectId, { name, description: "" });
       await onUnitTypesChange();
       selectType(ut.id);
     } catch (e) { setError(e.message); }
@@ -4875,7 +5215,7 @@ function StepUnitTypes({
     if (!selectedTypeId || !editDraft) return;
     setBusy(true);
     try {
-      await updateUnitType(selectedTypeId, editDraft);
+      await updateUnitType(savedProjectId, selectedTypeId, editDraft);
       await onUnitTypesChange();
     } catch (e) { setError(e.message); }
     finally { setBusy(false); }
@@ -4885,7 +5225,7 @@ function StepUnitTypes({
     if (!confirm("Delete this unit type?")) return;
     setBusy(true);
     try {
-      await deleteUnitType(id);
+      await deleteUnitType(savedProjectId, id);
       if (selectedTypeId === id) { setSelectedTypeId(null); setEditDraft(null); }
       await onUnitTypesChange();
     } catch (e) { setError(e.message); }
@@ -5313,6 +5653,7 @@ function StepUnitTypes({
         isOpen={importModalOpen}
         onClose={() => setImportModalOpen(false)}
         compositeCmTypes={compositeCmTypes}
+        projectId={savedProjectId}
         onImportSuccess={(result) => {
           setImportModalOpen(false);
           setToast(`Unit type "${result.unitName}" imported successfully!`);

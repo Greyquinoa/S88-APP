@@ -399,10 +399,13 @@ router.post('/imports/:id/promote', async (req, res) => {
 
 // ── Column mappings CRUD ──────────────────────────────────────────────────────
 // GET /api/eph-em/column-maps
-router.get('/column-maps', async (req, res) => {
+// ── Column Mappings (project-scoped) ──────────────────────────────────────────
+
+router.get('/project/:projectId/column-maps', async (req, res) => {
   try {
     const db = getDb();
-    const maps = await db.prepare('SELECT id, name, description FROM eph_em_column_mappings ORDER BY id DESC').all();
+    const projectId = parseInt(req.params.projectId, 10);
+    const maps = await db.prepare('SELECT id, name, description FROM eph_em_column_mappings WHERE project_id = ? ORDER BY id DESC').all(projectId);
     res.json(maps || []);
   } catch (e) {
     console.error('[EPH-EM column-maps GET]', e.message);
@@ -410,12 +413,13 @@ router.get('/column-maps', async (req, res) => {
   }
 });
 
-// GET /api/eph-em/column-maps/:id
-router.get('/column-maps/:id', async (req, res) => {
+// GET /api/projects/:projectId/eph-em/column-maps/:id
+router.get('/project/:projectId/column-maps/:id', async (req, res) => {
   try {
     const db = getDb();
+    const projectId = parseInt(req.params.projectId, 10);
     const id = parseInt(req.params.id, 10);
-    const map = await db.prepare('SELECT * FROM eph_em_column_mappings WHERE id = ?').get(id);
+    const map = await db.prepare('SELECT * FROM eph_em_column_mappings WHERE id = ? AND project_id = ?').get(id, projectId);
     if (!map) return err(res, 404, 'Not found');
     try {
       map.mappings = JSON.parse(map.mappings || '{}');
@@ -429,17 +433,18 @@ router.get('/column-maps/:id', async (req, res) => {
   }
 });
 
-// POST /api/eph-em/column-maps
-router.post('/column-maps', async (req, res) => {
+// POST /api/projects/:projectId/eph-em/column-maps
+router.post('/project/:projectId/column-maps', async (req, res) => {
   try {
     const db = getDb();
+    const projectId = parseInt(req.params.projectId, 10);
     const { name, description, mappings } = req.body;
     if (!name) return err(res, 400, 'name required');
 
     const result = await db.prepare(`
-      INSERT INTO eph_em_column_mappings (name, description, mappings)
-      VALUES (?, ?, ?)
-    `).run(name, description || null, JSON.stringify(mappings || {}));
+      INSERT INTO eph_em_column_mappings (project_id, name, description, mappings)
+      VALUES (?, ?, ?, ?)
+    `).run(projectId, name, description || null, JSON.stringify(mappings || {}));
 
     res.json({ id: result.lastInsertRowid, name, description });
   } catch (e) {
@@ -448,10 +453,11 @@ router.post('/column-maps', async (req, res) => {
   }
 });
 
-// PATCH /api/eph-em/column-maps/:id
-router.patch('/column-maps/:id', async (req, res) => {
+// PATCH /api/projects/:projectId/eph-em/column-maps/:id
+router.patch('/project/:projectId/column-maps/:id', async (req, res) => {
   try {
     const db = getDb();
+    const projectId = parseInt(req.params.projectId, 10);
     const id = parseInt(req.params.id, 10);
     const { name, description, mappings } = req.body;
 
@@ -461,8 +467,8 @@ router.patch('/column-maps/:id', async (req, res) => {
           description = COALESCE(?, description),
           mappings = COALESCE(?, mappings),
           updated_at = NOW()
-      WHERE id = ?
-    `).run(name || null, description || null, mappings ? JSON.stringify(mappings) : null, id);
+      WHERE id = ? AND project_id = ?
+    `).run(name || null, description || null, mappings ? JSON.stringify(mappings) : null, id, projectId);
 
     res.json({ success: true });
   } catch (e) {
@@ -471,12 +477,13 @@ router.patch('/column-maps/:id', async (req, res) => {
   }
 });
 
-// DELETE /api/eph-em/column-maps/:id
-router.delete('/column-maps/:id', async (req, res) => {
+// DELETE /api/projects/:projectId/eph-em/column-maps/:id
+router.delete('/project/:projectId/column-maps/:id', async (req, res) => {
   try {
     const db = getDb();
+    const projectId = parseInt(req.params.projectId, 10);
     const id = parseInt(req.params.id, 10);
-    await db.prepare('DELETE FROM eph_em_column_mappings WHERE id = ?').run(id);
+    await db.prepare('DELETE FROM eph_em_column_mappings WHERE id = ? AND project_id = ?').run(id, projectId);
     res.json({ success: true });
   } catch (e) {
     console.error('[EPH-EM column-maps DELETE]', e.message);
@@ -484,14 +491,15 @@ router.delete('/column-maps/:id', async (req, res) => {
   }
 });
 
-// ── Function mappings CRUD ────────────────────────────────────────────────────
-// GET /api/eph-em/function-map-configs
-router.get('/function-map-configs', async (req, res) => {
+// ── Function mappings CRUD (project-scoped) ───────────────────────────────────
+// GET /api/projects/:projectId/eph-em/function-map-configs
+router.get('/project/:projectId/function-map-configs', async (req, res) => {
   try {
     const db = getDb();
+    const projectId = parseInt(req.params.projectId, 10);
     const configs = await db.prepare(`
-      SELECT id, name, description FROM eph_em_function_map_configs ORDER BY id DESC
-    `).all();
+      SELECT id, name, description FROM eph_em_function_map_configs WHERE project_id = ? ORDER BY id DESC
+    `).all(projectId);
     res.json(configs || []);
   } catch (e) {
     console.error('[EPH-EM function-map-configs GET]', e.message);
@@ -499,17 +507,18 @@ router.get('/function-map-configs', async (req, res) => {
   }
 });
 
-// POST /api/eph-em/function-map-configs
-router.post('/function-map-configs', async (req, res) => {
+// POST /api/projects/:projectId/eph-em/function-map-configs
+router.post('/project/:projectId/function-map-configs', async (req, res) => {
   try {
     const db = getDb();
+    const projectId = parseInt(req.params.projectId, 10);
     const { name, description } = req.body;
     if (!name) return err(res, 400, 'name required');
 
     const result = await db.prepare(`
-      INSERT INTO eph_em_function_map_configs (name, description)
-      VALUES (?, ?)
-    `).run(name, description || null);
+      INSERT INTO eph_em_function_map_configs (project_id, name, description)
+      VALUES (?, ?, ?)
+    `).run(projectId, name, description || null);
 
     res.json({ id: result.lastInsertRowid, name, description });
   } catch (e) {
@@ -518,14 +527,15 @@ router.post('/function-map-configs', async (req, res) => {
   }
 });
 
-// ── Type mapping configs CRUD ─────────────────────────────────────────────────
-// GET /api/eph-em/type-mapping-configs
-router.get('/type-mapping-configs', async (req, res) => {
+// ── Type mapping configs CRUD (project-scoped) ────────────────────────────────
+// GET /api/projects/:projectId/eph-em/type-mapping-configs
+router.get('/project/:projectId/type-mapping-configs', async (req, res) => {
   try {
     const db = getDb();
+    const projectId = parseInt(req.params.projectId, 10);
     const configs = await db.prepare(`
-      SELECT id, name, mappings FROM eph_em_type_mapping_configs ORDER BY id DESC
-    `).all();
+      SELECT id, name, mappings FROM eph_em_type_mapping_configs WHERE project_id = ? ORDER BY id DESC
+    `).all(projectId);
     res.json(configs || []);
   } catch (e) {
     console.error('[EPH-EM type-mapping-configs GET]', e.message);
@@ -533,17 +543,18 @@ router.get('/type-mapping-configs', async (req, res) => {
   }
 });
 
-// POST /api/eph-em/type-mapping-configs
-router.post('/type-mapping-configs', async (req, res) => {
+// POST /api/projects/:projectId/eph-em/type-mapping-configs
+router.post('/project/:projectId/type-mapping-configs', async (req, res) => {
   try {
     const db = getDb();
+    const projectId = parseInt(req.params.projectId, 10);
     const { name, mappings } = req.body;
     if (!name) return err(res, 400, 'name required');
 
     const result = await db.prepare(`
-      INSERT INTO eph_em_type_mapping_configs (name, mappings)
-      VALUES (?, ?)
-    `).run(name, JSON.stringify(mappings || {}));
+      INSERT INTO eph_em_type_mapping_configs (project_id, name, mappings)
+      VALUES (?, ?, ?)
+    `).run(projectId, name, JSON.stringify(mappings || {}));
 
     res.json({ id: result.lastInsertRowid, name, mappings });
   } catch (e) {
@@ -552,10 +563,11 @@ router.post('/type-mapping-configs', async (req, res) => {
   }
 });
 
-// PATCH /api/eph-em/type-mapping-configs/:id
-router.patch('/type-mapping-configs/:id', async (req, res) => {
+// PATCH /api/projects/:projectId/eph-em/type-mapping-configs/:id
+router.patch('/project/:projectId/type-mapping-configs/:id', async (req, res) => {
   try {
     const db = getDb();
+    const projectId = parseInt(req.params.projectId, 10);
     const id = parseInt(req.params.id, 10);
     const { name, mappings } = req.body;
 
@@ -564,8 +576,8 @@ router.patch('/type-mapping-configs/:id', async (req, res) => {
       SET name = COALESCE(?, name),
           mappings = COALESCE(?, mappings),
           updated_at = NOW()
-      WHERE id = ?
-    `).run(name || null, mappings ? JSON.stringify(mappings) : null, id);
+      WHERE id = ? AND project_id = ?
+    `).run(name || null, mappings ? JSON.stringify(mappings) : null, id, projectId);
 
     res.json({ success: true });
   } catch (e) {
@@ -574,12 +586,13 @@ router.patch('/type-mapping-configs/:id', async (req, res) => {
   }
 });
 
-// DELETE /api/eph-em/type-mapping-configs/:id
-router.delete('/type-mapping-configs/:id', async (req, res) => {
+// DELETE /api/projects/:projectId/eph-em/type-mapping-configs/:id
+router.delete('/project/:projectId/type-mapping-configs/:id', async (req, res) => {
   try {
     const db = getDb();
+    const projectId = parseInt(req.params.projectId, 10);
     const id = parseInt(req.params.id, 10);
-    await db.prepare('DELETE FROM eph_em_type_mapping_configs WHERE id = ?').run(id);
+    await db.prepare('DELETE FROM eph_em_type_mapping_configs WHERE id = ? AND project_id = ?').run(id, projectId);
     res.json({ success: true });
   } catch (e) {
     console.error('[EPH-EM type-mapping-configs DELETE]', e.message);

@@ -126,11 +126,11 @@ function buildUnitMemberStructure(assignment, interconnections = [], aliasPrefix
  *   - extractedCms: string[]
  *   - db: database connection
  */
-async function validateCmTypesExist(extractedCms, db) {
+async function validateCmTypesExist(extractedCms, db, projectId) {
   const missing = [];
 
   for (const cmName of extractedCms) {
-    const row = await db.prepare('SELECT id FROM lib_cm_types WHERE name = ?').get(cmName);
+    const row = await db.prepare('SELECT id FROM lib_cm_types WHERE name = ? AND project_id = ?').get(cmName, projectId);
     if (!row) {
       missing.push(cmName);
     }

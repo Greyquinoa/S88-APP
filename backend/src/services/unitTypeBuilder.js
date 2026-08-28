@@ -19,7 +19,7 @@
  * Output:
  *   - { id: unitTypeId, name: unitName, memberCount, connectionCount }
  */
-async function createUnitTypeFromAssignment(unitName, description, unitMembers, connections, db) {
+async function createUnitTypeFromAssignment(unitName, description, unitMembers, connections, db, projectId) {
   // Validate inputs
   if (!unitName || !unitName.trim()) {
     throw new Error('unitName is required');
@@ -33,7 +33,7 @@ async function createUnitTypeFromAssignment(unitName, description, unitMembers, 
   for (const member of unitMembers) {
     const compositeId = member.compositeCmId ?? null;
     if (compositeId != null) {
-      const comp = await db.prepare('SELECT id FROM composite_cm_types WHERE id = ?').get(compositeId);
+      const comp = await db.prepare('SELECT id FROM composite_cm_types WHERE id = ? AND project_id = ?').get(compositeId, projectId);
       if (!comp) {
         throw new Error(`Composite CM Type with id ${compositeId} not found`);
       }
@@ -46,8 +46,8 @@ async function createUnitTypeFromAssignment(unitName, description, unitMembers, 
   const txn = db.transaction(async () => {
     // 1. Insert unit type
     const utRow = await db.prepare(
-      'INSERT INTO unit_types (name, description) VALUES (?, ?)'
-    ).run(unitName.trim(), description?.trim() || '');
+      'INSERT INTO unit_types (project_id, name, description) VALUES (?, ?, ?)'
+    ).run(projectId, unitName.trim(), description?.trim() || '');
 
     const unitTypeId = utRow.lastInsertRowid;
 

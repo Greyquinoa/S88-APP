@@ -26,6 +26,7 @@ const moduleParametersRoutes = require('./routes/moduleParameters');
 const workflowRoutes       = require('./routes/workflow');
 const instanceConflictRoutes = require('./routes/instanceConflicts');
 const reconciliationRoutes = require('./routes/reconciliation');
+const simitExportRoutes    = require('./routes/simitExport');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -43,12 +44,16 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '10mb' }));
 
-app.use('/api/library',    libraryRoutes);
-app.use('/api/cm-types',  libraryRoutes);
+// Library / CM-types / Composite CM types are project-scoped — mounted nested
+// under /api/projects/:projectId/... so every route in these routers sees
+// req.params.projectId. (Kept as separate app.use() calls, matching how
+// projectRoutes itself is mounted, rather than nesting inside projectRoutes.)
+app.use('/api/projects/:projectId/library',            libraryRoutes);
+app.use('/api/projects/:projectId/cm-types',            libraryRoutes);
+app.use('/api/projects/:projectId/composite-cm-types',  compositeCmRoutes);
 app.use('/api/generate',  generateRoutes);
 app.use('/api/projects',  projectRoutes);
 app.use('/api/unit-types',        unitTypeRoutes);
-app.use('/api/composite-cm-types', compositeCmRoutes);
 app.use('/api/io',                ioRoutes);
 app.use('/api/eph-em',            ephEmImportRoutes);
 app.use('/api/valve-commands',   valveCommandRoutes);
@@ -63,6 +68,7 @@ app.use('/api/module-parameters', moduleParametersRoutes);
 app.use('/api/workflow',         workflowRoutes);
 app.use('/api/instance-conflicts', instanceConflictRoutes);
 app.use('/api/reconciliation',   reconciliationRoutes);
+app.use('/api/simit-export',     simitExportRoutes);
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 

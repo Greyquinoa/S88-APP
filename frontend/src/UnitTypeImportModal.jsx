@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import "./UnitTypeImportModal.css";
 
-export default function UnitTypeImportModal({ isOpen, onClose, onImportSuccess, compositeCmTypes }) {
+export default function UnitTypeImportModal({ isOpen, onClose, onImportSuccess, compositeCmTypes, projectId }) {
   const [unitName, setUnitName] = useState("");
   const [description, setDescription] = useState("");
   const [xmlFile, setXmlFile] = useState(null);
@@ -47,7 +47,7 @@ export default function UnitTypeImportModal({ isOpen, onClose, onImportSuccess, 
     try {
       const xmlText = await xmlFile.text();
 
-      const response = await fetch("/api/unit-types/import-pcs7/preview", {
+      const response = await fetch(`/api/unit-types/project/${projectId}/import-pcs7/preview`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ xmlText })
@@ -87,7 +87,7 @@ export default function UnitTypeImportModal({ isOpen, onClose, onImportSuccess, 
 
     try {
       // Call import endpoint with preview data
-      const response = await fetch("/api/unit-types/import-pcs7", {
+      const response = await fetch(`/api/unit-types/project/${projectId}/import-pcs7`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

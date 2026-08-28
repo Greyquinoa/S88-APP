@@ -3,7 +3,7 @@
 const express = require('express');
 const { getDb } = require('../db');
 
-const router = express.Router();
+const router = express.Router({ mergeParams: true });
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -62,8 +62,8 @@ async function loadUnitTypeDetail(db, id) {
   };
 }
 
-// ── GET /api/unit-types — list all ───────────────────────────────────────────
-router.get('/', async (req, res) => {
+// ── GET /api/unit-types/project/:projectId/types — list all ──────────────────
+router.get('/project/:projectId/types', async (req, res) => {
   try {
     const db   = getDb();
     const rows = await db.prepare(`
@@ -71,24 +71,25 @@ router.get('/', async (req, res) => {
              COUNT(utm.id) AS member_count
       FROM unit_types ut
       LEFT JOIN unit_type_members utm ON utm.unit_type_id = ut.id
+      WHERE ut.project_id = ?
       GROUP BY ut.id
       ORDER BY ut.name
-    `).all();
+    `).all(req.params.projectId);
     res.json(rows.map(r => ({ ...r, member_count: Number(r.member_count) })));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── POST /api/unit-types — create ────────────────────────────────────────────
-router.post('/', async (req, res) => {
+// ── POST /api/unit-types/project/:projectId/types — create ───────────────────
+router.post('/project/:projectId/types', async (req, res) => {
   try {
     const { name, description } = req.body || {};
     if (!name?.trim()) return res.status(400).json({ error: 'name is required' });
     const db  = getDb();
     const row = await db.prepare(
-      'INSERT INTO unit_types (name, description) VALUES (?, ?)'
-    ).run(name.trim(), description || '');
+      'INSERT INTO unit_types (project_id, name, description) VALUES (?, ?, ?)'
+    ).run(req.params.projectId, name.trim(), description || '');
     res.json({ id: row.lastInsertRowid, name: name.trim(), description: description || '', members: [] });
   } catch (err) {
     if (err.message?.toLowerCase().includes('unique') || err.code === '23505') return res.status(409).json({ error: 'Unit type name already exists' });
@@ -96,10 +97,12 @@ router.post('/', async (req, res) => {
   }
 });
 
-// ── GET /api/unit-types/:id — full detail ────────────────────────────────────
-router.get('/:id', async (req, res) => {
+// ── GET /api/unit-types/project/:projectId/types/:id — full detail ───────────
+router.get('/project/:projectId/types/:id', async (req, res) => {
   try {
     const db = getDb();
+    const owned = await db.prepare('SELECT id FROM unit_types WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+    if (!owned) return res.status(404).json({ error: 'Unit type not found' });
     const ut = await loadUnitTypeDetail(db, req.params.id);
     if (!ut) return res.status(404).json({ error: 'Unit type not found' });
     res.json(ut);
@@ -108,13 +111,13 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// ── PUT /api/unit-types/:id — full replace (members + roles) ─────────────────
-router.put('/:id', async (req, res) => {
+// ── PUT /api/unit-types/project/:projectId/types/:id — full replace (members + roles) ─
+router.put('/project/:projectId/types/:id', async (req, res) => {
   try {
     const db  = getDb();
     const { name, description, members } = req.body || {};
     if (!name?.trim()) return res.status(400).json({ error: 'name is required' });
-    const existing = await db.prepare('SELECT id FROM unit_types WHERE id = ?').get(req.params.id);
+    const existing = await db.prepare('SELECT id FROM unit_types WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
     if (!existing) return res.status(404).json({ error: 'Unit type not found' });
 
     await db.transaction(async () => {
@@ -173,10 +176,12 @@ router.put('/:id', async (req, res) => {
   }
 });
 
-// ── DELETE /api/unit-types/:id ───────────────────────────────────────────────
-router.delete('/:id', async (req, res) => {
+// ── DELETE /api/unit-types/project/:projectId/types/:id ───────────────────────
+router.delete('/project/:projectId/types/:id', async (req, res) => {
   try {
     const db = getDb();
+    const owned = await db.prepare('SELECT id FROM unit_types WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+    if (!owned) return res.status(404).json({ error: 'Unit type not found' });
     await db.transaction(async () => {
       const members = await db.prepare('SELECT id FROM unit_type_members WHERE unit_type_id = ?').all(req.params.id);
       for (const m of members) {
@@ -193,11 +198,13 @@ router.delete('/:id', async (req, res) => {
   }
 });
 
-// ── GET /api/unit-types/:id/connections ──────────────────────────────────────
+// ── GET /api/unit-types/project/:projectId/types/:id/connections ─────────────
 // Fetch all wiring for this unit type
-router.get('/:id/connections', async (req, res) => {
+router.get('/project/:projectId/types/:id/connections', async (req, res) => {
   try {
     const db = getDb();
+    const owned = await db.prepare('SELECT id FROM unit_types WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+    if (!owned) return res.status(404).json({ error: 'Unit type not found' });
     const connections = (await db.prepare(
       'SELECT * FROM unit_type_member_connections WHERE unit_type_id = ? ORDER BY sort_order, id'
     ).all(req.params.id)) || [];
@@ -207,13 +214,13 @@ router.get('/:id/connections', async (req, res) => {
   }
 });
 
-// ── POST /api/unit-types/:id/connections ─────────────────────────────────────
+// ── POST /api/unit-types/project/:projectId/types/:id/connections ────────────
 // Body: { connections: [{...}], validateCycles: true }
-router.post('/:id/connections', async (req, res) => {
+router.post('/project/:projectId/types/:id/connections', async (req, res) => {
   try {
     const db = getDb();
     const { connections = [], validateCycles = true } = req.body || {};
-    const ut = await db.prepare('SELECT id FROM unit_types WHERE id = ?').get(req.params.id);
+    const ut = await db.prepare('SELECT id FROM unit_types WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
     if (!ut) return res.status(404).json({ error: 'Unit type not found' });
 
     // Load members and build alias map
@@ -296,10 +303,12 @@ router.post('/:id/connections', async (req, res) => {
   }
 });
 
-// ── DELETE /api/unit-types/:id/connections/:connId ───────────────────────────
-router.delete('/:id/connections/:connId', async (req, res) => {
+// ── DELETE /api/unit-types/project/:projectId/types/:id/connections/:connId ──
+router.delete('/project/:projectId/types/:id/connections/:connId', async (req, res) => {
   try {
     const db = getDb();
+    const owned = await db.prepare('SELECT id FROM unit_types WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+    if (!owned) return res.status(404).json({ error: 'Unit type not found' });
     await db.prepare('DELETE FROM unit_type_member_connections WHERE id = ? AND unit_type_id = ?')
       .run(req.params.connId, req.params.id);
     res.json({ success: true });
@@ -308,20 +317,20 @@ router.delete('/:id/connections/:connId', async (req, res) => {
   }
 });
 
-// ── GET /api/unit-types/:id/cm-type-variables ────────────────────────────────
+// ── GET /api/unit-types/project/:projectId/types/:id/cm-type-variables ───────
 // Load blocks/variables for every member of this unit, keyed by member alias.
 // Simple members:    { alias: { kind:'simple', cmTypeName, vars:[{name,dir,dtype,block}] } }
 // Composite members: { alias: { kind:'composite', subMembers:[{subIdx,subAlias,cmTypeName,vars:[...]}] } }
-router.get('/:id/cm-type-variables', async (req, res) => {
+router.get('/project/:projectId/types/:id/cm-type-variables', async (req, res) => {
   try {
     const db = getDb();
-    const ut = await db.prepare('SELECT * FROM unit_types WHERE id = ?').get(req.params.id);
+    const ut = await db.prepare('SELECT * FROM unit_types WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
     if (!ut) return res.status(404).json({ error: 'Unit type not found' });
 
     // Resolve all variables for a given CM type name → flat list with block name.
     const varsForCmType = async (cmTypeName) => {
       if (!cmTypeName) return [];
-      const cmType = await db.prepare('SELECT id FROM lib_cm_types WHERE name = ?').get(cmTypeName);
+      const cmType = await db.prepare('SELECT id FROM lib_cm_types WHERE project_id = ? AND name = ?').get(req.params.projectId, cmTypeName);
       const cmTypeId = cmType?.id;
       if (!cmTypeId) return [];
       const blocks = (await db.prepare(
@@ -338,7 +347,7 @@ router.get('/:id/cm-type-variables', async (req, res) => {
       const out = [];
       for (const b of blocks) {
         const vars = (await db.prepare(
-          'SELECT name, dir, dtype FROM lib_variables WHERE block_id = ? ORDER BY sort_order, id'
+          'SELECT name, dir, dtype FROM lib_variables WHERE block_id = ? AND is_valid = TRUE ORDER BY sort_order, id'
         ).all(b.id)) || [];
         for (const v of vars) out.push({ name: v.name, dir: normDir(v.dir), dtype: v.dtype, block: b.name });
       }
@@ -462,6 +471,28 @@ async function expandUnitInstances(db, projectId) {
       'SELECT name FROM project_user_projects WHERE project_id = ? ORDER BY sort_order LIMIT 1'
     ).all(projectId);
     const defaultUserProject = upRows[0]?.name || '';
+
+    // A unit instance carries a *user project* (chosen from the user-project
+    // dropdown), not a controller. Pre-fill the controller only when that user
+    // project owns exactly one controller — then the choice is unambiguous.
+    // With several controllers (e.g. AS01 + AS02 both in "S88xTest") there is no
+    // right answer, so leave it unset for the user to pick per instance; the
+    // grid flags those and generation stays blocked until they do.
+    const ctrlRows = await db.prepare(
+      'SELECT id, user_project FROM hw_controllers WHERE project_id = ?'
+    ).all(projectId);
+    const ctrlsByUserProject = new Map();
+    for (const c of ctrlRows) {
+      const key = (c.user_project || '').trim().toUpperCase();
+      if (!key) continue;
+      (ctrlsByUserProject.get(key) ?? ctrlsByUserProject.set(key, []).get(key)).push(c.id);
+    }
+    const controllerIdFor = userProjectName => {
+      const key = (userProjectName || '').trim().toUpperCase();
+      if (!key) return null;
+      const ids = ctrlsByUserProject.get(key);
+      return ids?.length === 1 ? ids[0] : null;   // ambiguous → leave unassigned
+    };
 
     // Determine current max sort_order in project_instances + project_hierarchy_folders
     const maxInstSO  = (await db.prepare('SELECT MAX(sort_order) AS m FROM project_instances WHERE project_id = ? AND source_unit_instance_id IS NULL').get(projectId))?.m || 0;
@@ -674,16 +705,17 @@ async function expandUnitInstances(db, projectId) {
               // Create new instance marked as generated
               await db.prepare(`
                 INSERT INTO project_instances
-                  (project_id, cm_type, instance_name, sampling_time, user_project,
+                  (project_id, cm_type, instance_name, sampling_time, user_project, hw_controller_id,
                    folder_id, role_assignments, sort_order, source_unit_instance_id,
                    composite_group_id, composite_id, member_idx, connections, is_generated)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
               `).run(
                 projectId,
                 cm.cm_type_name,
                 instanceName,
                 '1000',
                 instanceUserProject,
+                controllerIdFor(instanceUserProject),
                 subFolderId,
                 JSON.stringify(roleAssignments),
                 instSO++,
@@ -744,10 +776,10 @@ router.post('/project/:projectId/unit-instances/expand', async (req, res) => {
   }
 });
 
-// ── POST /api/unit-types/import-pcs7/preview ───────────────────────────────────
+// ── POST /api/unit-types/project/:projectId/import-pcs7/preview ────────────────
 // Preview: Extract CM/EM types from XML without creating unit type yet.
 // Body: { xmlText }
-router.post('/import-pcs7/preview', async (req, res) => {
+router.post('/project/:projectId/import-pcs7/preview', async (req, res) => {
   try {
     const { xmlText } = req.body || {};
 
@@ -759,13 +791,15 @@ router.post('/import-pcs7/preview', async (req, res) => {
     const compositeMatcherV2 = require('../services/compositeMatcherV2');
     const extracted = pcs7XmlImporter.extractCmTypesFromXml(xmlText);
     const db = getDb();
+    const projectId = req.params.projectId;
 
     // Try to match instances to existing Composite CM Types (+ attach role + classify interconnections)
     const { assignments, metadata: matchMetadata, interconnections: filteredConnections, intraCompositeChecks } = await compositeMatcherV2.matchInstancesToComposites(
       extracted.cmInstances,
       db,
       extracted.metadata.roleAssignments || [],
-      extracted.interconnections || []
+      extracted.interconnections || [],
+      projectId
     );
 
     console.log(`[Import Preview] Extracted ${extracted.cmInstances.length} CM/EM instances`);
@@ -799,10 +833,10 @@ router.post('/import-pcs7/preview', async (req, res) => {
   }
 });
 
-// ── POST /api/unit-types/import-pcs7 ───────────────────────────────────────────
+// ── POST /api/unit-types/project/:projectId/import-pcs7 ────────────────────────
 // Create unit type from extracted CM instances (without Composite assignment for now).
 // Body: { unitName, description, cmInstances, interconnections }
-router.post('/import-pcs7', async (req, res) => {
+router.post('/project/:projectId/import-pcs7', async (req, res) => {
   try {
     const { unitName, description, assignments, interconnections } = req.body || {};
 
@@ -814,6 +848,7 @@ router.post('/import-pcs7', async (req, res) => {
     }
 
     const db = getDb();
+    const projectId = req.params.projectId;
     const unitTypeBuilder = require('../services/unitTypeBuilder');
 
     // Build unit members from assignments (may include composite CM references)
@@ -836,7 +871,8 @@ router.post('/import-pcs7', async (req, res) => {
       description?.trim() || '',
       unitMembers,
       interconnections || [],  // preserve interconnections
-      db
+      db,
+      projectId
     );
 
     res.status(201).json({

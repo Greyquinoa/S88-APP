@@ -1,5 +1,5 @@
 // StepController.jsx — Controller editor panel (no sidebar; controller selected by parent)
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   updateHwController, deleteHwController,
   listHwModuleTemplates,
@@ -59,7 +59,7 @@ const S = {
   },
 };
 
-export default function StepController({ controller, onSaved, onDeleted, pipMappings = [] }) {
+export default function StepController({ controller, onSaved, onDeleted, pipMappings = [], userProjects = [], autoFocusName = false, onAutoFocusNameDone }) {
   const [form, setForm]         = useState(null);
   const [saving, setSaving]     = useState(false);
   const [savedAt, setSavedAt]   = useState(null);
@@ -69,6 +69,8 @@ export default function StepController({ controller, onSaved, onDeleted, pipMapp
   const [fieldbuses, setFieldbuses]   = useState([]);
   const [fbEditingId, setFbEditingId] = useState(null);
   const [fbDraft, setFbDraft]         = useState({});
+
+  const nameInputRef = useRef(null);
 
   useEffect(() => {
     listHwModuleTemplates().then(setHwLibrary).catch(() => {});
@@ -82,6 +84,15 @@ export default function StepController({ controller, onSaved, onDeleted, pipMapp
     setFbDraft({});
     listHwFieldbuses(controller.id).then(setFieldbuses).catch(() => setFieldbuses([]));
   }, [controller?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (autoFocusName && form && nameInputRef.current) {
+      nameInputRef.current.focus();
+      nameInputRef.current.select();
+      onAutoFocusNameDone?.();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoFocusName, form]);
 
   const set = (field, value) => setForm(f => ({ ...f, [field]: value }));
 
@@ -152,13 +163,20 @@ export default function StepController({ controller, onSaved, onDeleted, pipMapp
         <div style={S.cardTitle}>Identity</div>
         <div style={S.grid2}>
           <Field label="Controller Tag Name">
-            <input style={S.input} value={form.T16_Controller_TagName || ''}
+            <input ref={nameInputRef} style={S.input} value={form.T16_Controller_TagName || ''}
               onChange={e => set('T16_Controller_TagName', e.target.value)} />
           </Field>
           <Field label="Station Type">
             <select style={S.select} value={form.T16_Station_Type || ''}
               onChange={e => set('T16_Station_Type', e.target.value)}>
               {STATION_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+            </select>
+          </Field>
+          <Field label="User Project">
+            <select style={S.select} value={form.user_project || ''}
+              onChange={e => set('user_project', e.target.value || null)}>
+              <option value="">— unassigned —</option>
+              {userProjects.map(p => <option key={p} value={p}>{p}</option>)}
             </select>
           </Field>
         </div>

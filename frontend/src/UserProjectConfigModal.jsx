@@ -9,9 +9,6 @@ const PCS7_CONFIG_FIELDS = [
   { key: "cpu_id",          label: "CPU ID"          },
   { key: "process_cell",    label: "Process Cell"    },
   { key: "process_cell_id", label: "Process Cell ID" },
-  { key: "unit_name",       label: "Unit Name"       },
-  { key: "unit_id",         label: "Unit ID"         },
-  { key: "cm_folder_id",    label: "CM Folder ID"    },
   { key: "export_user",     label: "Export User"     },
   { key: "unit_author",     label: "Unit Author"     },
 ];

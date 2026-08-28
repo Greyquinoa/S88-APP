@@ -211,16 +211,48 @@ async function promoteToProject(db, importId, projectId) {
     'SELECT name FROM project_user_projects WHERE project_id = ? ORDER BY sort_order, id LIMIT 1'
   ).get(projectId))?.name || '';
 
+  // The AS column names a *controller* (e.g. "AS01"), matching
+  // hw_controllers.T16_Controller_TagName — not a user project. The user project
+  // is read from the matched controller rather than invented from the AS string.
+  // Unmatched names resolve to null: the grid shows those instances unassigned
+  // and blocks generation until the user picks one, rather than guessing.
+  const ctrlRows = await db.prepare(
+    `SELECT id, T16_Controller_TagName AS tag_name, user_project
+       FROM hw_controllers WHERE project_id = ?`
+  ).all(projectId);
+  const ctrlByName = new Map(
+    ctrlRows
+      .filter(c => c.tag_name)
+      .map(c => [String(c.tag_name).trim().toUpperCase(), c])
+  );
+  const controllerFor = name => {
+    const key = (name || '').trim().toUpperCase();
+    return key ? (ctrlByName.get(key) ?? null) : null;
+  };
+  const controllerIdFor = name => controllerFor(name)?.id ?? null;
+
   const created = [];
   const warnings = [];
+  const unmatchedAs = new Set();  // AS values with no controller — warned once each
 
   await db.transaction(async () => {
     for (const row of rows) {
       if (!row.unit_name) continue;
 
       const assignedTypes = JSON.parse(row.assigned_cm_types || '{}');
-      // Use AS assignment as user_project, fall back to default if not specified
-      const userProject = row.assignment || defaultUserProject;
+      // The AS value identifies a controller; the user project comes from that
+      // controller. With no AS (or no matching controller) fall back to the
+      // project's first user project so the instance is still placed sensibly —
+      // its controller stays null and the grid flags it.
+      const ctrl = controllerFor(row.assignment);
+      const userProject = ctrl?.user_project || defaultUserProject;
+      if (row.assignment && !ctrl && !unmatchedAs.has(row.assignment.trim())) {
+        unmatchedAs.add(row.assignment.trim());
+        warnings.push(
+          `No controller matches AS "${row.assignment.trim()}" — instances for it have no ` +
+          `controller assigned. Set one in the Instances grid before generating.`
+        );
+      }
 
       const unitFolder = await db.prepare(
         'SELECT id FROM project_hierarchy_folders WHERE project_id = ? AND s88_type = ? AND name = ?'
@@ -232,8 +264,8 @@ async function promoteToProject(db, importId, projectId) {
 
       for (const [typeCol, compositeName] of Object.entries(assignedTypes)) {
         const composite = await db.prepare(
-          'SELECT id FROM composite_cm_types WHERE name = ?'
-        ).get(compositeName);
+          'SELECT id FROM composite_cm_types WHERE name = ? AND project_id = ?'
+        ).get(compositeName, projectId);
 
         if (!composite) {
           warnings.push(`Composite "${compositeName}" no longer exists — skipped for unit "${row.unit_name}"`);
@@ -271,10 +303,11 @@ async function promoteToProject(db, importId, projectId) {
 
           const inst = await db.prepare(`
             INSERT INTO project_instances
-              (project_id, cm_type, instance_name, user_project, sort_order, folder_id,
+              (project_id, cm_type, instance_name, user_project, hw_controller_id, sort_order, folder_id,
                composite_id, member_idx, source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `).run(projectId, m.cm_type_name, instanceName, userProject,
+                 controllerIdFor(userProject),
                  Number(maxSort?.max_sort || 0) + 1, folderId,
                  composite.id, idx, 'eph_em_import');
 

@@ -9,7 +9,7 @@ import {
   updateHwStation, updateHwSlot,
   listHwModuleTemplates,
   addHwStation, deleteHwStation, addHwSlot, deleteHwSlot,
-  listHwControllers, listHwFieldbuses,
+  listHwControllers, listHwFieldbuses, copyHwController,
   getSlotChannels, patchSlotChannel, patchSlotPip, patchSlotPotentialGroup, patchSlotPaProfile, patchSlotSubslotProfile,
   copyHwStation,
   bulkDeleteHwStations, bulkApproveHwStations,
@@ -29,6 +29,7 @@ import HwConfigGrid from "./HwConfigGrid.tsx";
 import CatalogueGrid from "./CatalogueGrid.jsx";
 import SymbolTableModal from "./SymbolTableModal.jsx";
 import StationAutoSlotsEditor from "./StationAutoSlotsEditor.jsx";
+import ContextMenu from "./ContextMenu.jsx";
 
 
 // Postgres returns is_visible as a boolean (true/false); older SQLite data used
@@ -37,7 +38,7 @@ function paramVisible(p) {
   return p.is_visible !== 0 && p.is_visible !== false;
 }
 
-export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwMappingConsumed }) {
+export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwMappingConsumed, userProjects = [] }) {
   const [hwTab,        setHwTab]        = useState("import");
   const [imports,      setImports]      = useState([]);    // all imports for the project; used to derive importId
   const [baselineOk,   setBaselineOk]   = useState(false);
@@ -52,6 +53,9 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
   const [importNotice, setImportNotice] = useState(null);   // { skipped, ambiguous, groups, totalRows }
   const [controllers,  setControllers]  = useState([]);
   const [selectedId,   setSelectedId]   = useState(null);
+  const [controllerClipboard, setControllerClipboard] = useState(null); // copied controller row, or null
+  const [controllerMsg, setControllerMsg] = useState(""); // brief copy/paste feedback
+  const [justPastedId, setJustPastedId] = useState(null); // controller id to autofocus its name field once
   const [stations,     setStations]     = useState([]);
   const [addrMap,      setAddrMap]      = useState({});   // { "<stationAddr>:<slot>": { inputAddr, outputAddr } }
   const [templates,    setTemplates]    = useState([]);
@@ -89,14 +93,18 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
   const [selectedColumns, setSelectedColumns] = useState(new Set());
 
   // ── Derived state: importId from selectedId ──────────────────────────────
-  // Legacy fallback: if no import matches the selected controller and exactly
-  // one import has hw_controller_id=NULL, use it (pre-migration data).
+  // A controller with no hw_imports row of its own (e.g. just pasted, never
+  // baselined) has no import — full stop. Previously this fell back to a
+  // stray hw_controller_id=NULL import left over from before per-controller
+  // imports existed, which meant any such controller silently inherited an
+  // unrelated legacy import's stations/generated CFGs instead of showing
+  // "not imported yet". That legacy data has its own path (an import row
+  // with hw_controller_id=NULL) and is only reachable when no controller is
+  // selected at all.
   const importId = useMemo(() => {
-    const matched = imports.find(i => i.hw_controller_id === selectedId);
-    if (matched) return matched.id;
     if (selectedId === null) return null;
-    const legacyImport = imports.find(i => i.hw_controller_id === null);
-    return legacyImport && imports.filter(i => i.hw_controller_id === null).length === 1 ? legacyImport.id : null;
+    const matched = imports.find(i => i.hw_controller_id === selectedId);
+    return matched ? matched.id : null;
   }, [imports, selectedId]);
 
   // Slot ↔ Subslot compatibility map
@@ -131,6 +139,29 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
   };
 
   useEffect(() => { loadControllers(); }, [projectId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  function handleCopyController(controller) {
+    setControllerClipboard(controller);
+    setControllerMsg(`Copied "${controller.T16_Controller_TagName || 'controller'}" — right-click to paste`);
+    setTimeout(() => setControllerMsg(""), 2500);
+  }
+
+  async function handlePasteController() {
+    if (!controllerClipboard) return;
+    try {
+      const { controller } = await copyHwController(controllerClipboard.id);
+      // The copy may have created a new hw_imports row (baseline + signals
+      // carried over from the source) — refresh imports so the importId memo
+      // picks it up immediately instead of showing "no baseline" until the
+      // next unrelated reload.
+      const rows = await listHwImports(projectId);
+      setImports(rows);
+      await loadControllers(controller.id);
+      setJustPastedId(controller.id);
+      setControllerMsg(`Pasted as "${controller.T16_Controller_TagName || 'controller'}"`);
+      setTimeout(() => setControllerMsg(""), 2500);
+    } catch (e) { setError(e.message); }
+  }
 
   useEffect(() => {
     if (!selectedId) { setFieldbuses([]); return; }
@@ -167,7 +198,7 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
 
   // ── Load stations/cfgs when importId changes ────────────────────────────
   useEffect(() => {
-    if (!importId) { setStations([]); setCfgs([]); setBaselineOk(false); setIoListOk(false); return; }
+    if (!importId) { setStations([]); setCfgs([]); setBaselineOk(false); setIoListOk(false); setBaselineInfo(null); return; }
     const imp = imports.find(i => i.id === importId);
     if (imp) {
       setBaselineOk(true);
@@ -632,6 +663,9 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
           setSelectedId(id);
           if (hwTab === "import" || hwTab === "catalogue") setHwTab("controller");
         }}
+        hasClipboard={!!controllerClipboard}
+        onCopyController={handleCopyController}
+        onPasteController={handlePasteController}
       />
 
       {/* ── Main content ─────────────────────────────────────────────── */}
@@ -645,6 +679,7 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
           </div>
         )}
         {loading && <div style={alertStyle("#eef4ff", "#99b", "#336")}>{loading}</div>}
+        {controllerMsg && <div style={alertStyle("#eef9ee", "#9c9", "#276")}>{controllerMsg}</div>}
         {genWarnings.length > 0 && (
           <div style={alertStyle("#fffbeb", "#fcd34d", "#92400e")}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
@@ -822,6 +857,9 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
                 onSaved={loadControllers}
                 onDeleted={() => { setSelectedId(null); loadControllers(); }}
                 pipMappings={baselineInfo?.pipMappings || []}
+                userProjects={userProjects}
+                autoFocusName={justPastedId !== null && selectedController?.id === justPastedId}
+                onAutoFocusNameDone={() => setJustPastedId(null)}
               />
             )}
 
@@ -1958,8 +1996,24 @@ const mrpSt = {
 };
 
 // ── Nav Panel (collapsible left sidebar) ──────────────────────────────────────
-function NavPanel({ hwTab, setHwTab, controllers, selectedId, onSelect }) {
+function NavPanel({ hwTab, setHwTab, controllers, selectedId, onSelect, hasClipboard, onCopyController, onPasteController }) {
   const [collapsed, setCollapsed] = useState(false);
+  const [menu, setMenu] = useState(null); // { x, y, controller | null }
+
+  function openMenu(e, controller) {
+    e.preventDefault();
+    e.stopPropagation();
+    setMenu({ x: e.clientX, y: e.clientY, controller: controller || null });
+  }
+
+  function menuItems() {
+    const items = [];
+    if (menu?.controller) {
+      items.push({ label: "Copy controller", onClick: () => { onCopyController(menu.controller); setMenu(null); } });
+    }
+    items.push({ label: "Paste controller", disabled: !hasClipboard, onClick: () => { onPasteController(); setMenu(null); } });
+    return items;
+  }
 
   const navBtn = (id, label) => {
     const active = hwTab === id;
@@ -2016,7 +2070,8 @@ function NavPanel({ hwTab, setHwTab, controllers, selectedId, onSelect }) {
       </div>
 
       {/* Controllers section */}
-      <div style={{ flex: 1, display: "flex", flexDirection: "column", overflowY: "auto", paddingTop: 6 }}>
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", overflowY: "auto", paddingTop: 6 }}
+        onContextMenu={e => openMenu(e, null)}>
         <div style={{
           padding: "4px 14px 6px",
           fontSize: 10, fontWeight: 700, textTransform: "uppercase",
@@ -2033,6 +2088,7 @@ function NavPanel({ hwTab, setHwTab, controllers, selectedId, onSelect }) {
           const isActive = isSelected && (hwTab === "controller" || hwTab === "config" || hwTab === "mrp");
           return (
             <div key={c.id} onClick={() => onSelect(c.id)}
+              onContextMenu={e => openMenu(e, c)}
               style={{
                 padding: "7px 14px", cursor: "pointer",
                 borderLeft: isActive ? "3px solid #2255cc" : "3px solid transparent",
@@ -2050,6 +2106,10 @@ function NavPanel({ hwTab, setHwTab, controllers, selectedId, onSelect }) {
           );
         })}
       </div>
+
+      {menu && (
+        <ContextMenu x={menu.x} y={menu.y} items={menuItems()} onClose={() => setMenu(null)} />
+      )}
     </div>
   );
 }
@@ -3398,7 +3458,10 @@ function ConfigurationPanel({
   isEditing, onStartEdit, onChangeEdit, onCommitEdit, onCancelEdit,
   onShowSymbolTable,
 }) {
-  const canGenerate = baselineOk && stations.some(s => s.slots.length > 0);
+  // A controller with a valid baseline (RACK/CPU/PS/PN-IO header) can generate
+  // a CFG even with zero stations/modules configured yet — the output just has
+  // no device blocks appended. Only a missing baseline blocks generation.
+  const canGenerate = baselineOk;
   const nSelected   = selectedAddrs.size;
   const allSelected = stations.length > 0 && selectedAddrs.size === stations.length;
   const [configureAddr, setConfigureAddr] = useState(null); // address of station open in modal

@@ -21,6 +21,16 @@ async function runRoundTripTest() {
 
     console.log('✓ Database initialized');
 
+    // Library / Composite CM Types / Unit Types are project-scoped — run this
+    // test's throwaway fixtures inside their own dedicated project so they
+    // never collide with (or pollute) a real project's library.
+    const projRow = await db.prepare(
+      `INSERT INTO projects (name) VALUES (?) ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name`
+    ).run('__test_pcs7_roundtrip__');
+    const testProject = await db.prepare('SELECT id FROM projects WHERE name = ?').get('__test_pcs7_roundtrip__');
+    const projectId = testProject.id;
+    console.log(`✓ Using test project id=${projectId}`);
+
     // ─────────────────────────────────────────────────────────────
     // Phase 1: Set up test data (CM types + Composite CM Type)
     // ─────────────────────────────────────────────────────────────
@@ -29,22 +39,22 @@ async function runRoundTripTest() {
     // Insert test CM types into library (if they don't exist)
     const cmTypes = ['TEST_CM_AO', 'TEST_CM_NIF', 'TEST_CM_POWER'];
     for (const cmName of cmTypes) {
-      const existing = await db.prepare('SELECT id FROM lib_cm_types WHERE name = ?').get(cmName);
+      const existing = await db.prepare('SELECT id FROM lib_cm_types WHERE name = ? AND project_id = ?').get(cmName, projectId);
       if (!existing) {
-        await db.prepare('INSERT INTO lib_cm_types (name, cm_type) VALUES (?, ?)')
-          .run(cmName, 'CM');
+        await db.prepare('INSERT INTO lib_cm_types (project_id, name, cm_type) VALUES (?, ?, ?)')
+          .run(projectId, cmName, 'CM');
         console.log(`  ✓ Created test CM type: ${cmName}`);
       }
     }
 
     // Create a test Composite CM Type
-    const compRow = await db.prepare('SELECT id FROM composite_cm_types WHERE name = ?')
-      .get('TEST_COMPOSITE_AO');
+    const compRow = await db.prepare('SELECT id FROM composite_cm_types WHERE name = ? AND project_id = ?')
+      .get('TEST_COMPOSITE_AO', projectId);
     let compositeId;
     if (!compRow) {
       const result = await db.prepare(
-        'INSERT INTO composite_cm_types (name, description) VALUES (?, ?)'
-      ).run('TEST_COMPOSITE_AO', 'Test Composite with AO + NIF + POWER');
+        'INSERT INTO composite_cm_types (project_id, name, description) VALUES (?, ?, ?)'
+      ).run(projectId, 'TEST_COMPOSITE_AO', 'Test Composite with AO + NIF + POWER');
       compositeId = result.lastInsertRowid;
       console.log(`  ✓ Created test Composite CM Type (id=${compositeId})`);
 
@@ -80,8 +90,8 @@ async function runRoundTripTest() {
 
     const origName = `TEST_UNIT_TYPE_ORIGINAL_${Date.now()}`;
     const utRow = await db.prepare(
-      'INSERT INTO unit_types (name, description) VALUES (?, ?)'
-    ).run(origName, 'Original unit type for round-trip test');
+      'INSERT INTO unit_types (project_id, name, description) VALUES (?, ?, ?)'
+    ).run(projectId, origName, 'Original unit type for round-trip test');
     const originalUnitTypeId = utRow.lastInsertRowid;
     console.log(`  ✓ Created Unit Type (id=${originalUnitTypeId})`);
 
@@ -135,11 +145,11 @@ STATION S7400 , "TEST_STATION"
     const unitTypeBuilder = require('../services/unitTypeBuilder');
 
     // Validate CMs exist
-    await compositeAssigner.validateCmTypesExist(extracted.cmTypes, db);
+    await compositeAssigner.validateCmTypesExist(extracted.cmTypes, db, projectId);
     console.log('  ✓ All extracted CM types exist in library');
 
     // Load composites and match
-    const existingComposites = await pcs7Importer.loadExistingComposites(db);
+    const existingComposites = await pcs7Importer.loadExistingComposites(db, projectId);
     const matchResult = compositeAssigner.findCompositeMatches(extracted.cmTypes, existingComposites, 0.7);
     console.log(`  ✓ Matched to composite: ${matchResult.assignment.compositeName} (confidence=${matchResult.confidence})`);
 
@@ -154,7 +164,8 @@ STATION S7400 , "TEST_STATION"
       'Re-imported unit type from round-trip test',
       unitStructure.unitMembers,
       unitStructure.connections,
-      db
+      db,
+      projectId
     );
     const reimportedUnitTypeId = reimportResult.id;
     console.log(`  ✓ Created re-imported Unit Type (id=${reimportedUnitTypeId})`);

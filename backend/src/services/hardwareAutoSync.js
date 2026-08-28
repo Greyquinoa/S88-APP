@@ -59,7 +59,10 @@ async function autoSyncHardware(db, { hwImportId, ioImportId, columnMap, asColum
       return normAs(obj[asColumn]) === want;
     });
     if (ioRows.length === 0) {
-      throw new Error(`No IO rows are assigned to controller '${controllerName}' (column '${asColumn}')`);
+      // Return early with an empty result: this controller has no rows in the IO import,
+      // so there's nothing to sync. This is not an error — the workflow should skip
+      // controllers that aren't in the current IO import.
+      return { log: { imported: 0, unchanged: 0, skippedModified: [], skippedMissing: [] }, stationCount: 0, signalCount: 0 };
     }
   }
 

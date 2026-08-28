@@ -332,7 +332,7 @@ export default function StepEphEmImport({ projectId, onComplete }) {
   const loadAvailableComposites = useCallback(async () => {
     try {
       setCompositesLoading(true);
-      const composites = await listCompositeCmTypes();
+      const composites = await listCompositeCmTypes(projectId);
       setAllComposites(composites || []);
     } catch (e) {
       console.error('Failed to load composites:', e);
@@ -348,7 +348,7 @@ export default function StepEphEmImport({ projectId, onComplete }) {
   const loadTypeMappingConfigs = useCallback(async () => {
     try {
       setConfigsLoading(true);
-      const configs = await getEphEmTypeMappingConfigs();
+      const configs = await getEphEmTypeMappingConfigs(projectId);
       setTypeMappingConfigs(configs || []);
       return configs || [];
     } catch (e) {
@@ -358,7 +358,7 @@ export default function StepEphEmImport({ projectId, onComplete }) {
     } finally {
       setConfigsLoading(false);
     }
-  }, []);
+  }, [projectId]);
 
   // Normalise a saved config's mappings into editor rows. Configs written
   // before match_mode/priority existed are stored as a flat { column: composite }
@@ -429,12 +429,12 @@ export default function StepEphEmImport({ projectId, onComplete }) {
       let savedId;
       if (editingConfig) {
         savedId = editingConfig.id;
-        await updateEphEmTypeMappingConfig(savedId, {
+        await updateEphEmTypeMappingConfig(projectId, savedId, {
           name: editConfigName,
           mappings,
         });
       } else {
-        const created = await createEphEmTypeMappingConfig({
+        const created = await createEphEmTypeMappingConfig(projectId, {
           name: editConfigName,
           mappings,
         });
@@ -460,7 +460,7 @@ export default function StepEphEmImport({ projectId, onComplete }) {
   const handleDeleteTypeMapping = useCallback(async (id) => {
     if (!confirm('Delete this type mapping config?')) return;
     try {
-      await deleteEphEmTypeMappingConfig(id);
+      await deleteEphEmTypeMappingConfig(projectId, id);
       // Close the editor if it was showing the config just deleted, otherwise
       // it would stay bound to a row that no longer exists and a save would
       // 404 against the missing id.
@@ -469,7 +469,7 @@ export default function StepEphEmImport({ projectId, onComplete }) {
     } catch (e) {
       alert('Error deleting config: ' + e.message);
     }
-  }, [loadTypeMappingConfigs]);
+  }, [projectId, loadTypeMappingConfigs]);
 
   // Handle file upload
   const handleFileUpload = useCallback(async (file) => {

@@ -89,10 +89,10 @@ function extractInterconnectionsFromXml(xmlText) {
  *
  * Returns: { compositeId: { name, members: [{ cmName, sort_order }], connections } }
  */
-async function loadExistingComposites(db) {
+async function loadExistingComposites(db, projectId) {
   const composites = {};
 
-  const rows = await db.prepare('SELECT id, name FROM composite_cm_types').all();
+  const rows = await db.prepare('SELECT id, name FROM composite_cm_types WHERE project_id = ?').all(projectId);
 
   for (const comp of rows) {
     const members = await db.prepare(

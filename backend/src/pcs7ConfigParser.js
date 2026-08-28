@@ -87,17 +87,33 @@ async function parsePcs7Config(xmlBuffer) {
   // ObjectList inside Project
   const projOL = project.ObjectList?.[0];
 
-  // Device (Type=Central) — first Device child
-  const devices = projOL?.Device || [];
-  const device = devices[0];
-  const deviceName = attr(device, 'Name');
-  const deviceId = attr(device, 'ID');
+  // Devices (Type=Central). A project may contain several controllers
+  // (e.g. AS01 + AS02 both under one user project), each with its own rack,
+  // CPU and IOTag folder — so collect them all, in document order.
+  const deviceEls = projOL?.Device || [];
+  const devices = deviceEls.map((dev, idx) => {
+    const devOL = dev?.ObjectList?.[0];
+    const devItems = devOL?.DeviceItem || [];
+    const cpu  = devItems.find(di => attr(di, 'Type') === 'ControllerTarget');
+    const rack = devItems.find(di => attr(di, 'Type') === 'Rack');
+    // The IOTag folder hangs off the CPU's ObjectList, not the device's.
+    const iotagFolder = cpu?.ObjectList?.[0]?.IOTagFolder?.[0];
+    return {
+      device_name: attr(dev, 'Name'),
+      device_id:   attr(dev, 'ID'),
+      cpu_id:      attr(cpu, 'ID'),
+      rack_id:     attr(rack, 'ID'),
+      iotag_id:    attr(iotagFolder, 'ID'),
+      sort_order:  idx,
+    };
+  });
 
-  // CPU: DeviceItem with Type=ControllerTarget — inside Device/ObjectList
-  const devOL = device?.ObjectList?.[0];
-  const devItems = devOL?.DeviceItem || [];
-  const cpu = devItems.find(di => attr(di, 'Type') === 'ControllerTarget');
-  const cpuId = attr(cpu, 'ID');
+  // Keep the first device's IDs at the top level so existing single-device
+  // callers (project_config columns, buildFX) keep working unchanged.
+  const first = devices[0] || {};
+  const deviceName = first.device_name || '';
+  const deviceId   = first.device_id   || '';
+  const cpuId      = first.cpu_id      || '';
 
   // PlantHierarchyFolder trees — inside Project/ObjectList (may be nested under Device or direct)
   // PCS7 exports typically place them directly under Project/ObjectList alongside Device.
@@ -122,16 +138,10 @@ async function parsePcs7Config(xmlBuffer) {
   const processCell = attr(pc, 'Name');
   const processCellId = attr(pc, 'ID');
 
-  // Unit — first Unit inside ProcessCell
+  // Unit — first Unit inside ProcessCell (only used to locate unit_author below;
+  // unit name/id/CM folder id are not consumed anywhere and are not extracted).
   const pcChildren = findFolderChildren(pc);
   const unit = findFolder(pcChildren, f => attr(f, 'Type') === 'Unit');
-  const unitName = attr(unit, 'Name');
-  const unitId = attr(unit, 'ID');
-
-  // CM folder — child of Unit named "CM"
-  const unitChildren = findFolderChildren(unit);
-  const cmFolder = unitChildren.find(f => attr(f, 'Name') === 'CM');
-  const cmFolderId = attr(cmFolder, 'ID');
 
   // unit_author — inside Unit/AttributeList/Author
   let unitAuthor = '';
@@ -148,15 +158,16 @@ async function parsePcs7Config(xmlBuffer) {
     cpu_id:          cpuId,
     process_cell:    processCell,
     process_cell_id: processCellId,
-    unit_name:       unitName,
-    unit_id:         unitId,
-    cm_folder_id:    cmFolderId,
     export_user:     exportUser,
     unit_author:     unitAuthor,
   };
 
+  // `missing` only scans the flat string fields above — devices is an array and
+  // is reported separately so an empty device list is still surfaced.
   const missing = Object.entries(config).filter(([, v]) => !v).map(([k]) => k);
-  return { config, missing };
+  if (!devices.length) missing.push('devices');
+
+  return { config, devices, missing };
 }
 
 module.exports = { parsePcs7Config };

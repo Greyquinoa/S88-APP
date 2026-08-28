@@ -2,21 +2,21 @@
 'use strict';
 const express = require('express');
 const { getDb } = require('../db');
-const router = express.Router();
+const router = express.Router({ mergeParams: true });
 
-// ── GET /api/io-connections/cm-type/:cmTypeId ─────────────────────────────────
+// ── GET /api/io-connections/project/:projectId/cm-type/:cmTypeId ─────────────
 // List all IO connection rules for a given lib_cm_type id.
 // Also returns the available blocks+vars for that type so the frontend can
 // build dropdowns without a separate call.
-router.get('/cm-type/:cmTypeId', async (req, res) => {
+router.get('/project/:projectId/cm-type/:cmTypeId', async (req, res) => {
   try {
     const db = getDb();
-    const { cmTypeId } = req.params;
+    const { cmTypeId, projectId } = req.params;
 
     // Accept either a numeric lib_cm_types.id or a CM type name (frontend has the name).
     const cmType = /^\d+$/.test(String(cmTypeId))
-      ? await db.prepare('SELECT id, name FROM lib_cm_types WHERE id = ?').get(cmTypeId)
-      : await db.prepare('SELECT id, name FROM lib_cm_types WHERE name = ?').get(cmTypeId);
+      ? await db.prepare('SELECT id, name FROM lib_cm_types WHERE id = ? AND project_id = ?').get(cmTypeId, projectId)
+      : await db.prepare('SELECT id, name FROM lib_cm_types WHERE name = ? AND project_id = ?').get(cmTypeId, projectId);
     if (!cmType) return res.status(404).json({ error: 'CM type not found' });
 
     // From here on, use the resolved numeric id for child lookups.
@@ -56,15 +56,15 @@ router.get('/cm-type/:cmTypeId', async (req, res) => {
   }
 });
 
-// ── POST /api/io-connections/cm-type/:cmTypeId ────────────────────────────────
+// ── POST /api/io-connections/project/:projectId/cm-type/:cmTypeId ────────────
 // Create a new IO connection rule on a lib_cm_type.
 // Body: { block_name, var_name, suffix, prefix, signal_type, required }
-router.post('/cm-type/:cmTypeId', async (req, res) => {
+router.post('/project/:projectId/cm-type/:cmTypeId', async (req, res) => {
   try {
     const db = getDb();
-    const { cmTypeId } = req.params;
+    const { cmTypeId, projectId } = req.params;
 
-    const cmType = await db.prepare('SELECT id FROM lib_cm_types WHERE id = ?').get(cmTypeId);
+    const cmType = await db.prepare('SELECT id FROM lib_cm_types WHERE id = ? AND project_id = ?').get(cmTypeId, projectId);
     if (!cmType) return res.status(404).json({ error: 'CM type not found' });
 
     const {
@@ -154,10 +154,10 @@ router.delete('/:id', async (req, res) => {
   }
 });
 
-// ── PATCH /api/io-connections/cm-type/:cmTypeId/reorder ──────────────────────
+// ── PATCH /api/io-connections/project/:projectId/cm-type/:cmTypeId/reorder ───
 // Bulk-update sort_order after the user drags rows.
 // Body: { ids: [id, id, ...] }  — ordered list of rule IDs in new order.
-router.patch('/cm-type/:cmTypeId/reorder', async (req, res) => {
+router.patch('/project/:projectId/cm-type/:cmTypeId/reorder', async (req, res) => {
   try {
     const db = getDb();
     const { ids = [] } = req.body || {};

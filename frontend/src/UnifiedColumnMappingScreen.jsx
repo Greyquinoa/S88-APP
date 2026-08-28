@@ -409,7 +409,7 @@ export default function UnifiedColumnMappingScreen({
     try {
       // Reuse io_column_mappings table. Unified configs store both panels' mappings
       // in the `mappings` JSON field as { instance: {...}, hardware: {...} }.
-      const all = await getIOColumnMaps();
+      const all = await getIOColumnMaps(projectId);
       // Hide transient auto-created configs (named __io_instances_<id>) from the sidebar.
       const visible = (all || []).filter(c => !String(c.name || '').startsWith('__io_instances_'));
       setConfigs(visible);
@@ -509,9 +509,9 @@ export default function UnifiedColumnMappingScreen({
 
       let savedId = selectedConfigId;
       if (selectedConfigId) {
-        await updateIOColumnMap(selectedConfigId, payload);
+        await updateIOColumnMap(projectId, selectedConfigId, payload);
       } else {
-        const r = await createIOColumnMap(payload);
+        const r = await createIOColumnMap(projectId, payload);
         savedId = r.id;
         setSelectedConfigId(r.id);
       }
@@ -532,7 +532,7 @@ export default function UnifiedColumnMappingScreen({
   async function deleteConfig(id) {
     if (!confirm('Delete this column mapping config?')) return;
     try {
-      await deleteIOColumnMap(id);
+      await deleteIOColumnMap(projectId, id);
       if (selectedConfigId === id) {
         setSelectedConfigId(null);
         setDraft(null);

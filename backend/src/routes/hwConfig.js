@@ -2507,8 +2507,13 @@ router.post('/imports/:id/generate', async (req, res) => {
     }
     signalQuery += ' ORDER BY station_address, slot, channel, row_number';
 
+    // A controller with no stations yet (e.g. just baselined/pasted, no IO
+    // added) still has a valid RACK/CPU/PS/PN-IO header to generate — the CFG
+    // just has no device blocks appended. generateCfg() and allocateAddresses()
+    // both handle an empty stations map correctly, so there is no need to
+    // block generation here; only a genuinely missing baseline (checked above)
+    // makes the output meaningless.
     const signals = await db.prepare(signalQuery).all(...queryParams);
-    if (signals.length === 0) return err(res, 400, 'No signals or modules configured — add modules in Configuration');
 
     // Load per-subslot profiles for all stations in this import
     const subslotRows = await db.prepare(

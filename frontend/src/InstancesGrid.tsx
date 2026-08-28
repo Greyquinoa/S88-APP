@@ -36,6 +36,7 @@ export interface InstanceRow {
   instanceName: string;
   samplingTime: string;
   userProject: string;
+  hwControllerId: string;
   folderId: string;
   source?: "manual" | "imported";
 }
@@ -45,11 +46,21 @@ export interface FolderOption {
   label: string;
 }
 
+export interface HwControllerOption {
+  id: string;
+  /** Controller tag name, e.g. "AS101" — falls back to "Controller #<id>" when blank. */
+  name: string;
+  /** User project this controller belongs to, or null/blank when unassigned. */
+  userProject: string | null;
+}
+
 interface InstancesGridProps {
   libType: "ControlModule" | "EquipmentModule" | "EquipmentPhase";
   rowData: InstanceRow[];
   cmtProfiles: CmtProfile[];
-  userProjects: string[];
+  /** Hardware controllers for the active project. Instances pick a controller;
+   *  the user project is derived from the controller's own assignment. */
+  hwControllers: HwControllerOption[];
   folderOptions: FolderOption[];
   onRowUpdate: (id: string, field: keyof InstanceRow, value: string) => void;
   onRowDelete: (id: string) => void;
@@ -78,6 +89,12 @@ interface InstancesGridProps {
     acceptedAt?: string | null;
     acceptedBy?: string | null;
   }>;
+  /** Called when "Add Composite" is clicked — opens the composite instance modal. */
+  onAddComposite?: () => void;
+  /** Called when "Run Reconciliation" is clicked — reconciles IO connections. */
+  onRunReconciliation?: () => void;
+  /** Called when "View Overview" is clicked — opens the reconciliation overview modal. */
+  onViewOverview?: () => void;
 }
 
 // ── Delete button cell renderer ───────────────────────────────────────────────
@@ -238,7 +255,7 @@ export default function InstancesGrid({
   libType,
   rowData,
   cmtProfiles,
-  userProjects,
+  hwControllers = [],
   folderOptions,
   onRowUpdate,
   onRowDelete,
@@ -250,6 +267,9 @@ export default function InstancesGrid({
   onGenerateConnections,
   connStatusByInstance,
   reconciliationDataByInstance,
+  onAddComposite,
+  onRunReconciliation,
+  onViewOverview,
 }: InstancesGridProps) {
   const gridRef = useRef<AgGridReact<InstanceRow>>(null);
   const [quickFilter, setQuickFilter] = useState("");
@@ -300,10 +320,36 @@ export default function InstancesGrid({
     return m;
   }, [folderOptions]);
 
-  const userProjectValues = useMemo(
-    () => ["", ...userProjects],
-    [userProjects]
+  // Controllers sorted by user project (grouped), then by name, so the dropdown
+  // reads as "S88xTest: AS101, AS102 / Prod: AS103" instead of raw insertion order.
+  const sortedControllers = useMemo(() => {
+    const list = hwControllers || [];
+    return [...list].sort((a, b) => {
+      const groupCmp = (a.userProject || "￿").localeCompare(b.userProject || "￿");
+      if (groupCmp !== 0) return groupCmp;
+      return (a.name || "").localeCompare(b.name || "");
+    });
+  }, [hwControllers]);
+
+  const hwControllerValues = useMemo(
+    () => ["", ...sortedControllers.map((c) => c.id)],
+    [sortedControllers]
   );
+
+  const hwControllerLabels = useMemo(() => {
+    const m: Record<string, string> = { "": "— pick —" };
+    sortedControllers.forEach((c) => {
+      const group = c.userProject ? `${c.userProject}: ` : "";
+      m[c.id] = `${group}${c.name || `Controller #${c.id}`}`;
+    });
+    return m;
+  }, [sortedControllers]);
+
+  const userProjectByControllerId = useMemo(() => {
+    const m: Record<string, string> = {};
+    sortedControllers.forEach((c) => { m[c.id] = c.userProject || ""; });
+    return m;
+  }, [sortedControllers]);
 
   // AG Grid theme — light Quartz with CSS-variable overrides applied via class
   const theme = useMemo(
@@ -398,23 +444,37 @@ export default function InstancesGrid({
         },
       },
       {
-        headerName: "User Project",
-        field: "userProject",
+        headerName: "Controller (AS)",
+        field: "hwControllerId",
         editable: true,
         cellEditor: "agSelectCellEditor",
         cellEditorParams: {
-          values: userProjectValues,
+          values: hwControllerValues,
         } as ISelectCellEditorParams,
+        valueFormatter: (p) => hwControllerLabels[p.value ?? ""] ?? p.value ?? "",
         filter: "agTextColumnFilter",
         floatingFilter: true,
         sortable: true,
         resizable: true,
-        minWidth: 130,
+        minWidth: 160,
         flex: 1.5,
         cellStyle: (p) =>
           !p.value
             ? { background: "#FEF3C7", color: "#92400E" }
             : null,
+      },
+      {
+        headerName: "User Project",
+        colId: "userProjectDerived",
+        editable: false,
+        sortable: true,
+        filter: "agTextColumnFilter",
+        floatingFilter: true,
+        resizable: true,
+        minWidth: 120,
+        flex: 1,
+        valueGetter: (p) => userProjectByControllerId[p.data?.hwControllerId ?? ""] ?? "",
+        cellStyle: { color: "var(--color-text-secondary, #6b7280)" },
       },
       {
         headerName: "Folder",
@@ -499,7 +559,7 @@ export default function InstancesGrid({
         suppressHeaderMenuButton: true,
       },
     ],
-    [typeValues, userProjectValues, folderValues, folderLabels, cmtProfiles, folderOptions.length, onMapSignals, onViewExportedBlocks, folderLabels, connStatusByInstance, reconciliationDataByInstance]
+    [typeValues, hwControllerValues, hwControllerLabels, userProjectByControllerId, folderValues, folderLabels, cmtProfiles, folderOptions.length, onMapSignals, onViewExportedBlocks, folderLabels, connStatusByInstance, reconciliationDataByInstance]
   );
 
   // Detect duplicate instance names for cell styling
@@ -618,9 +678,21 @@ export default function InstancesGrid({
               {genConn ? "Generating…" : "Generate Connections"}
             </button>
           )}
-          <button className="ig-btn ig-btn-primary" onClick={onRowAdd}>
-            <i className="ti ti-plus" aria-hidden="true" /> Add Instance
-          </button>
+          {onRunReconciliation && (
+            <button className="ig-btn ig-btn-ghost" onClick={onRunReconciliation} title="Reconcile IO connections">
+              <i className="ti ti-refresh" aria-hidden="true" /> Run Reconciliation
+            </button>
+          )}
+          {onViewOverview && (
+            <button className="ig-btn ig-btn-ghost" onClick={onViewOverview} title="View reconciliation overview">
+              <i className="ti ti-list-check" aria-hidden="true" /> View Overview
+            </button>
+          )}
+          {onAddComposite && (
+            <button className="ig-btn ig-btn-primary" onClick={onAddComposite} title="Add composite CM instances">
+              <i className="ti ti-layout-grid" aria-hidden="true" /> Add Composite
+            </button>
+          )}
         </div>
       </div>
 

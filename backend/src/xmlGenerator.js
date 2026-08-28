@@ -10,7 +10,12 @@ const mkBlock = () => `DT0003006D${_h8()}`;
 const mkVar   = () => `DT0003006E${_h8()}`;
 const mkMsg   = () => `DT0003003E${_h8()}`;
 const appId   = id => 'DT0000' + id.slice(6);
-const resetCtr = () => { _ctr = 0x00400000; resetIOTagCtr(); };
+const resetCtr = () => { _ctr = 0x00400000; resetIOTagCtr(); resetFolderCtr(); };
+
+
+let _folderCtr = 0x00000251;
+const mkFolder     = () => `OD01101071:${(_folderCtr++).toString(16).padStart(8, '0').toUpperCase()}:00000000:00000000`;
+const resetFolderCtr = () => { _folderCtr = 0x00000251; };
 
 // ── IOTag ID generator ────────────────────────────────────────────────────────
 // Generate IOTag IDs following PCS7 convention: OD00113002:{unique hex}:{parent type}:{parent hex}
@@ -463,7 +468,7 @@ function emitInstanceLines(inst, counters, preAllocatedId, instanceIdMap, fx, wi
 function emitFolder(b, folder, depth, childrenOf, instsByFolder, counters, useLegacyId, instanceIdMap, legacyPcId, fx, wireSpecs, exposedVarIds, signalMaps) {
   fx = fx || FX_DEFAULT;
   const prefix = '\t'.repeat(depth);
-  const folderId = useLegacyId ? (legacyPcId || FX_DEFAULT.PC) : mkBlock();
+  const folderId = useLegacyId ? (legacyPcId || FX_DEFAULT.PC) : mkFolder();
   counters.blocks++;
 
   b.raw(`${prefix}<PlantHierarchyFolder Name="${esc(folder.name)}" ID="${folderId}" Version="V6.0">`);
@@ -488,9 +493,11 @@ function emitFolder(b, folder, depth, childrenOf, instsByFolder, counters, useLe
       const baseDepth   = 5;
       const extra       = '\t'.repeat(Math.max(0, targetDepth - baseDepth));
       for (const inst of insts) {
+        // Each instance is assigned to its own controller's CPU (multi-device projects).
+        const instFx = fx.forInstance ? fx.forInstance(inst) : fx;
         const instLines = inst.isMatrix
-          ? emitMatrixInstanceLines(inst.matrixDef, counters, instanceIdMap?.[inst.instanceName], fx)
-          : emitInstanceLines(inst, counters, instanceIdMap?.[inst.instanceName], instanceIdMap, fx,
+          ? emitMatrixInstanceLines(inst.matrixDef, counters, instanceIdMap?.[inst.instanceName], instFx)
+          : emitInstanceLines(inst, counters, instanceIdMap?.[inst.instanceName], instanceIdMap, instFx,
               wireSpecs?.[inst.instanceName], exposedVarIds, (exposedVarIds ? (exposedVarIds[inst.instanceName] ||= {}) : undefined),
               signalMaps?.[inst.instanceName]);
         for (const l of instLines) b.raw(extra + l);
@@ -547,6 +554,14 @@ function buildWireSpecs(connGroups) {
 function generateXML(instances, projectName, hierarchy, instanceFolderMap, projectConfig, connGroups, signalMaps = {}) {
   resetCtr();
   const FX  = buildFX(projectConfig);
+
+  // Seed folder counter from imported Process Cell ID so generated folder IDs
+  // follow on from the real PCS7 sequence and don't collide with the PC itself.
+  // PC format: OD01101071:<ownID>:00000000:00000000 — start at ownID+1.
+  if (projectConfig?.process_cell_id) {
+    const pcOwn = parseInt(projectConfig.process_cell_id.split(':')[1], 16);
+    if (!isNaN(pcOwn) && pcOwn >= 0x00000251) _folderCtr = pcOwn + 1;
+  }
   const b   = makeBuilder();
   const now = new Date().toISOString().slice(0, 19);
   const NS  = 'http://www.siemens.com/automation/2005/SimaticML';
@@ -555,6 +570,85 @@ function generateXML(instances, projectName, hierarchy, instanceFolderMap, proje
   const xmlProjectName = projectConfig?.project_name || projectName;
   const xmlDeviceName  = projectConfig?.device_name  || projectName;
   const xmlExportUser  = projectConfig?.export_user  || 'GENERATED';
+
+  // ── Devices ─────────────────────────────────────────────────────────────────
+  // A user project may contain several controllers (AS01 + AS02), each needing
+  // its own <Device> block with distinct rack / CPU / IOTag ids. Those ids come
+  // from project_config_devices, parsed out of that user project's PCS7 export.
+  // With no stored devices we fall back to a single device built from FX, which
+  // reproduces the previous single-controller output byte-for-byte.
+  const deviceRows = (projectConfig?.devices || []).filter(d => d && (d.device_id || d.cpu_id));
+  const devices = deviceRows.length
+    ? deviceRows.map(d => ({
+        hwControllerId: d.hw_controller_id ?? null,
+        name:  d.device_name || xmlDeviceName,
+        DEV:   d.device_id   || FX.DEV,
+        RACK:  d.rack_id     || FX.RACK,
+        CPU:   d.cpu_id      || FX.CPU,
+        IOTAG: d.iotag_id    || FX.IOTAG,
+      }))
+    : [{
+        hwControllerId: null,
+        name:  xmlDeviceName,
+        DEV:   FX.DEV,
+        RACK:  FX.RACK,
+        CPU:   FX.CPU,
+        IOTAG: FX.IOTAG,
+      }];
+
+  // Resolve an instance to the device that should own it, keyed by the
+  // hw_controller_id chosen in the Instances grid.
+  //
+  // Single-device projects always use that one device — the instance's controller
+  // is irrelevant because there is only one place for it to go, which keeps
+  // pre-multi-controller projects generating exactly as before.
+  //
+  // Multi-device projects must NOT guess: an instance whose controller doesn't
+  // match a device would silently land on the wrong CPU. The UI blocks this
+  // (Generate is disabled while any instance lacks a controller), so reaching
+  // here means something bypassed that gate — fail loudly rather than mis-route.
+  const cpuByControllerId = new Map(
+    devices.filter(d => d.hwControllerId != null).map(d => [String(d.hwControllerId), d])
+  );
+  const singleDevice = devices.length === 1;
+  const unroutable = new Set();
+  const deviceForInstance = inst => {
+    if (singleDevice) return devices[0];
+    const key = inst?.hwControllerId ?? inst?.hw_controller_id;
+    const dev = key != null ? cpuByControllerId.get(String(key)) : null;
+    if (!dev) {
+      unroutable.add(inst?.instanceName || '(unnamed)');
+      return null;
+    }
+    return dev;
+  };
+  const assertAllRouted = () => {
+    if (!unroutable.size) return;
+    const names = [...unroutable].slice(0, 10).join(', ');
+    const more = unroutable.size > 10 ? ` … and ${unroutable.size - 10} more` : '';
+    throw new Error(
+      `${unroutable.size} instance(s) are not assigned to a controller in this user project: ` +
+      `${names}${more}. Assign a controller in the Instances grid before generating.`
+    );
+  };
+
+  // Validate up front so a routing failure aborts before any XML is produced,
+  // rather than surfacing halfway through a partially-built document.
+  for (const inst of instances) deviceForInstance(inst);
+  assertAllRouted();
+
+  // FX variant carrying the CPU id of the instance's own controller. Cached per
+  // device so repeated lookups don't allocate. `forInstance` lets emitFolder
+  // resolve per-instance FX without changing its signature.
+  const fxCache = new Map();
+  const fxForInstance = inst => {
+    const dev = deviceForInstance(inst);
+    if (!fxCache.has(dev)) {
+      fxCache.set(dev, { ...FX, DEV: dev.DEV, RACK: dev.RACK, CPU: dev.CPU, IOTAG: dev.IOTAG });
+    }
+    return fxCache.get(dev);
+  };
+  const FX_WITH_RESOLVER = { ...FX, forInstance: fxForInstance };
 
   // Stats counters (shared, mutated by helpers)
   const counters = { blocks: 0, vars: 0, msgs: 0, links: 0 };
@@ -570,42 +664,26 @@ function generateXML(instances, projectName, hierarchy, instanceFolderMap, proje
   b.raw(`\t\t</AttributeList>`);
   b.raw(`\t\t<ObjectList>`);
 
-  // ── Device section ──────────────────────────────────────────────────────────
-  b.raw(`\t\t\t<Device Name="${esc(xmlDeviceName)}" Type="Central" ID="${FX.DEV}" Version="3.0">`);
-  b.raw(`\t\t\t\t<AppId AppName="SIMATIC" Value="${FX.DEV}"/>`);
-  b.raw(`\t\t\t\t<AttributeList><Attribute Name="S7StationType"><Value>S7400</Value></Attribute></AttributeList>`);
-  b.raw(`\t\t\t\t<ObjectList>`);
-  b.raw(`\t\t\t\t\t<DeviceItem Name="UR2ALU" Type="Rack" ID="${FX.RACK}" Version="3.0">`);
-  b.raw(`\t\t\t\t\t\t<AttributeList>`);
-  b.raw(`\t\t\t\t\t\t\t<Attribute Name="BuildIn"><Value>false</Value></Attribute>`);
-  b.raw(`\t\t\t\t\t\t\t<Attribute Name="OrderNumber"><Value>6ES7 400-1JA11-0AA0</Value></Attribute>`);
-  b.raw(`\t\t\t\t\t\t\t<Attribute Name="SubDevice"><Value>0</Value></Attribute>`);
-  b.raw(`\t\t\t\t\t\t\t<Attribute Name="SubSystem"><Value>0</Value></Attribute>`);
-  b.raw(`\t\t\t\t\t\t</AttributeList>`);
-  b.raw(`\t\t\t\t\t</DeviceItem>`);
-  b.raw(`\t\t\t\t\t<DeviceItem Name="CPU 410-5H" Type="ControllerTarget" ID="${FX.CPU}" Version="3.0">`);
-  b.raw(`\t\t\t\t\t\t<AttributeList>`);
-  b.raw(`\t\t\t\t\t\t\t<Attribute Name="BuildIn"><Value>false</Value></Attribute>`);
-  b.raw(`\t\t\t\t\t\t\t<Attribute Name="FirmwareVersion"><Value>V8.2</Value></Attribute>`);
-  b.raw(`\t\t\t\t\t\t\t<Attribute Name="OrderNumber"><Value>6ES7 410-5HX08-0AB0</Value></Attribute>`);
-  b.raw(`\t\t\t\t\t\t\t<Attribute Name="Slot"><Value>3</Value></Attribute>`);
-  b.raw(`\t\t\t\t\t\t\t<Attribute Name="SubDevice"><Value>0</Value></Attribute>`);
-  b.raw(`\t\t\t\t\t\t\t<Attribute Name="SubSystem"><Value>0</Value></Attribute>`);
-  b.raw(`\t\t\t\t\t\t</AttributeList>`);
-
-  // ── IOTag Folder with reconciled signal tags ────────────────────────────────
-  // Collect all REAL (hardware-matched) signals from signalMaps and emit IOTag
-  // elements with resolved I/O addresses.
-  // Collect all REAL (hardware-matched) signals from signalMaps, deduplicating by tag
-  // name (multiple block-pins may bind the same physical signal).
+  // ── IOTag collection ────────────────────────────────────────────────────────
+  // Collect all REAL (hardware-matched) signals from signalMaps, deduplicating by
+  // tag name (multiple block-pins may bind the same physical signal), and bucket
+  // them by the device that owns the instance the signal belongs to — each
+  // controller's IOTagFolder must hold only its own signals.
   const ioTagsSeen = new Set();
-  const ioTags = [];
-  for (const pins of Object.values(signalMaps || {})) {
+  const ioTagsByDevice = new Map(devices.map(d => [d, []]));
+  const instByName = new Map(instances.map(i => [i.instanceName, i]));
+  for (const [instName, pins] of Object.entries(signalMaps || {})) {
+    const inst = instByName.get(instName);
+    // A signal map may name an instance that isn't in this group (other user
+    // project, or stale mapping) — it has no device here, so skip its tags.
+    if (!inst) continue;
+    const dev = deviceForInstance(inst);
+    if (!dev) continue;
     for (const entry of Object.values(pins || {})) {
       if (entry.dummy || !entry.tag || !entry.ioAddress) continue;
       if (ioTagsSeen.has(entry.tag)) continue;
       ioTagsSeen.add(entry.tag);
-      ioTags.push({
+      ioTagsByDevice.get(dev).push({
         name:     entry.tag,
         address:  entry.ioAddress,
         comment:  entry.comment || null,
@@ -614,33 +692,59 @@ function generateXML(instances, projectName, hierarchy, instanceFolderMap, proje
     }
   }
 
-  // Extract parent IOTagFolder's type and ID for child IOTag IDs
+  // ── Device sections ─────────────────────────────────────────────────────────
+  // One <Device> per controller, emitted as siblings before the shared plant
+  // hierarchy — matching how PCS7 exports a multi-controller user project.
   const parentTypeHex = '00113001';
-  const parentIdHex = FX.IOTAG.split(':')[1] || '00006407';
+  for (const dev of devices) {
+    b.raw(`\t\t\t<Device Name="${esc(dev.name)}" Type="Central" ID="${dev.DEV}" Version="3.0">`);
+    b.raw(`\t\t\t\t<AppId AppName="SIMATIC" Value="${dev.DEV}"/>`);
+    b.raw(`\t\t\t\t<AttributeList><Attribute Name="S7StationType"><Value>S7400</Value></Attribute></AttributeList>`);
+    b.raw(`\t\t\t\t<ObjectList>`);
+    b.raw(`\t\t\t\t\t<DeviceItem Name="UR2ALU" Type="Rack" ID="${dev.RACK}" Version="3.0">`);
+    b.raw(`\t\t\t\t\t\t<AttributeList>`);
+    b.raw(`\t\t\t\t\t\t\t<Attribute Name="BuildIn"><Value>false</Value></Attribute>`);
+    b.raw(`\t\t\t\t\t\t\t<Attribute Name="OrderNumber"><Value>6ES7 400-1JA11-0AA0</Value></Attribute>`);
+    b.raw(`\t\t\t\t\t\t\t<Attribute Name="SubDevice"><Value>0</Value></Attribute>`);
+    b.raw(`\t\t\t\t\t\t\t<Attribute Name="SubSystem"><Value>0</Value></Attribute>`);
+    b.raw(`\t\t\t\t\t\t</AttributeList>`);
+    b.raw(`\t\t\t\t\t</DeviceItem>`);
+    b.raw(`\t\t\t\t\t<DeviceItem Name="CPU 410-5H" Type="ControllerTarget" ID="${dev.CPU}" Version="3.0">`);
+    b.raw(`\t\t\t\t\t\t<AttributeList>`);
+    b.raw(`\t\t\t\t\t\t\t<Attribute Name="BuildIn"><Value>false</Value></Attribute>`);
+    b.raw(`\t\t\t\t\t\t\t<Attribute Name="FirmwareVersion"><Value>V8.2</Value></Attribute>`);
+    b.raw(`\t\t\t\t\t\t\t<Attribute Name="OrderNumber"><Value>6ES7 410-5HX08-0AB0</Value></Attribute>`);
+    b.raw(`\t\t\t\t\t\t\t<Attribute Name="Slot"><Value>3</Value></Attribute>`);
+    b.raw(`\t\t\t\t\t\t\t<Attribute Name="SubDevice"><Value>0</Value></Attribute>`);
+    b.raw(`\t\t\t\t\t\t\t<Attribute Name="SubSystem"><Value>0</Value></Attribute>`);
+    b.raw(`\t\t\t\t\t\t</AttributeList>`);
 
-  b.raw(`\t\t\t\t\t\t<ObjectList>`);
-  b.raw(`\t\t\t\t\t\t\t<IOTagFolder ID="${FX.IOTAG}" Version="V6.0">`);
-  b.raw(`\t\t\t\t\t\t\t\t<ObjectList>`);
-  for (const tag of ioTags) {
-    const tagId = mkIOTag(parentTypeHex, parentIdHex);
-    b.raw(`\t\t\t\t\t\t\t\t\t<IOTag Name="${esc(tag.name)}" ID="${tagId}" Version="V6.0">`);
-    b.raw(`\t\t\t\t\t\t\t\t\t\t<AttributeList>`);
-    b.raw(`\t\t\t\t\t\t\t\t\t\t\t<Address>${esc(tag.address)}</Address>`);
-    b.raw(tag.comment
-      ? `\t\t\t\t\t\t\t\t\t\t\t<Comment>${esc(tag.comment)}</Comment>`
-      : `\t\t\t\t\t\t\t\t\t\t\t<Comment/>`);
-    b.raw(`\t\t\t\t\t\t\t\t\t\t\t<DataType>${esc(tag.dataType)}</DataType>`);
-    b.raw(`\t\t\t\t\t\t\t\t\t\t</AttributeList>`);
-    b.raw(`\t\t\t\t\t\t\t\t\t</IOTag>`);
+    // ── IOTag Folder with this device's reconciled signal tags ────────────────
+    const parentIdHex = dev.IOTAG.split(':')[1] || '00006407';
+    b.raw(`\t\t\t\t\t\t<ObjectList>`);
+    b.raw(`\t\t\t\t\t\t\t<IOTagFolder ID="${dev.IOTAG}" Version="V6.0">`);
+    b.raw(`\t\t\t\t\t\t\t\t<ObjectList>`);
+    for (const tag of ioTagsByDevice.get(dev) || []) {
+      const tagId = mkIOTag(parentTypeHex, parentIdHex);
+      b.raw(`\t\t\t\t\t\t\t\t\t<IOTag Name="${esc(tag.name)}" ID="${tagId}" Version="V6.0">`);
+      b.raw(`\t\t\t\t\t\t\t\t\t\t<AttributeList>`);
+      b.raw(`\t\t\t\t\t\t\t\t\t\t\t<Address>${esc(tag.address)}</Address>`);
+      b.raw(tag.comment
+        ? `\t\t\t\t\t\t\t\t\t\t\t<Comment>${esc(tag.comment)}</Comment>`
+        : `\t\t\t\t\t\t\t\t\t\t\t<Comment/>`);
+      b.raw(`\t\t\t\t\t\t\t\t\t\t\t<DataType>${esc(tag.dataType)}</DataType>`);
+      b.raw(`\t\t\t\t\t\t\t\t\t\t</AttributeList>`);
+      b.raw(`\t\t\t\t\t\t\t\t\t</IOTag>`);
+    }
+    b.raw(`\t\t\t\t\t\t\t\t</ObjectList>`);
+    b.raw(`\t\t\t\t\t\t\t</IOTagFolder>`);
+    b.raw(`\t\t\t\t\t\t</ObjectList>`);
+    b.raw(`\t\t\t\t\t</DeviceItem>`);
+    b.raw(`\t\t\t\t</ObjectList>`);
+    b.raw(`\t\t\t</Device>`);
+
+    counters.blocks++; // Device
   }
-  b.raw(`\t\t\t\t\t\t\t\t</ObjectList>`);
-  b.raw(`\t\t\t\t\t\t\t</IOTagFolder>`);
-  b.raw(`\t\t\t\t\t\t</ObjectList>`);
-  b.raw(`\t\t\t\t\t</DeviceItem>`);
-  b.raw(`\t\t\t\t</ObjectList>`);
-  b.raw(`\t\t\t</Device>`);
-
-  counters.blocks++; // Device
 
   // Pre-allocate a top-level ID for every instance so EM role assignments can
   // reference CM instance IDs before those instances have been emitted.
@@ -696,7 +800,7 @@ function generateXML(instances, projectName, hierarchy, instanceFolderMap, proje
     }
 
     for (const root of roots) {
-      emitFolder(b, root, 3, childrenOf, instsByFolder, counters, false, instanceIdMap, FX.PC, FX, wireSpecs, exposedVarIds, signalMaps);
+      emitFolder(b, root, 3, childrenOf, instsByFolder, counters, true, instanceIdMap, FX.PC, FX_WITH_RESOLVER, wireSpecs, exposedVarIds, signalMaps);
     }
   } else {
     // Legacy: single Process cell(1) containing all instances (byte-identical to pre-feature output).
@@ -706,9 +810,11 @@ function generateXML(instances, projectName, hierarchy, instanceFolderMap, proje
     b.raw(`\t\t\t\t<ObjectList>`);
     counters.blocks++; // ProcessCell
     for (const inst of instances) {
+      // Each instance is assigned to its own controller's CPU (multi-device projects).
+      const instFx = fxForInstance(inst);
       const instLines = inst.isMatrix
-        ? emitMatrixInstanceLines(inst.matrixDef, counters, instanceIdMap[inst.instanceName], FX)
-        : emitInstanceLines(inst, counters, instanceIdMap[inst.instanceName], instanceIdMap, FX,
+        ? emitMatrixInstanceLines(inst.matrixDef, counters, instanceIdMap[inst.instanceName], instFx)
+        : emitInstanceLines(inst, counters, instanceIdMap[inst.instanceName], instanceIdMap, instFx,
             wireSpecs[inst.instanceName], exposedVarIds, (exposedVarIds[inst.instanceName] ||= {}),
             signalMaps[inst.instanceName]);
       for (const l of instLines) b.raw(l);

@@ -681,9 +681,9 @@ function TabColumnMap({ importId, columnMaps, onColumnMapsChange, cmtProfiles, a
     setBusy(true);
     try {
       if (selected) {
-        await updateIOColumnMap(selected, draft);
+        await updateIOColumnMap(savedProjectId, selected, draft);
       } else {
-        const r = await createIOColumnMap(draft);
+        const r = await createIOColumnMap(savedProjectId, draft);
         setSelected(r.id);
       }
       await onColumnMapsChange();
@@ -704,7 +704,7 @@ function TabColumnMap({ importId, columnMaps, onColumnMapsChange, cmtProfiles, a
 
   async function del(id) {
     if (!confirm('Delete this column mapping config?')) return;
-    await deleteIOColumnMap(id);
+    await deleteIOColumnMap(savedProjectId, id);
     if (selected === id) { setSelected(null); setDraft(null); }
     await onColumnMapsChange();
   }
@@ -1043,7 +1043,14 @@ function TabHierarchy({ importId, projectId, functionMaps, onPromoted, setError 
         }
       }
       const r = await promoteIOImport(importId, projectId);
-      alert(`Promoted ${r.instances} instances, ${r.folders} hierarchy folders${r.userProjects ? `, ${r.userProjects} AS assignments` : ''}.`);
+      alert(
+        `Promoted ${r.instances} instances, ${r.folders} hierarchy folders.` +
+        (r.unmatchedAs?.length
+          ? `\n\nNo controller matches these AS values: ${r.unmatchedAs.join(', ')}.` +
+            `\nThose instances have no controller — assign one in the Instances grid ` +
+            `(or add the controller in HW Config) before generating.`
+          : '')
+      );
       onPromoted();
     } catch (e) { setError(e.message); }
     finally { setBusy(false); }
@@ -1219,14 +1226,16 @@ function TabHierarchy({ importId, projectId, functionMaps, onPromoted, setError 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TAB 4 — FUNCTION MAPPING
 // ═══════════════════════════════════════════════════════════════════════════════
-function TabFunctionMap({ importId, functionMaps, onFunctionMapsChange, cmtProfiles, compositeCmTypes, setError }) {
+function TabFunctionMap({ projectId, importId, functionMaps, onFunctionMapsChange, cmtProfiles, compositeCmTypes, setError }) {
   const [selected, setSelected]   = useState(null);
   const [mappings, setMappings]   = useState([]);   // { function_value, cm_type_name, match_mode, priority }
   const [unresolved, setUnresolved] = useState([]);
   const [busy, setBusy]           = useState(false);
+  const [importWarnings, setImportWarnings] = useState([]); // unknown CM types after import
   // Draft of the selected config's name while the field has focus. The parent
   // owns `functionMaps`, so we edit locally and push on blur.
   const [nameDraft, setNameDraft] = useState(null);
+  const importFileRef = useRef(null);
 
   // Sliding-highlight geometry. The row height is measured rather than assumed:
   // rows size to their own font/padding, so a hard-coded value drifts the
@@ -1242,8 +1251,9 @@ function TabFunctionMap({ importId, functionMaps, onFunctionMapsChange, cmtProfi
   async function selectConfig(id) {
     setSelected(id);
     setNameDraft(null);
+    setImportWarnings([]);
     try {
-      const m = await getIOFunctionMapMappings(id);
+      const m = await getIOFunctionMapMappings(projectId, id);
       setMappings(m.map(r => ({ ...r })));
     } catch (e) { setError(e.message); }
   }
@@ -1251,7 +1261,7 @@ function TabFunctionMap({ importId, functionMaps, onFunctionMapsChange, cmtProfi
   async function createNew() {
     setBusy(true);
     try {
-      const r = await createIOFunctionMap({ name: `Function Map ${functionMaps.length + 1}`, description: '' });
+      const r = await createIOFunctionMap(projectId, { name: `Function Map ${functionMaps.length + 1}`, description: '' });
       await onFunctionMapsChange();
       selectConfig(r.id);
     } catch (e) { setError(e.message); }
@@ -1264,9 +1274,9 @@ function TabFunctionMap({ importId, functionMaps, onFunctionMapsChange, cmtProfi
     try {
       const fm = functionMaps.find(m => m.id === selected);
       if (fm && fm.name) {
-        await updateIOFunctionMap(selected, { name: fm.name });
+        await updateIOFunctionMap(projectId, selected, { name: fm.name });
       }
-      await saveIOFunctionMapMappings(selected, mappings);
+      await saveIOFunctionMapMappings(projectId, selected, mappings);
     } catch (e) { setError(e.message); }
     finally { setBusy(false); }
   }
@@ -1275,7 +1285,7 @@ function TabFunctionMap({ importId, functionMaps, onFunctionMapsChange, cmtProfi
     if (!selected) return;
     setBusy(true);
     try {
-      await deleteIOFunctionMap(selected);
+      await deleteIOFunctionMap(projectId, selected);
       setSelected(null);
       setMappings([]);
       await onFunctionMapsChange();
@@ -1289,7 +1299,7 @@ function TabFunctionMap({ importId, functionMaps, onFunctionMapsChange, cmtProfi
     const next = nameDraft.trim();
     if (!fm || !next || next === fm.name) { setNameDraft(null); return; }
     try {
-      await updateIOFunctionMap(id, { name: next });
+      await updateIOFunctionMap(projectId, id, { name: next });
       await onFunctionMapsChange();                 // refresh the list so the rename shows
     } catch (e) { setError(e.message); }
     finally { setNameDraft(null); }
@@ -1315,6 +1325,67 @@ function TabFunctionMap({ importId, functionMaps, onFunctionMapsChange, cmtProfi
     setMappings(m => [...m, { function_value: fnVal, cm_type_name: '', match_mode: 'exact', priority: 0 }]);
   }
 
+  // Export selected config as a JSON file (cross-project portable)
+  async function exportConfig() {
+    if (!selected) return;
+    const fm = functionMaps.find(m => m.id === selected);
+    if (!fm) return;
+    let rows = mappings;
+    if (!rows.length) {
+      try { rows = await getIOFunctionMapMappings(projectId, selected); } catch (_) {}
+    }
+    const payload = {
+      _type: 'io_function_map',
+      name: fm.name,
+      mappings: rows.map(({ function_value, cm_type_name, match_mode, priority }) =>
+        ({ function_value, cm_type_name, match_mode: match_mode || 'exact', priority: priority || 0 })),
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = `${fm.name.replace(/[^a-z0-9_-]/gi, '_')}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  // Import a config JSON file; creates a new config in the DB
+  async function handleImportFile(e) {
+    const file = e.target.files?.[0];
+    if (!importFileRef.current) return;
+    importFileRef.current.value = '';
+    if (!file) return;
+    let payload;
+    try {
+      payload = JSON.parse(await file.text());
+    } catch {
+      setError('Invalid JSON file.'); return;
+    }
+    if (payload._type !== 'io_function_map' || !Array.isArray(payload.mappings)) {
+      setError('File is not a valid Function Map export.'); return;
+    }
+    setBusy(true);
+    try {
+      // Resolve name — append _copy if name already taken
+      const existingNames = new Set(functionMaps.map(m => m.name));
+      let name = payload.name || 'Imported Map';
+      if (existingNames.has(name)) name = `${name}_copy`;
+
+      const created = await createIOFunctionMap(projectId, { name, description: '' });
+      await saveIOFunctionMapMappings(projectId, created.id, payload.mappings);
+      await onFunctionMapsChange();
+      await selectConfig(created.id);
+
+      // Warn about CM types not present in this project's composites
+      const knownTypes = new Set((compositeCmTypes || []).map(c => c.name));
+      const unknown = payload.mappings
+        .map(m => m.cm_type_name)
+        .filter(t => t && !knownTypes.has(t));
+      setImportWarnings([...new Set(unknown)]);
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
+  }
+
   const MAP_COLS = '1fr 180px 110px 80px 40px';
 
   return (
@@ -1327,10 +1398,20 @@ function TabFunctionMap({ importId, functionMaps, onFunctionMapsChange, cmtProfi
 
         {/* Config list panel */}
         <div style={glassPanelSx}>
-          <div style={glassPanelHeaderSx}>
+          <div style={{ ...glassPanelHeaderSx, display: 'flex', flexDirection: 'column', gap: 6 }}>
             <Btn primary onClick={createNew} disabled={busy} style={{ width: '100%' }}>
               <i className="ti ti-plus" /> New config
             </Btn>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <Btn onClick={() => importFileRef.current?.click()} disabled={busy} style={{ flex: 1, fontSize: 11, padding: '5px 8px' }}>
+                <i className="ti ti-upload" /> Import
+              </Btn>
+              <Btn onClick={exportConfig} disabled={!selected || busy} style={{ flex: 1, fontSize: 11, padding: '5px 8px' }}>
+                <i className="ti ti-download" /> Export
+              </Btn>
+            </div>
+            <input ref={importFileRef} type="file" accept=".json" style={{ display: 'none' }}
+              onChange={handleImportFile} />
           </div>
           <div className="glass-radio-group-vertical" style={{ flex: 1, overflowY: 'auto' }}>
             {functionMaps.length === 0 ? (
@@ -1407,6 +1488,23 @@ function TabFunctionMap({ importId, functionMaps, onFunctionMapsChange, cmtProfi
                     background: '#FFFFFF', color: '#1C1B19', outline: 'none' }} />
               </div>
 
+              {importWarnings.length > 0 && (
+                <div style={{ background: '#FEF3C7', border: '1px solid #FCD34D', borderRadius: 8,
+                    padding: '8px 12px', marginBottom: '1rem', fontSize: 12, color: '#92400E',
+                    display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+                  <i className="ti ti-alert-triangle" style={{ flexShrink: 0, marginTop: 1 }} />
+                  <div>
+                    <b>Unknown CM types in this project:</b>{' '}
+                    {importWarnings.join(', ')}. These rows are highlighted — assign a valid type or add the composite CM type first.
+                    <button onClick={() => setImportWarnings([])}
+                      style={{ marginLeft: 10, background: 'none', border: 'none', cursor: 'pointer',
+                        color: '#92400E', fontWeight: 600, fontSize: 12, padding: 0 }}>
+                      Dismiss
+                    </button>
+                  </div>
+                </div>
+              )}
+
               <SLabel text={`Mappings (${mappings.length})`}>
                 <Btn onClick={addRow} style={{ fontSize: 11, padding: '5px 12px' }}>
                   <i className="ti ti-plus" /> Add mapping
@@ -1430,20 +1528,27 @@ function TabFunctionMap({ importId, functionMaps, onFunctionMapsChange, cmtProfi
                     ))}
                   </div>
 
-                  {mappings.map((m, i) => (
+                  {mappings.map((m, i) => {
+                    const knownTypes = new Set((compositeCmTypes || []).map(c => c.name));
+                    const cmUnknown = m.cm_type_name && !knownTypes.has(m.cm_type_name);
+                    return (
                     <div key={i} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr 40px', gap: 12,
                         padding: '10px 16px', alignItems: 'center',
                         borderBottom: '1px solid rgba(28,27,25,0.08)',
-                        background: '#FFFFFF' }}>
+                        background: cmUnknown ? '#FFF7ED' : '#FFFFFF' }}>
                       <div style={{ display: 'flex', borderRight: '1px solid rgba(28,27,25,0.08)', paddingRight: '12px' }}>
                         <input value={m.function_value}
                           onChange={e => updateRow(i, 'function_value', e.target.value.toUpperCase())}
                           placeholder="e.g. MOTOR" style={{ ...inputSx, padding: '6px 8px', flex: 1 }} />
                       </div>
                       <div style={{ display: 'flex', borderRight: '1px solid rgba(28,27,25,0.08)', paddingRight: '12px' }}>
-                        <select value={m.cm_type_name} onChange={e => updateRow(i, 'cm_type_name', e.target.value)}
-                          style={{ ...inputSx, padding: '6px 8px', cursor: 'pointer', flex: 1 }}>
+                        <select value={m.cm_type_name} onChange={e => { updateRow(i, 'cm_type_name', e.target.value); setImportWarnings(w => w.filter(t => t !== m.cm_type_name)); }}
+                          style={{ ...inputSx, padding: '6px 8px', cursor: 'pointer', flex: 1,
+                            border: cmUnknown ? '1.5px solid #F97316' : undefined,
+                            background: cmUnknown ? '#FFF7ED' : undefined,
+                            color: cmUnknown ? '#C2410C' : undefined }}>
                           <option value="">- pick type -</option>
+                          {cmUnknown && <option value={m.cm_type_name} style={{ color: '#C2410C' }}>{m.cm_type_name} ⚠ not found</option>}
                           {(compositeCmTypes || []).map(c => <option key={c.id} value={c.name}>{c.name}</option>)}
                         </select>
                       </div>
@@ -1468,7 +1573,8 @@ function TabFunctionMap({ importId, functionMaps, onFunctionMapsChange, cmtProfi
                         <i className="ti ti-x" />
                       </button>
                     </div>
-                  ))}
+                  );
+                  })}
                 </div>
               )}
 
@@ -1610,7 +1716,14 @@ function TabReview({ importId, projectId, cmtProfiles, compositeCmTypes = [], on
     setBusy(true);
     try {
       const r = await promoteIOImport(importId, projectId);
-      alert(`Promoted ${r.instances} instances, ${r.folders} hierarchy folders${r.userProjects ? `, ${r.userProjects} AS assignments` : ''}.`);
+      alert(
+        `Promoted ${r.instances} instances, ${r.folders} hierarchy folders.` +
+        (r.unmatchedAs?.length
+          ? `\n\nNo controller matches these AS values: ${r.unmatchedAs.join(', ')}.` +
+            `\nThose instances have no controller — assign one in the Instances grid ` +
+            `(or add the controller in HW Config) before generating.`
+          : '')
+      );
       onPromoted();
     } catch (e) { setError(e.message); }
     finally { setBusy(false); }
@@ -1864,12 +1977,16 @@ function TabWorkflow({ importId, projectId, functionMaps, columnMaps, currentImp
         setError(res.error);
       } else {
         setResult(res);
-        onPromoted();
       }
     } catch (err) {
       setError(err);
     } finally {
       setBusy(false);
+      // Re-hydrate regardless of outcome. promoteToProject can commit instances
+      // before a later gate throws, so a failed run still changes project_instances.
+      // Skipping this on the error path is what leaves rows in the DB that the
+      // Instances grid never renders — and therefore can never delete.
+      onPromoted();
     }
   }
 
@@ -2212,12 +2329,12 @@ export default function StepIOImport({ savedProjectId, cmtProfiles, compositeCmT
   }, [selectedImportId]);
 
   const loadColumnMaps = useCallback(async () => {
-    try { setColumnMaps(await getIOColumnMaps()); } catch (_) {}
-  }, []);
+    try { setColumnMaps(await getIOColumnMaps(savedProjectId)); } catch (_) {}
+  }, [savedProjectId]);
 
   const loadFunctionMaps = useCallback(async () => {
-    try { setFunctionMaps(await getIOFunctionMaps()); } catch (_) {}
-  }, []);
+    try { setFunctionMaps(await getIOFunctionMaps(savedProjectId)); } catch (_) {}
+  }, [savedProjectId]);
 
   const savePrefsTimer = useRef(null);
   const handleActiveHeadersChange = useCallback((next) => {

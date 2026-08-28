@@ -99,7 +99,7 @@ function groupBySharedSuffix(cmInstances) {
  *
  * Returns { compositeId, compositeInfo } or { compositeId: null, ... }.
  */
-async function resolveCompositeForGroup(group, cmInstances, db) {
+async function resolveCompositeForGroup(group, cmInstances, db, projectId) {
   const primary = group.primaryIdx != null ? cmInstances[group.primaryIdx] : null;
   const primaryType = primary ? primary.type : (cmInstances[group.members[0].idx]?.type);
   if (!primaryType) return { compositeId: null, compositeInfo: null };
@@ -109,9 +109,9 @@ async function resolveCompositeForGroup(group, cmInstances, db) {
     SELECT DISTINCT cct.id, cct.name, cct.description
     FROM composite_cm_members ccm
     JOIN composite_cm_types cct ON ccm.composite_id = cct.id
-    WHERE ccm.cm_type_name = ?
+    WHERE ccm.cm_type_name = ? AND cct.project_id = ?
     ORDER BY cct.name
-  `).all(primaryType);
+  `).all(primaryType, projectId);
 
   if (candidates.length === 0) return { compositeId: null, compositeInfo: null };
   if (candidates.length === 1) {
@@ -160,7 +160,7 @@ async function resolveCompositeForGroup(group, cmInstances, db) {
  *
  * Returns { compositeId, compositeInfo } or { compositeId: null }.
  */
-async function resolveCompositeForSingle(cm, db) {
+async function resolveCompositeForSingle(cm, db, projectId) {
   const alias = cm.alias || cm.name;
   const cmType = cm.type;
   if (!cmType) return { compositeId: null, compositeInfo: null };
@@ -169,9 +169,9 @@ async function resolveCompositeForSingle(cm, db) {
     SELECT DISTINCT cct.id, cct.name, cct.description
     FROM composite_cm_members ccm
     JOIN composite_cm_types cct ON ccm.composite_id = cct.id
-    WHERE ccm.cm_type_name = ?
+    WHERE ccm.cm_type_name = ? AND cct.project_id = ?
     ORDER BY cct.name
-  `).all(cmType);
+  `).all(cmType, projectId);
 
   if (candidates.length === 0) return { compositeId: null, compositeInfo: null };
 
@@ -213,7 +213,7 @@ async function resolveCompositeForSingle(cm, db) {
  * Output:
  *   - { assignments: [{ alias, cmTypeName, compositeCmId, compositeInfo, suffix, prefix, hierarchyFolder, roleAssignments }], metadata, interconnections }
  */
-async function matchInstancesToComposites(cmInstances, db, roleAssignments = [], interconnections = []) {
+async function matchInstancesToComposites(cmInstances, db, roleAssignments = [], interconnections = [], projectId) {
   const metadata = {
     totalInstances: cmInstances ? cmInstances.length : 0,
     matchedToComposite: 0,
@@ -245,7 +245,7 @@ async function matchInstancesToComposites(cmInstances, db, roleAssignments = [],
   // Resolve a composite per group, then map each instance index → its group resolution.
   const perIndex = new Array(cmInstances.length).fill(null);
   for (const [suffix, group] of groups) {
-    const resolved = await resolveCompositeForGroup(group, cmInstances, db);
+    const resolved = await resolveCompositeForGroup(group, cmInstances, db, projectId);
     metadata.groups.push({
       suffix,
       memberCount: group.members.length,
@@ -296,7 +296,7 @@ async function matchInstancesToComposites(cmInstances, db, roleAssignments = [],
 
     // Not part of a resolved suffix group → try singleton composite resolution
     // (match by CM type, disambiguate by composite name vs instance alias).
-    const single = await resolveCompositeForSingle(cm, db);
+    const single = await resolveCompositeForSingle(cm, db, projectId);
     if (single.compositeId) {
       metadata.matchedToComposite++;
       assignments.push({

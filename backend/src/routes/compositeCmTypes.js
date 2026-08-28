@@ -2,9 +2,9 @@
 'use strict';
 const express = require('express');
 const { getDb } = require('../db');
-const router = express.Router();
+const router = express.Router({ mergeParams: true });
 
-// ── GET /api/composite-cm-types ───────────────────────────────────────────────
+// ── GET /api/projects/:projectId/composite-cm-types ───────────────────────────
 router.get('/', async (req, res) => {
   try {
     const db = getDb();
@@ -13,20 +13,21 @@ router.get('/', async (req, res) => {
              COUNT(m.id) AS member_count
       FROM composite_cm_types c
       LEFT JOIN composite_cm_members m ON m.composite_id = c.id
+      WHERE c.project_id = ?
       GROUP BY c.id
       ORDER BY c.name
-    `).all();
+    `).all(req.params.projectId);
     res.json(rows.map(r => ({ ...r, member_count: Number(r.member_count) })));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── GET /api/composite-cm-types/:id ──────────────────────────────────────────
+// ── GET /api/projects/:projectId/composite-cm-types/:id ───────────────────────
 router.get('/:id', async (req, res) => {
   try {
     const db = getDb();
-    const comp = await db.prepare('SELECT * FROM composite_cm_types WHERE id = ?').get(req.params.id);
+    const comp = await db.prepare('SELECT * FROM composite_cm_types WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
     if (!comp) return res.status(404).json({ error: 'Not found' });
     let members = await db.prepare(
       'SELECT * FROM composite_cm_members WHERE composite_id = ? ORDER BY sort_order, id'
@@ -89,7 +90,7 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// ── POST /api/composite-cm-types ──────────────────────────────────────────────
+// ── POST /api/projects/:projectId/composite-cm-types ──────────────────────────
 // Body: { name, description, is_matrix, members, connections, matrixColumns, matrixModes }
 router.post('/', async (req, res) => {
   try {
@@ -99,8 +100,8 @@ router.post('/', async (req, res) => {
 
     const result = await db.transaction(async () => {
       const row = await db.prepare(
-        'INSERT INTO composite_cm_types (name, description, is_matrix) VALUES (?, ?, ?)'
-      ).run(name.trim(), description?.trim() || '', !!is_matrix);
+        'INSERT INTO composite_cm_types (project_id, name, description, is_matrix) VALUES (?, ?, ?, ?)'
+      ).run(req.params.projectId, name.trim(), description?.trim() || '', !!is_matrix);
       const compId = row.lastInsertRowid;
       await _insertMembers(db, compId, members);
       await _insertConnections(db, compId, connections);
@@ -118,11 +119,11 @@ router.post('/', async (req, res) => {
   }
 });
 
-// ── PUT /api/composite-cm-types/:id ─────────────────────────────────────────
+// ── PUT /api/projects/:projectId/composite-cm-types/:id ───────────────────────
 router.put('/:id', async (req, res) => {
   try {
     const db = getDb();
-    const comp = await db.prepare('SELECT id FROM composite_cm_types WHERE id = ?').get(req.params.id);
+    const comp = await db.prepare('SELECT id FROM composite_cm_types WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
     if (!comp) return res.status(404).json({ error: 'Not found' });
 
     const { name, description, is_matrix, members = [], connections = [], matrixColumns = [], matrixModes = [] } = req.body || {};
@@ -149,10 +150,12 @@ router.put('/:id', async (req, res) => {
   }
 });
 
-// ── DELETE /api/composite-cm-types/:id ───────────────────────────────────────
+// ── DELETE /api/projects/:projectId/composite-cm-types/:id ────────────────────
 router.delete('/:id', async (req, res) => {
   try {
     const db = getDb();
+    const comp = await db.prepare('SELECT id FROM composite_cm_types WHERE id = ? AND project_id = ?').get(req.params.id, req.params.projectId);
+    if (!comp) return res.status(404).json({ error: 'Not found' });
     await db.transaction(async () => {
       await _deleteMatrixData(db, req.params.id);
       await db.prepare('DELETE FROM composite_cm_connections WHERE composite_id = ?').run(req.params.id);
@@ -296,3 +299,72 @@ async function _insertMembers(db, compId, members) {
 }
 
 module.exports = router;
+// Exported so the library export/import routes can serialize/recreate
+// composite trees without duplicating the insert/matrix logic.
+module.exports._insertMembers = _insertMembers;
+module.exports._insertConnections = _insertConnections;
+module.exports._insertMatrixColumns = _insertMatrixColumns;
+module.exports._insertMatrixModes = _insertMatrixModes;
+module.exports._deleteMatrixData = _deleteMatrixData;
+
+// Fetch one composite with full detail (members, connections, matrix data).
+// Same shape as GET /:id — extracted so it can be reused by library export.
+async function getCompositeDetail(db, compositeId) {
+  const comp = await db.prepare('SELECT * FROM composite_cm_types WHERE id = ?').get(compositeId);
+  if (!comp) return null;
+  let members = await db.prepare(
+    'SELECT * FROM composite_cm_members WHERE composite_id = ? ORDER BY sort_order, id'
+  ).all(compositeId);
+  members = members.map(m => ({
+    ...m,
+    roles: m.roles ? (typeof m.roles === 'string' ? JSON.parse(m.roles) : m.roles) : {},
+  }));
+  let connections = await db.prepare(
+    'SELECT * FROM composite_cm_connections WHERE composite_id = ? ORDER BY sort_order, id'
+  ).all(compositeId);
+
+  connections = connections.map(c => {
+    if (c.conn_type === 'io_connection' && c.static_value) {
+      try {
+        const meta = JSON.parse(c.static_value);
+        return { ...c, ...meta };
+      } catch (e) {
+        return c;
+      }
+    }
+    if (c.conn_type === 'value' && c.static_value) {
+      try {
+        const meta = JSON.parse(c.static_value);
+        if (meta && meta.mode === 'derived') {
+          return { ...c, value_mode: 'derived', column: meta.column || '', prefix: meta.prefix || '', suffix: meta.suffix || '' };
+        }
+      } catch (e) {
+        // plain static string — not JSON, fall through
+      }
+      return { ...c, value_mode: 'static' };
+    }
+    return c;
+  });
+
+  const matrixColumnRows = await db.prepare(
+    'SELECT column_name FROM composite_matrix_columns WHERE composite_id = ? ORDER BY sort_order, id'
+  ).all(compositeId);
+  const matrixColumns = matrixColumnRows.map(r => r.column_name);
+
+  const modesRaw = await db.prepare(
+    'SELECT * FROM composite_matrix_modes WHERE composite_id = ? ORDER BY sort_order, id'
+  ).all(compositeId);
+
+  const matrixModes = [];
+  for (const m of modesRaw) {
+    const cells = await db.prepare(
+      'SELECT column_name, value FROM composite_matrix_cells WHERE mode_id = ?'
+    ).all(m.id);
+    const cellMap = {};
+    for (const c of cells) cellMap[c.column_name] = c.value;
+    matrixModes.push({ id: m.id, mode_nr: m.mode_nr, mode_name: m.mode_name, sort_order: m.sort_order, cells: cellMap });
+  }
+
+  return { ...comp, members, connections, matrixColumns, matrixModes };
+}
+module.exports.getCompositeDetail = getCompositeDetail;
