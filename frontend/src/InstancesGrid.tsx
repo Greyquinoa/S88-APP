@@ -201,6 +201,24 @@ function ExportPreviewCellRenderer(props: {
   );
 }
 
+// ── Reconciliation-status cell renderer ──────────────────────────────────────
+// Stable top-level reference (matching the other cell renderers below) instead
+// of an inline arrow function in columnDefs — an inline function there gets
+// treated as a new component type on re-render, which makes AG Grid remount
+// the cell (and its DOM) for every visible row instead of reusing it. That
+// was the main cause of laggy scrolling once the grid held a few thousand rows.
+function ReconciliationStatusCellRenderer(props: {
+  data: InstanceRow;
+  context: { reconciliationDataByInstance?: Record<string, any> };
+}) {
+  return (
+    <ReconciliationStatusRenderer
+      reconData={props.context.reconciliationDataByInstance}
+      instanceName={props.data.instanceName}
+    />
+  );
+}
+
 // ── Imported checkbox cell renderer ──────────────────────────────────────────
 
 function ImportedCheckboxRenderer(props: { data: InstanceRow }) {
@@ -517,12 +535,7 @@ export default function InstancesGrid({
         resizable: true,
         minWidth: 120,
         flex: 0.8,
-        cellRenderer: (props: { data: InstanceRow; context: { reconciliationDataByInstance?: Record<string, any> } }) => (
-          <ReconciliationStatusRenderer
-            reconData={props.context.reconciliationDataByInstance}
-            instanceName={props.data.instanceName}
-          />
-        ),
+        cellRenderer: ReconciliationStatusCellRenderer,
         cellStyle: { display: "flex", alignItems: "center", justifyContent: "center" },
         suppressHeaderMenuButton: true,
       },
@@ -739,7 +752,15 @@ export default function InstancesGrid({
           rowBuffer={20}
           suppressColumnVirtualisation={false}
           pagination={false}
-          domLayout="autoHeight"
+          // "normal" (the default) virtualizes rows — only visible rows exist
+          // in the DOM, scrolled via .ig-grid-wrap's own scrollbar (it's
+          // already a bounded flex child with overflow-y: auto, exactly what
+          // this needs). The previous "autoHeight" renders every row to the
+          // DOM at once to size the grid to its content — harmless at a few
+          // dozen rows, but at a few thousand it means thousands of live DOM
+          // rows/cell-renderers scrolling via the *page's* scrollbar instead
+          // of the grid's own virtualized one. That was the main cause of
+          // laggy scrolling once instance counts got into the thousands.
         />
       </div>
     </div>
