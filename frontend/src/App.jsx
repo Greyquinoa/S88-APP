@@ -1001,7 +1001,7 @@ export default function App() {
               hwControllers={hwControllers}
               hierarchy={hierarchy}
               compositeCmTypes={compositeCmTypes}
-              addInstance={addInstance} removeInstance={removeInstance}
+              addInstance={addInstance} removeInstance={removeInstance} removeInstances={removeInstances}
               updateInstance={updateInstance} updateInstanceRole={updateInstanceRole}
               addCompositeInstances={addCompositeInstances}
               ensureLoaded={ensureBlocksLoaded} loading={loading}
@@ -4730,7 +4730,7 @@ function InstanceTab({ libType, label, instances, cmtProfiles, userProjects, hwC
 
 function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName, savedProjectId,
     hwControllers,
-    hierarchy, compositeCmTypes, addInstance, removeInstance, updateInstance,
+    hierarchy, compositeCmTypes, addInstance, removeInstance, removeInstances, updateInstance,
     updateInstanceRole, addCompositeInstances, ensureLoaded, loading, generating, saveProjectNow, onGenerate, setError,
     getCompositeCmType, extractMemberConnections, valveCommands, setInstances, loadProjectIntoState }) {
   const noUserProjects = !userProjects?.length;
