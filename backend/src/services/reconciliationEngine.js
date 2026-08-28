@@ -79,15 +79,23 @@ async function runReconciliation(db, projectId) {
     countsPerStatus[newStatus]++;
   }
 
-  // Apply updates in transaction
+  // Apply updates in batches — one UPDATE per BATCH_SIZE instances instead
+  // of one per instance. The per-row loop this replaced meant "Run
+  // Reconciliation" issued one round-trip per instance; at a few thousand
+  // instances that was thousands of sequential queries for a single click.
+  const RECON_BATCH_SIZE = 500;
   await db.transaction(async () => {
-    const stmt = db.prepare(`
-      UPDATE project_instances
-      SET reconciliation_status = ?, last_reconciled_at = NOW()
-      WHERE id = ?
-    `);
-    for (const upd of updates) {
-      await stmt.run(upd.status, upd.id);
+    for (let i = 0; i < updates.length; i += RECON_BATCH_SIZE) {
+      const batch = updates.slice(i, i + RECON_BATCH_SIZE);
+      const values = batch.map(() => '(?::int,?::text)').join(',');
+      const params = batch.flatMap(u => [u.id, u.status]);
+      await db.prepare(`
+        UPDATE project_instances AS p SET
+          reconciliation_status = v.status,
+          last_reconciled_at    = NOW()
+        FROM (VALUES ${values}) AS v(id, status)
+        WHERE p.id = v.id
+      `).run(...params);
     }
   })();
 
