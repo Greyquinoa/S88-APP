@@ -95,12 +95,23 @@ export async function commitLibraryImport(projectId, token, selectedCmNames, sel
   return request('POST', `/projects/${projectId}/library/import2/commit`, { token, selectedCmNames, selectedCompositeNames });
 }
 
-// ── Library — Audit Log ──────────────────────────────────────────────────────
-export async function getLibraryAuditLog(projectId, params = {}) {
+// Drops empty/absent filters so callers can pass `undefined` freely.
+function auditQuery(params) {
   const qs = new URLSearchParams(
     Object.fromEntries(Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== ''))
   ).toString();
-  return request('GET', `/projects/${projectId}/library/audit-log${qs ? `?${qs}` : ''}`);
+  return qs ? `?${qs}` : '';
+}
+
+// ── Library — Audit Log ──────────────────────────────────────────────────────
+export async function getLibraryAuditLog(projectId, params = {}) {
+  return request('GET', `/projects/${projectId}/library/audit-log${auditQuery(params)}`);
+}
+
+// ── Instances — Audit Log ────────────────────────────────────────────────────
+// params: { limit, offset, instance, user, action, from, to }
+export async function getInstanceAuditLog(projectId, params = {}) {
+  return request('GET', `/projects/${projectId}/instances/audit-log${auditQuery(params)}`);
 }
 
 export async function getEntityAuditLog(projectId, entityType, entityId) {
@@ -132,16 +143,28 @@ export async function toggleBlockConditional(projectId, blockId, isConditional) 
 }
 
 // ── SIMIT Export ──────────────────────────────────────────────────────────────
-// Downloads SIMIT.xlsm for the given project. Uses a direct anchor-click so the
-// browser handles the file-save dialog without requiring blob juggling.
-export function exportSimit(projectId) {
-  const url = `${BASE}/simit-export/${projectId}`;
+// Downloads SIMIT.xlsm for the given project. Accepts the same instances payload as
+// generateXML so it uses the UI's current enabledBlocks, not the saved DB state.
+export async function exportSimit(projectId, instances) {
+  const res = await fetch(`${BASE}/simit-export/${projectId}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ instances }),
+  });
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    try { const j = await res.json(); if (j?.error) msg = j.error; } catch (_) {}
+    throw new Error(msg);
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = '';
+  a.download = `SIMIT_${new Date().toISOString().slice(0, 10)}.xlsm`;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 // ── Generate ──────────────────────────────────────────────────────────────────
@@ -358,6 +381,14 @@ export async function promoteIOImport(importId, projectId) {
 
 export function ioExportUrl(importId) { return `/api/io/imports/${importId}/export`; }
 
+export async function detectIOConflicts(importId, projectId) {
+  return request('POST', '/io-conflicts/detect', { importId, projectId });
+}
+
+export async function applyIOPromotion(importId, projectId) {
+  return request('POST', '/io-conflicts/apply', { importId, projectId });
+}
+
 // ── Automated Workflow ───────────────────────────────────────────────────────────
 // Streaming execution: POSTs the payload and reads Server-Sent-Events progress frames.
 // Calls onProgress({ pct, phase, msg }) for each frame and resolves with { success, xml, stats, auditId }.
@@ -572,9 +603,9 @@ export async function ingestIoRowsIntoHw(hwImportId, ioImportId) {
 
 // Multi-controller variant: split the IO rows across the project's HW imports by
 // the AS-assignment column. Returns { groups, skipped, ambiguous, totalRows }.
-export async function ingestIoRowsSplitByAs(projectId, ioImportId, asColumn) {
+export async function ingestIoRowsSplitByAs(projectId, ioImportId, asColumn, orderNoColumn) {
   return request('POST', `/hw-config/project/${projectId}/ingest-io-rows-split`,
-    { ioImportId, asColumn });
+    { ioImportId, asColumn, orderNoColumn });
 }
 
 // Preview HW import using stored rows + a column mapping (no file upload).
@@ -634,6 +665,9 @@ export async function deleteHwSlot(importId, addr, slot) {
 export async function getSlotChannels(importId, addr, slot) {
   return request('GET', `/hw-config/imports/${importId}/stations/${addr}/slots/${slot}/channels`);
 }
+export async function getAllSlotChannels(importId) {
+  return request('GET', `/hw-config/imports/${importId}/all-slot-channels`);
+}
 export async function patchSlotChannel(importId, addr, slot, ch, data) {
   return request('PATCH', `/hw-config/imports/${importId}/stations/${addr}/slots/${slot}/channels/${ch}`, data);
 }
@@ -663,6 +697,22 @@ export async function listHwCfgs(importId) {
 }
 export function hwCfgDownloadUrl(importId, cfgId) {
   return `/api/hw-config/imports/${importId}/cfgs/${cfgId}/download`;
+}
+export async function exportHwConfig(importId) {
+  const response = await fetch(`/api/hw-config/imports/${importId}/export`, { method: 'GET' });
+  if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+  return response.blob();
+}
+export async function importHwConfig(importId, file) {
+  const formData = new FormData();
+  formData.append('file', file);
+  const response = await fetch(`/api/hw-config/imports/${importId}/import`, {
+    method: 'POST',
+    body: formData,
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.message || `HTTP ${response.status}`);
+  return data;
 }
 
 // ── HW Controllers (migrated from App2) ──────────────────────────────────────

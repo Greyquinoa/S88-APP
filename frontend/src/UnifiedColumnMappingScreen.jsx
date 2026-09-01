@@ -172,6 +172,7 @@ const HW_SIGNAL_TYPE_FIELD = { key: 'signal_type', label: 'SIGNAL TYPE', desc: '
 
 const HW_OPTIONAL_FIELDS = [
   { key: 'station_name', label: 'STATION NAME' },
+  { key: 'module_name', label: 'MODULE NAME' },
   { key: 'ip_address', label: 'IP ADDRESS' },
   { key: 'description', label: 'DESCRIPTION' },
   { key: 'subsystem_no', label: 'SUBSYSTEM NO' },

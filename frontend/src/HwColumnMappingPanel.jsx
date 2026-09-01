@@ -30,6 +30,7 @@ export default function HwColumnMappingPanel({ importId, excelHeaders, selectedC
 
   const OPTIONAL_FIELDS = [
     { key: 'station_name', label: 'Station Name' },
+    { key: 'module_name', label: 'Module Name' },
     { key: 'ip_address', label: 'IP Address' },
     { key: 'description', label: 'Description' },
     { key: 'subsystem_no', label: 'Subsystem No' },
@@ -95,6 +96,7 @@ export default function HwColumnMappingPanel({ importId, excelHeaders, selectedC
     channel: 'channel',
     slot: 'slot',
     station_name: 'stationName',
+    module_name: 'moduleName',
     ip_address: 'ip',
     signal_type: 'signalType',
     description: 'desc',

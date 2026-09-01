@@ -21,6 +21,7 @@ import {
   mrpGetDevices, mrpGetConfig, mrpSaveConfig, mrpDownloadCfg,
   listHwHardwareResolutions, upsertHwHardwareResolution, deleteHwHardwareResolution,
   exportHwHardwareResolutionUrl, importHwHardwareResolutionCsv,
+  exportHwConfig, importHwConfig,
   getModuleParameters, getModuleParametersGrouped,
 } from "./api.js";
 
@@ -80,6 +81,11 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
 
   // Multi-select state for bulk operations
   const [selectedAddrs, setSelectedAddrs] = useState(new Set());
+
+  // Import from Excel modal state
+  const [showImportModal, setShowImportModal] = useState(false);
+  const [importErrors, setImportErrors] = useState([]);
+  const [importChanges, setImportChanges] = useState(null); // null=idle, []=success
 
   // Catalogue delete confirmation modal
   const [deleteCatalogueTarget, setDeleteCatalogueTarget] = useState(null);
@@ -411,6 +417,48 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
     } catch (e) { setError(e.message); }
   }
 
+  async function handleExportConfig() {
+    if (!importId) return;
+    setLoading("Exporting configuration…");
+    setError("");
+    try {
+      const blob = await exportHwConfig(importId);
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `hw-config-${importId}-${new Date().toISOString().slice(0, 10)}.xlsx`;
+      a.click();
+      window.URL.revokeObjectURL(url);
+    } catch (e) { setError(e.message); }
+    finally { setLoading(""); }
+  }
+
+  async function handleImportConfig(file) {
+    if (!importId) return;
+    setLoading("Importing configuration…");
+    setError("");
+    setImportErrors([]);
+    setImportChanges(null);
+    try {
+      const result = await importHwConfig(importId, file);
+      if (result.errors && result.errors.length > 0) {
+        setImportErrors(result.errors);
+        setImportChanges(null);
+        setShowImportModal(true);
+      } else {
+        await loadStations(importId);
+        setImportChanges(result.changes || []);
+        setImportErrors([]);
+        setShowImportModal(true);
+      }
+    } catch (e) {
+      setError(e.message);
+      setImportChanges(null);
+      setShowImportModal(true);
+    }
+    finally { setLoading(""); }
+  }
+
   function toggleSelectStation(addr) {
     setSelectedAddrs(prev => {
       const next = new Set(prev);
@@ -695,8 +743,10 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
           </div>
         )}
         {importNotice && (importNotice.skipped.length > 0 || importNotice.ambiguous.length > 0) && (() => {
-          const skippedTotal = importNotice.skipped.reduce((n, s) => n + s.rowCount, 0);
-          const routed = importNotice.totalRows - skippedTotal;
+          const skippedTotal    = importNotice.skipped.reduce((n, s) => n + s.rowCount, 0);
+          const routed          = importNotice.totalRows - skippedTotal;
+          const wrongAsItems    = importNotice.skipped.filter(s => s.warningType === 'wrong_as');
+          const missingCatItems = importNotice.skipped.filter(s => s.warningType === 'missing_catalogue');
           return (
             <div style={alertStyle("#fffbeb", "#fcd34d", "#92400e")}>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
@@ -706,19 +756,34 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
                   {skippedTotal > 0 && `; ${skippedTotal} row${skippedTotal !== 1 ? "s" : ""} skipped`}
                 </strong>
                 <button onClick={() => setImportNotice(null)}
-                  style={{ background: "none", border: "none", cursor: "pointer", color: "#92400e", fontSize: 16, lineHeight: 1 }}
+                  style={{ background: "none", border: "none", cursor: "pointer", fontSize: 16, lineHeight: 1 }}
                   title="Dismiss">✕</button>
               </div>
               <ul style={{ margin: "6px 0 0 0", paddingLeft: 20, fontSize: 12 }}>
-                {importNotice.skipped.slice(0, 20).map((s, i) => (
-                  <li key={i}>
-                    AS value <code>{s.asValue || "(blank)"}</code> — no matching controller — {s.rowCount} row{s.rowCount !== 1 ? "s" : ""}
-                    {s.sampleRowNumbers.length > 0 &&
+                {wrongAsItems.slice(0, 20).map((s, i) => (
+                  <li key={`was-${i}`}>
+                    <strong>Wrong AS value</strong>{" "}
+                    <code>{s.asValue === "(blank)" ? "(blank — no AS assigned)" : s.asValue}</code>
+                    {" "}— no matching controller — {s.rowCount} row{s.rowCount !== 1 ? "s" : ""}
+                    {s.sampleRowNumbers?.length > 0 &&
                       ` (e.g. row${s.sampleRowNumbers.length !== 1 ? "s" : ""} ${s.sampleRowNumbers.join(", ")})`}
                   </li>
                 ))}
-                {importNotice.skipped.length > 20 && (
-                  <li>…and {importNotice.skipped.length - 20} more distinct AS values</li>
+                {wrongAsItems.length > 20 && (
+                  <li>…and {wrongAsItems.length - 20} more unrecognized AS values</li>
+                )}
+                {missingCatItems.slice(0, 20).map((s, i) => (
+                  <li key={`mcat-${i}`}>
+                    <strong>Missing Device Family / Order No</strong>{" "}
+                    <code>{s.orderNo}</code>
+                    {" "}— not in hardware catalogue — {s.rowCount} row{s.rowCount !== 1 ? "s" : ""}
+                    {s.sampleRowNumbers?.length > 0 &&
+                      ` (e.g. row${s.sampleRowNumbers.length !== 1 ? "s" : ""} ${s.sampleRowNumbers.join(", ")})`}
+                    {" — add this device to the catalogue to enable proper routing."}
+                  </li>
+                ))}
+                {missingCatItems.length > 20 && (
+                  <li>…and {missingCatItems.length - 20} more devices missing from catalogue</li>
                 )}
                 {importNotice.ambiguous.map((a, i) => (
                   <li key={`amb-${i}`}>
@@ -938,6 +1003,8 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
                 onSaveSlotPaProfile={handleSaveSlotPaProfile}
                 onSaveSlotSubslotProfile={handleSaveSlotSubslotProfile}
                 onGenerate={handleGenerate}
+                onExportConfig={handleExportConfig}
+                onImportConfig={handleImportConfig}
                 isEditing={isEditing}
                 onStartEdit={startEdit}
                 onChangeEdit={setEditVal}
@@ -981,6 +1048,103 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
           stations={stations}
           onClose={() => setShowSymbolTable(false)}
         />
+      )}
+
+      {/* ── Import result modal (success summary or validation errors) ── */}
+      {showImportModal && (
+        <div style={{
+          position: "fixed",
+          top: 0, left: 0, right: 0, bottom: 0,
+          background: "rgba(0,0,0,0.5)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          zIndex: 10000,
+        }} onClick={() => setShowImportModal(false)}>
+          <div style={{
+            background: "#fff",
+            borderRadius: 12,
+            padding: "24px",
+            width: 680,
+            maxWidth: "95vw",
+            maxHeight: "80vh",
+            display: "flex",
+            flexDirection: "column",
+            boxShadow: "0 20px 25px rgba(0,0,0,0.15)",
+            border: "1px solid #e5e7eb",
+          }} onClick={(e) => e.stopPropagation()}>
+
+            {importErrors.length > 0 ? (
+              <>
+                <h3 style={{ marginTop: 0, marginBottom: 12, color: "#dc2626", fontSize: 17 }}>
+                  ⚠ Import Validation Errors
+                </h3>
+                <div style={{ fontSize: 12, color: "#6b7280", marginBottom: 14 }}>
+                  Fix the errors below in your Excel file and re-import. All rows must pass before any updates are written.
+                </div>
+                <div style={{
+                  flex: 1, overflowY: "auto",
+                  background: "#fef2f2", border: "1px solid #fecaca",
+                  borderRadius: 6, padding: "10px 12px",
+                  fontSize: 12, fontFamily: "monospace",
+                }}>
+                  {importErrors.map((e, i) => (
+                    <div key={i} style={{ marginBottom: 6, color: "#7c2d12" }}>
+                      <strong>Row {e.row}:</strong> {e.field} — {e.message}
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <>
+                <h3 style={{ marginTop: 0, marginBottom: 12, color: importChanges?.length ? "#065f46" : "#374151", fontSize: 17 }}>
+                  {importChanges?.length ? "✔ Import Complete" : "✔ Import Complete — No Changes"}
+                </h3>
+                {importChanges?.length > 0 ? (
+                  <>
+                    <div style={{ fontSize: 12, color: "#6b7280", marginBottom: 14 }}>
+                      {importChanges.length} field{importChanges.length !== 1 ? "s" : ""} updated across {new Set(importChanges.map(c => `${c.stationAddr}:${c.slot}`)).size} slot{new Set(importChanges.map(c => `${c.stationAddr}:${c.slot}`)).size !== 1 ? "s" : ""}.
+                    </div>
+                    <div style={{ flex: 1, overflowY: "auto" }}>
+                      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                        <thead>
+                          <tr style={{ background: "#f3f4f6" }}>
+                            {["Station", "Slot", "Module", "Field", "From", "To"].map(h => (
+                              <th key={h} style={{ padding: "6px 10px", textAlign: "left", fontWeight: 600, fontSize: 11, color: "#374151", borderBottom: "1px solid #e5e7eb" }}>{h}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {importChanges.map((c, i) => (
+                            <tr key={i} style={{ borderBottom: "1px solid #f3f4f6" }}>
+                              <td style={{ padding: "5px 10px", fontWeight: 600 }}>{c.station}</td>
+                              <td style={{ padding: "5px 10px", fontFamily: "monospace" }}>{c.slot}</td>
+                              <td style={{ padding: "5px 10px", color: "#6b7280", fontFamily: "monospace", fontSize: 11 }}>{c.orderNo}</td>
+                              <td style={{ padding: "5px 10px", color: "#2255cc", fontWeight: 500 }}>{c.field}</td>
+                              <td style={{ padding: "5px 10px", color: "#9ca3af", textDecoration: "line-through" }}>{c.from}</td>
+                              <td style={{ padding: "5px 10px", color: "#065f46", fontWeight: 600 }}>{c.to}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </>
+                ) : (
+                  <div style={{ fontSize: 13, color: "#6b7280" }}>
+                    All values in the imported file matched the current configuration. Nothing was changed.
+                  </div>
+                )}
+              </>
+            )}
+
+            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 16 }}>
+              <button
+                onClick={() => setShowImportModal(false)}
+                style={{ ...btnStyle, background: "#e5e7eb", color: "#374151" }}
+              >Close</button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
@@ -3454,7 +3618,7 @@ function ConfigurationPanel({
   onBulkDelete, onBulkApprove,
   onOpenAddSlot, onCancelAddSlot, onModuleSelect, onSetNewSlot, onCommitAddSlot,
   onDeleteSlot, onSaveSlotPip, onSaveSlotPotentialGroup, onSaveSlotPaProfile, onSaveSlotSubslotProfile,
-  onGenerate,
+  onGenerate, onExportConfig, onImportConfig,
   isEditing, onStartEdit, onChangeEdit, onCommitEdit, onCancelEdit,
   onShowSymbolTable,
 }) {
@@ -3555,7 +3719,7 @@ function ConfigurationPanel({
       </div>
 
       {/* Baseline CFG collapsible panel */}
-      {baselineInfo && <BaselinePanel info={baselineInfo} controllerTagName={controllerTagName} />}
+      {baselineInfo && <BaselinePanel info={baselineInfo} controllerTagName={controllerTagName} templates={templates} />}
 
       {/* Add-station form */}
       {addingStation && (
@@ -3626,12 +3790,35 @@ function ConfigurationPanel({
       <div style={{ overflowX: "auto" }}>
 
           {/* ── Table toolbar ──────────────────────────────────────────── */}
-          <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 6 }}>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 6, flexWrap: "wrap" }}>
             <button
               onClick={onStartAddStation}
               disabled={!baselineOk}
               style={{ ...btnStyle, opacity: baselineOk ? 1 : 0.4 }}
             >+ Add Station</button>
+            <button
+              onClick={onExportConfig}
+              disabled={!importId || stations.length === 0 || !!loading}
+              style={{ ...btnStyle, background: "#059669", color: "#fff", opacity: (!importId || stations.length === 0 || loading) ? 0.5 : 1, cursor: (!importId || stations.length === 0 || loading) ? "not-allowed" : "pointer" }}
+            >📥 Export to Excel</button>
+            <input
+              ref={el => { window.hwImportFileRef = el; }}
+              type="file"
+              accept=".xlsx"
+              style={{ display: "none" }}
+              onChange={(e) => {
+                if (e.target.files?.[0]) {
+                  onImportConfig(e.target.files[0]);
+                  e.target.value = "";
+                }
+              }}
+              disabled={!importId || !!loading}
+            />
+            <button
+              onClick={() => window.hwImportFileRef?.click()}
+              disabled={!importId || !!loading}
+              style={{ ...btnStyle, background: "#2563eb", color: "#fff", opacity: (!importId || loading) ? 0.5 : 1, cursor: (!importId || loading) ? "not-allowed" : "pointer" }}
+            >📤 Import from Excel</button>
           </div>
 
           {/* Action bar — appears as soon as ≥1 row is checked in the grid */}
@@ -4343,8 +4530,13 @@ function StationDetailPanel({
 }
 
 // ── Baseline Info Panel ────────────────────────────────────────────────────────
-function BaselinePanel({ info, controllerTagName }) {
+function BaselinePanel({ info, controllerTagName, templates }) {
   const [open, setOpen] = useState(true);
+  const tplMap = React.useMemo(() => {
+    const m = new Map();
+    for (const t of (templates || [])) if (t.order_no) m.set(t.order_no, t);
+    return m;
+  }, [templates]);
   return (
     <div style={{ marginBottom: 20, border: "1px solid #c8d8f0", borderRadius: 8,
                   background: "#f0f6ff", overflow: "hidden" }}>
@@ -4370,22 +4562,27 @@ function BaselinePanel({ info, controllerTagName }) {
               <table style={{ borderCollapse: "collapse", fontSize: 12, width: "100%" }}>
                 <thead>
                   <tr>
-                    {["Slot", "Subslot", "Name", "IP Address"].map(h => (
+                    {["Slot", "Subslot", "Order No", "Name", "Family", "IP Address"].map(h => (
                       <th key={h} style={{ ...thStyle, padding: "4px 8px", fontSize: 11 }}>{h}</th>
                     ))}
                   </tr>
                 </thead>
                 <tbody>
-                  {info.rackModules.map((m, i) => (
-                    <tr key={i} style={{ background: i % 2 === 0 ? "#fff" : "#f4f8ff" }}>
-                      <td style={{ ...tdStyle, textAlign: "center", padding: "3px 8px" }}>{m.slot}</td>
-                      <td style={{ ...tdStyle, textAlign: "center", padding: "3px 8px" }}>{m.subslot ?? "—"}</td>
-                      <td style={{ ...tdStyle, padding: "3px 8px" }}>{m.name}</td>
-                      <td style={{ ...tdStyle, fontFamily: "monospace", fontSize: 11, padding: "3px 8px", color: m.ip ? "#1a6a1a" : "#bbb" }}>
-                        {m.ip || "—"}
-                      </td>
-                    </tr>
-                  ))}
+                  {info.rackModules.map((m, i) => {
+                    const tpl = tplMap.get(m.orderNo);
+                    return (
+                      <tr key={i} style={{ background: i % 2 === 0 ? "#fff" : "#f4f8ff" }}>
+                        <td style={{ ...tdStyle, textAlign: "center", padding: "3px 8px" }}>{m.slot}</td>
+                        <td style={{ ...tdStyle, textAlign: "center", padding: "3px 8px" }}>{m.subslot ?? "—"}</td>
+                        <td style={{ ...tdStyle, fontFamily: "monospace", fontSize: 11, padding: "3px 8px", color: "#446" }}>{m.orderNo || "—"}</td>
+                        <td style={{ ...tdStyle, padding: "3px 8px" }}>{m.name}</td>
+                        <td style={{ ...tdStyle, padding: "3px 8px", color: tpl ? "#224" : "#aaa" }}>{tpl?.family || "—"}</td>
+                        <td style={{ ...tdStyle, fontFamily: "monospace", fontSize: 11, padding: "3px 8px", color: m.ip ? "#1a6a1a" : "#bbb" }}>
+                          {m.ip || "—"}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             ) : (

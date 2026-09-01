@@ -27,6 +27,7 @@ import {
   runReconciliation, getReconciliationInstances,
 } from "./api.js";
 import StepIOImport from "./StepIOImport.jsx";
+import InstanceAuditLog from "./InstanceAuditLog.jsx";
 import StepEphEmImport from "./StepEphEmImport.jsx";
 import ReconciliationOverviewModal from "./ReconciliationOverviewModal.jsx";
 import StepHWConfig from "./StepHWConfig.jsx";
@@ -854,10 +855,12 @@ export default function App() {
                     setError('AS Assignment column is not mapped. Map it on the column-mapping screen and retry.');
                     return;
                   }
+                  const orderNoColumn = Object.keys(hardwareMappings)
+                    .find(col => hardwareMappings[col] === 'module_order_no') || null;
 
                   // The server groups the rows by AS value and stages each group into
                   // its own controller's hw_excel_raw.
-                  const result = await ingestIoRowsSplitByAs(savedProjectId, ioImportId, asColumn);
+                  const result = await ingestIoRowsSplitByAs(savedProjectId, ioImportId, asColumn, orderNoColumn);
 
                   if (!result.groups || result.groups.length === 0) {
                     const seen = (result.skipped || []).map(s => `"${s.asValue || '(blank)'}"`).join(', ');
@@ -4773,6 +4776,9 @@ function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName,
     { key: "ControlModule",   label: "CM",  color: "#0C447C", bg: "#E6F1FB" },
     { key: "EquipmentModule", label: "EM",  color: "#065F46", bg: "#D1FAE5" },
     { key: "EquipmentPhase",  label: "EPH", color: "#6B21A8", bg: "#F3E8FF" },
+    // Not an instance type — no count badge, and it renders the audit feed rather
+    // than an InstanceTab.
+    { key: "__audit", label: "Audit Log", color: "#7C2D12", bg: "#FEF3C7", noCount: true },
   ];
 
   const countOf = libType => instances.filter(i => cmtProfiles.find(p => p.id === i.profileId)?.libType === libType).length;
@@ -4889,7 +4895,35 @@ function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName,
           </div>
         </div>
         {savedProjectId && (
-          <Btn onClick={() => exportSimit(savedProjectId)} disabled={!instances.length}
+          <Btn onClick={async () => {
+            try {
+              const usedTypes = [...new Set(instances.map(i => i.profileId))];
+              const loadedProfiles = {};
+              for (const t of usedTypes) loadedProfiles[t] = await ensureLoaded(t);
+
+              // Folder ids must be DB-resolved (`db…` prefix) — same as handleGenerate.
+              const pendingFolder = hierarchy.some(f => !f.id?.startsWith("db"));
+              if (pendingFolder) throw new Error("Saving hierarchy… try again in a moment.");
+              const folderClientToDb = Object.fromEntries(
+                hierarchy.map(f => [f.id, Number(f.id.slice(2))])
+              );
+
+              const payload = instances.map(inst => {
+                const profile = loadedProfiles[inst.profileId] ?? cmtProfiles.find(p => p.id === inst.profileId);
+                return {
+                  cmType: inst.profileId,
+                  instanceName: inst.instanceName,
+                  samplingTime: inst.samplingTime,
+                  hwControllerId: inst.hwControllerId ? Number(inst.hwControllerId) : null,
+                  folderId: folderClientToDb[inst.folderId] ?? null,
+                  enabledBlocks: profile?.enabledBlocks || [],
+                };
+              });
+              await exportSimit(savedProjectId, payload);
+            } catch (e) {
+              setError(e.message);
+            }
+          }} disabled={!instances.length}
             style={{ background: "#b7410e", color: "white", border: "none", fontWeight: 500 }}>
             <i className="ti ti-file-spreadsheet" /> SIMIT Export
           </Btn>
@@ -4969,11 +5003,13 @@ function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName,
                 color: active ? t.color : "var(--color-text-secondary)",
                 marginBottom: -1, display: "flex", alignItems: "center", gap: 6 }}>
               {t.label}
-              <span style={{ fontSize: 10, padding: "1px 7px", borderRadius: 10,
-                background: active ? t.bg : "var(--color-background-secondary)",
-                color: active ? t.color : "var(--color-text-secondary)", fontWeight: 600 }}>
-                {count}
-              </span>
+              {!t.noCount && (
+                <span style={{ fontSize: 10, padding: "1px 7px", borderRadius: 10,
+                  background: active ? t.bg : "var(--color-background-secondary)",
+                  color: active ? t.color : "var(--color-text-secondary)", fontWeight: 600 }}>
+                  {count}
+                </span>
+              )}
             </button>
           );
         })}
@@ -4983,9 +5019,11 @@ function StepInstances({ instances, cmtProfiles, userProjects, savedProjectName,
       <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0,
           border: "0.5px solid var(--color-border-tertiary)",
           borderRadius: "0 0 var(--border-radius-lg) var(--border-radius-lg)" }}>
-        {INST_TABS.map(t => instTab === t.key && (
-          <InstanceTab key={t.key} libType={t.key} label={t.label} {...commonTabProps} />
-        ))}
+        {instTab === "__audit"
+          ? <InstanceAuditLog projectId={savedProjectId} />
+          : INST_TABS.map(t => instTab === t.key && (
+              <InstanceTab key={t.key} libType={t.key} label={t.label} {...commonTabProps} />
+            ))}
       </div>
     </div>
   );

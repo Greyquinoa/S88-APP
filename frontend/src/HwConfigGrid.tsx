@@ -57,6 +57,23 @@ interface HwConfigGridProps {
   onSelectionChanged: (addrs: Set<number>) => void;
 }
 
+// ── Error dot cell renderer (flashing red !) for missing order number ─────────
+
+function ErrorDotRenderer(props: { data: HwStation; context: { templates: HwModuleTemplate[] } }) {
+  const st = props.data;
+  const imSlot = st.slots?.find((s) => s.slot === 0);
+  const orderNo = st.orderNo || imSlot?.orderNo || "";
+  if (orderNo) return null;
+  return (
+    <span
+      className="hw-error-dot"
+      title="Order Number is missing — open Configure to set the IM module type"
+    >
+      !
+    </span>
+  );
+}
+
 // ── Configure button cell renderer ────────────────────────────────────────────
 
 function ConfigureCellRenderer(props: {
@@ -133,6 +150,20 @@ export default function HwConfigGrid({
 
   const columnDefs = useMemo<ColDef<HwStation>[]>(
     () => [
+      {
+        headerName: "",
+        colId: "errorDot",
+        sortable: false,
+        filter: false,
+        resizable: false,
+        editable: false,
+        width: 36,
+        maxWidth: 36,
+        pinned: "left" as const,
+        suppressHeaderMenuButton: true,
+        cellRenderer: ErrorDotRenderer,
+        cellStyle: { display: "flex", alignItems: "center", justifyContent: "center", padding: 0 } as CellStyle,
+      },
       {
         headerName: "#",
         valueGetter: (p) => (p.node?.rowIndex ?? 0) + 1,
@@ -214,7 +245,7 @@ export default function HwConfigGrid({
         valueGetter: (p) => {
           if (p.data?.orderNo) return p.data.orderNo;
           const imSlot = p.data?.slots.find((s) => s.slot === 0);
-          return imSlot?.orderNo ?? "—";
+          return imSlot?.orderNo ?? "";
         },
         filter: "agTextColumnFilter",
         floatingFilter: true,
@@ -222,11 +253,16 @@ export default function HwConfigGrid({
         resizable: true,
         flex: 1.5,
         minWidth: 140,
-        cellStyle: {
-          fontFamily: "var(--font-mono, ui-monospace, monospace)",
-          fontSize: 11,
-          color: "#556",
-        } as CellStyle,
+        cellRenderer: (p: { value: string }) =>
+          p.value ? (
+            <span style={{ fontFamily: "var(--font-mono, ui-monospace, monospace)", fontSize: 11, color: "#556" }}>
+              {p.value}
+            </span>
+          ) : (
+            <span style={{ color: "#DC2626", fontWeight: 600, fontSize: 11 }}>
+              ⚠ Missing Order No
+            </span>
+          ),
       },
       {
         headerName: "IP Address",
@@ -301,10 +337,19 @@ export default function HwConfigGrid({
   );
 
   const getRowStyle = useCallback(
-    (params: { data?: HwStation }) =>
-      params.data?.address === configureAddr
-        ? { background: "#EEEDFE", borderLeft: "3px solid #2255cc" }
-        : undefined,
+    (params: { data?: HwStation }) => {
+      const st = params.data;
+      if (!st) return undefined;
+      const imSlot = st.slots?.find((s) => s.slot === 0);
+      const missingOrder = !st.orderNo && !imSlot?.orderNo;
+      if (st.address === configureAddr) {
+        return { background: "#EEEDFE", borderLeft: "3px solid #2255cc" };
+      }
+      if (missingOrder) {
+        return { background: "#FEF2F2", borderLeft: "3px solid #DC2626" };
+      }
+      return undefined;
+    },
     [configureAddr]
   );
 

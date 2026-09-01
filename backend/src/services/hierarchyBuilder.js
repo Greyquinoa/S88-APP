@@ -234,7 +234,7 @@ async function promoteToProject(db, importId, projectId) {
   ).get(projectId))?.m || 0;
   let instSO = maxInstSO + 1;
 
-  let foldersCreated = 0, instancesCreated = 0;
+  let foldersCreated = 0, instancesCreated = 0, instancesUpdated = 0;
   // AS values in the import that match no controller — reported back so the user
   // knows which instances arrived without a controller assignment.
   let unmatchedAs = [];
@@ -420,6 +420,7 @@ async function promoteToProject(db, importId, projectId) {
         await db.prepare(
           'UPDATE project_instances SET is_imported=true WHERE id=?'
         ).run(existing.id);
+        instancesUpdated++;
       }
       const baseAlreadyExisted = !!existing;
 
@@ -465,6 +466,7 @@ async function promoteToProject(db, importId, projectId) {
             await db.prepare(
               'UPDATE project_instances SET is_imported=true WHERE id=?'
             ).run(exMember.id);
+            instancesUpdated++;
             continue;
           }
 
@@ -507,7 +509,7 @@ async function promoteToProject(db, importId, projectId) {
           '1000',
           userProjectFor(tag.assignment),
           controllerIdFor(tag.assignment),
-          folderId,
+          baseFolderId,
           instSO++,
           'imported',
           JSON.stringify([]),
@@ -524,6 +526,7 @@ async function promoteToProject(db, importId, projectId) {
   return {
     folders: foldersCreated,
     instances: instancesCreated,
+    instancesUpdated,
     // AS values with no matching controller. Those instances were still created
     // but have no controller, so the Instances grid flags them and generation
     // stays blocked until the user assigns one.
@@ -531,4 +534,137 @@ async function promoteToProject(db, importId, projectId) {
   };
 }
 
-module.exports = { buildHierarchy, loadHierarchyTree, promoteToProject, VALID_LEVELS };
+/**
+ * Dry-run of promoteToProject: computes what instances would be created/updated
+ * without touching the DB. Returns a flat array of planned instance records.
+ */
+async function computePromotionPlan(db, importId, projectId) {
+  const STATUS_RANK = { manual_override: 1, approved: 2, auto: 3 };
+  const allCmRows = await db.prepare(`
+    SELECT n.id AS node_id, n.name AS node_name, n.parent_id AS node_parent_id,
+           t.assigned_cm_type, t.assignment_status, t.assignment, t.id AS tag_id
+    FROM io_hierarchy_nodes n
+    JOIN io_tags t ON t.hierarchy_node_id = n.id
+    WHERE n.import_id = ?
+      AND t.assignment_status IN ('auto','manual_override','approved')
+      AND t.assigned_cm_type IS NOT NULL AND t.validation_status != 'error'
+    ORDER BY t.id
+  `).all(importId);
+
+  const bestByNode = new Map();
+  for (const row of allCmRows) {
+    const existing = bestByNode.get(row.node_id);
+    const rank = STATUS_RANK[row.assignment_status] ?? 99;
+    const existingRank = existing ? (STATUS_RANK[existing.assignment_status] ?? 99) : 100;
+    if (!existing || rank < existingRank) bestByNode.set(row.node_id, row);
+  }
+  const approvedTags = [...bestByNode.values()];
+
+  const controllerRows = await db.prepare(
+    `SELECT id, T16_Controller_TagName AS tag_name, user_project
+       FROM hw_controllers WHERE project_id = ?`
+  ).all(projectId);
+  const controllerByAs = new Map(
+    controllerRows
+      .filter(c => c.tag_name)
+      .map(c => [String(c.tag_name).trim().toUpperCase(), c])
+  );
+  const controllerFor = asgn => {
+    const key = (asgn || '').trim().toUpperCase();
+    return key ? (controllerByAs.get(key) ?? null) : null;
+  };
+
+  const compositeCache = new Map();
+  async function resolveComposite(name) {
+    if (compositeCache.has(name)) return compositeCache.get(name);
+    const comp = await db.prepare('SELECT * FROM composite_cm_types WHERE name=? AND project_id=?').get(name, projectId);
+    if (!comp) { compositeCache.set(name, null); return null; }
+    const members = await db.prepare(
+      'SELECT * FROM composite_cm_members WHERE composite_id=? ORDER BY sort_order, id'
+    ).all(comp.id);
+    let connRules = await db.prepare(
+      'SELECT * FROM composite_cm_connections WHERE composite_id=? AND conn_type=? ORDER BY sort_order, id'
+    ).all(comp.id, 'io_connection');
+    connRules = connRules.map(c => {
+      try {
+        const meta = c.static_value ? JSON.parse(c.static_value) : {};
+        return { ...c, ...meta };
+      } catch (e) {
+        return c;
+      }
+    });
+    const result = { comp, members, ioConnections: connRules };
+    compositeCache.set(name, result);
+    return result;
+  }
+
+  function getIOConnectionsForMember(composite, memberIdx) {
+    if (!composite || !composite.ioConnections) return [];
+    const member = composite.members[memberIdx];
+    if (!member) return [];
+    return composite.ioConnections
+      .filter(c => Number(c.to_member_idx) === Number(memberIdx))
+      .map(c => ({
+        target_block: c.block_name || '',
+        target_pin: c.to_var_name || '',
+        prefix: c.prefix || '',
+        suffix: c.suffix || '',
+        signal_type: c.dtype || c.signal_type || 'DI',
+        required: c.required ? 1 : 0,
+        childBlocks: (Array.isArray(c.childBlocks) ? c.childBlocks : []) || [],
+      }));
+  }
+
+  const plan = [];
+  const seenProjectScope = new Set();
+
+  for (const tag of approvedTags) {
+    const ctrl = controllerFor(tag.assignment);
+    const composite = await resolveComposite(tag.assigned_cm_type);
+
+    if (composite) {
+      const { comp, members } = composite;
+      for (let mi = 0; mi < members.length; mi++) {
+        const m = members[mi];
+        const isProject = m.scope === 'project';
+        const instName = isProject
+          ? (`${m.name_prefix || ''}${m.name_suffix || ''}`.trim() || m.cm_type_name || tag.node_name)
+          : `${m.name_prefix || ''}${tag.node_name}${m.name_suffix || ''}`;
+
+        if (isProject && seenProjectScope.has(instName)) continue;
+        if (isProject) seenProjectScope.add(instName);
+
+        const connections = getIOConnectionsForMember(composite, mi);
+        plan.push({
+          instanceName: instName,
+          cmType: m.cm_type_name,
+          hwControllerId: ctrl?.id ?? null,
+          hwControllerTagName: ctrl?.tag_name ?? null,
+          connections,
+          compositeId: comp.id,
+          memberIdx: mi,
+          isProjectScope: isProject,
+          parentNodeId: tag.node_parent_id,
+          tagNodeName: tag.node_name,
+        });
+      }
+    } else {
+      plan.push({
+        instanceName: tag.node_name,
+        cmType: tag.assigned_cm_type,
+        hwControllerId: ctrl?.id ?? null,
+        hwControllerTagName: ctrl?.tag_name ?? null,
+        connections: [],
+        compositeId: null,
+        memberIdx: null,
+        isProjectScope: false,
+        parentNodeId: tag.node_parent_id,
+        tagNodeName: tag.node_name,
+      });
+    }
+  }
+
+  return plan;
+}
+
+module.exports = { buildHierarchy, loadHierarchyTree, promoteToProject, computePromotionPlan, VALID_LEVELS };

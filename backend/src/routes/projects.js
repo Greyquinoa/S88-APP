@@ -4,6 +4,11 @@ const express = require('express');
 const multer  = require('multer');
 const { getDb } = require('../db');
 const { parsePcs7Config } = require('../pcs7ConfigParser');
+const { newBatchId } = require('../services/auditLog');
+const {
+  INSTANCE_ENTITY_TYPE,
+  buildInstanceLookups, folderPath, auditInstanceCreate, auditInstanceDelete, auditInstanceUpdate,
+} = require('../services/instanceAudit');
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
@@ -110,6 +115,51 @@ router.get('/:id', async (req, res) => {
   }
 });
 
+// Audit the instance delta for one project save.
+//
+// The save endpoint wipes and reinserts every instance, so "what changed" can only
+// be recovered by diffing the pre-wipe snapshot against the incoming payload, keyed
+// by instance_name. Three outcomes: gone from the payload (DELETE), new to it
+// (CREATE), present in both with a tracked field different (UPDATE). A save that
+// changes nothing — autosave, the pre-save inside "Generate Connections" — produces
+// no entries at all, which is what keeps this from flooding the log.
+//
+// Runs inside the caller's transaction.
+async function auditInstanceSave(db, projectId, priorByName, nextByName, priorFolderNames) {
+  const created = [...nextByName.keys()].filter(n => !priorByName.has(n));
+  const deleted = [...priorByName.keys()].filter(n => !nextByName.has(n));
+  const common  = [...nextByName.keys()].filter(n => priorByName.has(n));
+  if (!created.length && !deleted.length && !common.length) return;
+
+  const lookups = await buildInstanceLookups(db, projectId);
+  // Folders are rewritten by this same save; merge the pre-wipe names in for ids
+  // the new table no longer has, so a removed folder still renders as a name.
+  const folderLookup = lookups['project_instances.folder_id'];
+  for (const [id, name] of priorFolderNames) {
+    if (!folderLookup.has(id)) folderLookup.set(id, name);
+  }
+
+  // One batch id for the whole save, so a multi-row edit reads as one operation.
+  const batchId = newBatchId();
+  const opts = { batchId, source: 'ui', location: 'Instances > Grid' };
+
+  for (const name of deleted) {
+    await auditInstanceDelete(db, { projectId, instance: priorByName.get(name), ...opts });
+  }
+  for (const name of created) {
+    await auditInstanceCreate(db, { projectId, instance: nextByName.get(name), ...opts });
+  }
+  for (const name of common) {
+    await auditInstanceUpdate(db, {
+      projectId,
+      prior: priorByName.get(name),
+      next:  nextByName.get(name),
+      lookups,
+      ...opts,
+    });
+  }
+}
+
 // ── POST /api/projects ────────────────────────────────────────────────────────
 // Body: { name, comment, instances: [{cm_type, instance_name, sampling_time}],
 //         cmtProfiles: [{cmType, enabledBlocks: [...]}] }
@@ -141,12 +191,29 @@ router.post('/', async (req, res) => {
       // This endpoint wipes and reinserts every instance, so snapshot that state by
       // instance name and restore it below — otherwise any save (autosave, "Generate
       // Connections") silently resets every row to not-imported/not-generated.
+      // The audited columns ride along on this same snapshot: it is taken before the
+      // wipe below and keyed by instance_name, which is the only identity that
+      // survives a save, so it doubles as the "before" side of the audit diff.
       const priorRecon = new Map(
         (await db.prepare(`
-          SELECT instance_name, is_imported, is_generated, reconciliation_status,
+          SELECT id, instance_name, cm_type, sampling_time, user_project,
+                 hw_controller_id, folder_id,
+                 is_imported, is_generated, reconciliation_status,
                  accepted_at, accepted_by, last_reconciled_at
           FROM project_instances WHERE project_id = ?
         `).all(projectId)).map(r => [r.instance_name, r])
+      );
+
+      // Full folder paths as they stand before the folder table is rewritten, so a
+      // diff that moves an instance out of a since-deleted folder can still name
+      // where it was — as a path ("ProcessCell/Unit/CM"), not just a bare name that
+      // may exist under several parents.
+      const priorFolderRows = await db.prepare(
+        `SELECT id, parent_id, name FROM project_hierarchy_folders WHERE project_id = ?`
+      ).all(projectId);
+      const priorFoldersById = new Map(priorFolderRows.map(f => [f.id, f]));
+      const priorFolderNames = new Map(
+        priorFolderRows.map(f => [f.id, folderPath(f.id, priorFoldersById) || f.name])
       );
 
       await db.prepare(`DELETE FROM project_instances         WHERE project_id = ?`).run(projectId);
@@ -196,6 +263,10 @@ router.post('/', async (req, res) => {
           is_imported, is_generated, reconciliation_status, accepted_at, accepted_by, last_reconciled_at)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       `);
+      // The "after" side of the audit diff, keyed by name, with folder_client_id
+      // already resolved to a real folder id so the two sides are comparable.
+      const nextByName = new Map();
+
       for (let idx = 0; idx < instances.length; idx++) {
         const i = instances[idx];
         const folderDbId = i.folder_client_id != null ? folderIdMap[i.folder_client_id] ?? null : null;
@@ -210,7 +281,18 @@ router.post('/', async (req, res) => {
           rec?.is_imported ?? false, rec?.is_generated ?? false,
           rec?.reconciliation_status ?? 'PENDING',
           rec?.accepted_at ?? null, rec?.accepted_by ?? null, rec?.last_reconciled_at ?? null);
+
+        nextByName.set(i.instance_name, {
+          instance_name:    i.instance_name,
+          cm_type:          i.cm_type,
+          sampling_time:    i.sampling_time || '1000',
+          user_project:     i.user_project || null,
+          hw_controller_id: i.hw_controller_id ?? null,
+          folder_id:        folderDbId,
+        });
       }
+
+      await auditInstanceSave(db, projectId, priorRecon, nextByName, priorFolderNames);
 
       const insProf = db.prepare(`
         INSERT INTO project_cmt_profiles (project_id, cm_type, enabled_blocks)
@@ -684,8 +766,10 @@ router.delete('/:projectId/instances/:instanceName', async (req, res) => {
 
     await db.transaction(async () => {
       // First, get the instance ID so we can delete unit_resolved_connections if needed
+      // (cm_type comes along for the audit entry, which has to be written while the
+      // row still exists).
       const instance = await db.prepare(
-        'SELECT id FROM project_instances WHERE project_id = ? AND instance_name = ?'
+        'SELECT id, instance_name, cm_type FROM project_instances WHERE project_id = ? AND instance_name = ?'
       ).get(projectId, instanceName);
 
       if (!instance) {
@@ -693,6 +777,13 @@ router.delete('/:projectId/instances/:instanceName', async (req, res) => {
       }
 
       const instanceId = instance.id;
+
+      await auditInstanceDelete(db, {
+        projectId: Number(projectId),
+        instance,
+        source: 'ui',
+        location: 'Instances > Grid',
+      });
 
       // Delete all related data in order (respect any foreign key constraints)
       await db.prepare(
@@ -748,9 +839,22 @@ router.post('/:projectId/instances/bulk-delete', async (req, res) => {
       const placeholders = instanceNames.map(() => '?').join(',');
 
       const instances = await db.prepare(
-        `SELECT id FROM project_instances WHERE project_id = ? AND instance_name IN (${placeholders})`
+        `SELECT id, instance_name, cm_type FROM project_instances WHERE project_id = ? AND instance_name IN (${placeholders})`
       ).all(projectId, ...instanceNames);
       const instanceIds = instances.map(i => i.id);
+
+      // Written before the rows go, and under one batch id so the whole
+      // multi-select reads as a single operation in the log.
+      const batchId = newBatchId();
+      for (const instance of instances) {
+        await auditInstanceDelete(db, {
+          projectId: Number(projectId),
+          instance,
+          batchId,
+          source: 'ui',
+          location: 'Instances > Grid',
+        });
+      }
 
       await db.prepare(
         `DELETE FROM instance_ios WHERE project_id = ? AND instance_name IN (${placeholders})`
@@ -784,6 +888,49 @@ router.post('/:projectId/instances/bulk-delete', async (req, res) => {
 
     res.json({ success: true, deletedCount });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /api/projects/:projectId/instances/audit-log ─────────────────────────
+// Instance change feed. Mirrors the Library audit endpoint, plus an `instance`
+// filter — entity_key holds instance_name, the identity that survives a save.
+router.get('/:projectId/instances/audit-log', async (req, res) => {
+  try {
+    const db = getDb();
+    const projectId = Number(req.params.projectId);
+
+    const limit  = Math.min(Number(req.query.limit) || 50, 200);
+    const offset = Math.max(Number(req.query.offset) || 0, 0);
+
+    const where  = ['entity_type = ?', 'project_id = ?'];
+    const params = [INSTANCE_ENTITY_TYPE, projectId];
+
+    if (req.query.instance) { where.push('entity_key ILIKE ?'); params.push(`%${req.query.instance}%`); }
+    if (req.query.user)     { where.push('changed_by ILIKE ?'); params.push(`%${req.query.user}%`); }
+    if (req.query.action)   { where.push('action = ?');         params.push(req.query.action); }
+    if (req.query.from)     { where.push('changed_at >= ?');    params.push(req.query.from); }
+    if (req.query.to)       { where.push('changed_at <= ?');    params.push(req.query.to); }
+
+    const whereSql = where.join(' AND ');
+
+    const entries = await db.prepare(`
+      SELECT id, project_id, batch_id, entity_type, entity_id, entity_key, action,
+             field_changes, description, changed_by, reason, source, changed_at,
+             location, object_label, context_cm_type
+      FROM audit_log
+      WHERE ${whereSql}
+      ORDER BY changed_at DESC, id DESC
+      LIMIT ? OFFSET ?
+    `).all(...params, limit, offset);
+
+    const countRow = await db.prepare(
+      `SELECT COUNT(*) AS count FROM audit_log WHERE ${whereSql}`
+    ).get(...params);
+
+    res.json({ entries, total: Number(countRow?.count) || 0, limit, offset });
+  } catch (err) {
+    console.error('[Projects] Instance audit-log error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });

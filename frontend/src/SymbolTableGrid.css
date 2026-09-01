@@ -9,12 +9,13 @@
   font-family: var(--font-sans, system-ui, -apple-system, sans-serif);
 }
 
-/* Grid wrapper IS the scroll container — domLayout=autoHeight expands the
-   grid to fit its rows, and this box scrolls when it overflows. */
+/* AG Grid runs in normal (virtualized) layout and owns its own scrolling, so
+   this box only bounds its height — it must not scroll itself, or the grid
+   would size to its full row count and defeat virtualization. */
 .st-grid-wrap {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
+  overflow: hidden;
   border: 0.5px solid var(--color-border-tertiary, rgba(0,0,0,0.10));
 }
 

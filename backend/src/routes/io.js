@@ -8,6 +8,7 @@ const { validateTags }              = require('../services/ioValidator');
 const { applyMapping, suggestMappings } = require('../services/columnMapper');
 const { buildHierarchy, loadHierarchyTree, promoteToProject, VALID_LEVELS } = require('../services/hierarchyBuilder');
 const { runAssignment, getUnresolvedFunctions } = require('../services/assignmentEngine');
+const { auditInstanceDelete }       = require('../services/instanceAudit');
 
 const router  = express.Router();
 const upload  = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
@@ -476,8 +477,23 @@ router.post('/imports/:id/tags/:tagId/reject', async (req, res) => {
         WHERE import_id=? AND COALESCE(instrument_tag, tag_name)=?
       `).run(importId, identity);
 
-      // Remove the matching project_instance by name (if it was promoted)
+      // Remove the matching project_instance by name (if it was promoted).
+      // This deletion is otherwise invisible from the Instances tab, which is
+      // exactly the kind of thing the audit trail exists to surface.
       if (imp?.project_id) {
+        const doomed = await db.prepare(
+          'SELECT id, instance_name, cm_type FROM project_instances WHERE project_id=? AND instance_name=?'
+        ).get(imp.project_id, identity);
+
+        if (doomed) {
+          await auditInstanceDelete(db, {
+            projectId: imp.project_id,
+            instance: doomed,
+            source: 'ui',
+            location: 'IO Import > Review',
+          });
+        }
+
         await db.prepare(
           'DELETE FROM project_instances WHERE project_id=? AND instance_name=?'
         ).run(imp.project_id, identity);

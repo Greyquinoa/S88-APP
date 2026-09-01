@@ -1,6 +1,8 @@
 // services/ephEmImporter.js — EPH/EM import processing
 'use strict';
 const { parseSheet, listSheets } = require('./ioParser');
+const { newBatchId } = require('./auditLog');
+const { auditInstanceCreate } = require('./instanceAudit');
 
 /**
  * Upload and parse EPH/EM Excel file.
@@ -196,6 +198,9 @@ async function ensureSubfolder(db, projectId, parentId, name) {
  * error — its instances are created with no folder so the user can place them.
  */
 async function promoteToProject(db, importId, projectId) {
+  // One batch id for the whole promote, so the log shows it as one operation.
+  const auditBatchId = newBatchId();
+
   const rows = await db.prepare(`
     SELECT id, unit_name, assigned_cm_types, assignment
     FROM eph_em_import_rows
@@ -310,6 +315,18 @@ async function promoteToProject(db, importId, projectId) {
                  controllerIdFor(userProject),
                  Number(maxSort?.max_sort || 0) + 1, folderId,
                  composite.id, idx, 'eph_em_import');
+
+          await auditInstanceCreate(db, {
+            projectId,
+            instance: {
+              id: inst.lastInsertRowid,
+              instance_name: instanceName,
+              cm_type: m.cm_type_name,
+            },
+            batchId: auditBatchId,
+            source: 'import',
+            location: 'EPH/EM Import',
+          });
 
           created.push({
             id: inst.lastInsertRowid,

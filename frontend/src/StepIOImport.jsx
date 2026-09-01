@@ -1,5 +1,7 @@
 // StepIOImport.jsx — Full IO List import pipeline
 import { useState, useEffect, useRef, useCallback, useMemo, memo, useLayoutEffect, Fragment } from 'react';
+import { detectIOConflicts, applyIOPromotion } from './api.js';
+import IoConflictModal from './IoConflictModal.jsx';
 import { AgGridReact } from 'ag-grid-react';
 
 // Register crystal-loader web component immediately.
@@ -1010,7 +1012,7 @@ const LEVEL_LABELS = {
 };
 const ALL_LEVELS = ['ProcessCell', 'Unit', 'Standard', 'EquipmentModule'];
 
-function TabHierarchy({ importId, projectId, functionMaps, onPromoted, setError }) {
+function TabHierarchy({ importId, projectId, functionMaps, setError }) {
   const [tree, setTree]       = useState([]);
   const [busy, setBusy]       = useState(false);
   const [stats, setStats]     = useState(null);
@@ -1030,34 +1032,24 @@ function TabHierarchy({ importId, projectId, functionMaps, onPromoted, setError 
     finally { setBusy(false); }
   }
 
+  async function runAssignments() {
+    for (const fm of (functionMaps || [])) {
+      try { await runIOAssignment(importId, fm.id); }
+      catch (e) { console.warn(`Assignment for config ${fm.id} failed:`, e); }
+    }
+  }
+
   async function promote() {
-    if (!confirm('Run Assignment and Promote to Instances and Hierarchy tabs?')) return;
+    if (!confirm('Run assignment for all function map configs?')) return;
     setBusy(true);
     try {
-      // Run assignment for all function map configs
-      for (const fm of (functionMaps || [])) {
-        try {
-          await runIOAssignment(importId, fm.id);
-        } catch (e) {
-          console.warn(`Assignment for config ${fm.id} failed:`, e);
-        }
-      }
-      const r = await promoteIOImport(importId, projectId);
-      alert(
-        `Promoted ${r.instances} instances, ${r.folders} hierarchy folders.` +
-        (r.unmatchedAs?.length
-          ? `\n\nNo controller matches these AS values: ${r.unmatchedAs.join(', ')}.` +
-            `\nThose instances have no controller — assign one in the Instances grid ` +
-            `(or add the controller in HW Config) before generating.`
-          : '')
-      );
-      onPromoted();
+      await runAssignments();
     } catch (e) { setError(e.message); }
     finally { setBusy(false); }
   }
 
   async function buildAndPromote() {
-    if (!confirm('Build hierarchy and promote to project?')) return;
+    if (!confirm('Build hierarchy and run assignment?')) return;
     setBusy(true);
     try {
       const r = await buildIOHierarchy(importId, levelMap);
@@ -1065,8 +1057,7 @@ function TabHierarchy({ importId, projectId, functionMaps, onPromoted, setError 
       if (r.effectiveLevelMap) setLevelMap(r.effectiveLevelMap);
       const resp = await getIOHierarchy(importId);
       setTree(resp.tree ?? resp);
-
-      await promote();
+      await runAssignments();
     } catch (e) { setError(e.message); }
     finally { setBusy(false); }
   }
@@ -1189,7 +1180,7 @@ function TabHierarchy({ importId, projectId, functionMaps, onPromoted, setError 
               display: 'flex', flexDirection: 'column', gap: 6 }}>
             <Btn primary onClick={buildAndPromote} disabled={busy || !importId || levelMap.length === 0}
               style={{ width: '100%' }}>
-              <i className="ti ti-refresh" /> {busy ? 'Building…' : 'Build & Promote'}
+              <i className="ti ti-refresh" /> {busy ? 'Building…' : 'Build & Assign'}
             </Btn>
           </div>
         </div>
@@ -1656,7 +1647,7 @@ function ReviewActionsCell({ data, onOverride, onReject }) {
   );
 }
 
-function TabReview({ importId, projectId, cmtProfiles, compositeCmTypes = [], onPromoted, setError }) {
+function TabReview({ importId, projectId, cmtProfiles, compositeCmTypes = [], onPromoted, setError, onTriggerPromote }) {
   const gridRef = useRef(null);
   const [data, setData]         = useState({ tags: [], total: 0, page: 1, perPage: 100, pages: 1 });
   const [filter, setFilter]     = useState('all');
@@ -1715,16 +1706,7 @@ function TabReview({ importId, projectId, cmtProfiles, compositeCmTypes = [], on
     if (!confirm('Promote all approved/auto-assigned tags to project instances?')) return;
     setBusy(true);
     try {
-      const r = await promoteIOImport(importId, projectId);
-      alert(
-        `Promoted ${r.instances} instances, ${r.folders} hierarchy folders.` +
-        (r.unmatchedAs?.length
-          ? `\n\nNo controller matches these AS values: ${r.unmatchedAs.join(', ')}.` +
-            `\nThose instances have no controller — assign one in the Instances grid ` +
-            `(or add the controller in HW Config) before generating.`
-          : '')
-      );
-      onPromoted();
+      await onTriggerPromote(importId, projectId);
     } catch (e) { setError(e.message); }
     finally { setBusy(false); }
   }
@@ -2301,6 +2283,15 @@ export default function StepIOImport({ savedProjectId, cmtProfiles, compositeCmT
   // every return to Upload refetches and rebuilds the preview from scratch.
   const [preview, setPreview]           = useState(null);
 
+  const [ioConflictData, setIoConflictData]       = useState(null);
+  const [ioConflictApplying, setIoConflictApplying] = useState(false);
+  const [localToast, setLocalToast]               = useState('');
+
+  function showLocalToast(msg) {
+    setLocalToast(msg);
+    setTimeout(() => setLocalToast(''), 3500);
+  }
+
   const loadImports = useCallback(async () => {
     if (!savedProjectId) return;
     try { setImports(await listIOImports(savedProjectId)); } catch (_) {}
@@ -2393,10 +2384,10 @@ export default function StepIOImport({ savedProjectId, cmtProfiles, compositeCmT
     // every field (hierarchy included) as null → no hierarchy is built.
     const payload = { name: cfgName, description: 'Auto-created by unified mapping', mappings: instanceMappings };
     if (existing) {
-      await updateIOColumnMap(existing.id, payload);
+      await updateIOColumnMap(savedProjectId, existing.id, payload);
       cfgId = existing.id;
     } else {
-      const r = await createIOColumnMap(payload);
+      const r = await createIOColumnMap(savedProjectId, payload);
       cfgId = r.id;
     }
     await loadColumnMaps();
@@ -2422,6 +2413,52 @@ export default function StepIOImport({ savedProjectId, cmtProfiles, compositeCmT
     }
   }
 
+  // ── IO promotion preview ──────────────────────────────────────────────────
+  // Anything to write goes through the preview modal first, so Cancel is always a
+  // real way out. Only a no-op promote (everything already matches) skips it.
+  async function handleTriggerPromote(importId, projectId) {
+    const data = await detectIOConflicts(importId, projectId);
+
+    if (data.conflicts.length === 0 && data.newInstances.length === 0) {
+      showLocalToast(
+        data.unchanged > 0
+          ? `Nothing to promote — ${data.unchanged} instances already match the import.`
+          : 'Nothing to promote (no approved tags found).'
+      );
+      return;
+    }
+
+    setIoConflictData({ ...data, importId, projectId });
+  }
+
+  async function handleIOConflictApply() {
+    if (!ioConflictData) return;
+    const { importId, projectId } = ioConflictData;
+    setIoConflictApplying(true);
+    try {
+      const r = await applyIOPromotion(importId, projectId);
+      setIoConflictData(null);
+      const parts = [];
+      if (r.created > 0)   parts.push(`${r.created} created`);
+      if (r.updated > 0)   parts.push(`${r.updated} updated`);
+      if (r.unchanged > 0) parts.push(`${r.unchanged} unchanged`);
+      const msg = parts.length ? `Promoted: ${parts.join(', ')}.` : 'No changes applied.';
+      if (r.unmatchedAs?.length) {
+        alert(msg + `\n\nNo controller matches: ${r.unmatchedAs.join(', ')}.` +
+          `\nAssign a controller in the Instances grid before generating.`);
+      } else {
+        showLocalToast(msg);
+      }
+      loadImports();
+      onPromoted();
+    } catch (e) { setError(e.message); }
+    finally { setIoConflictApplying(false); }
+  }
+
+  function handleIOConflictCancel() {
+    if (!ioConflictApplying) setIoConflictData(null);
+  }
+
   if (!savedProjectId) {
     return (
       <EmptyState style={{ padding: '2.5rem' }}>
@@ -2445,6 +2482,7 @@ export default function StepIOImport({ savedProjectId, cmtProfiles, compositeCmT
     onColumnMapsChange: loadColumnMaps,
     onFunctionMapsChange: loadFunctionMaps,
     onPromoted: () => { loadImports(); onPromoted(); },
+    onTriggerPromote: handleTriggerPromote,
   };
 
   return (
@@ -2500,6 +2538,26 @@ export default function StepIOImport({ savedProjectId, cmtProfiles, compositeCmT
           />
         )}
       </div>
+
+      {localToast && (
+        <div style={{
+          position: 'fixed', bottom: 24, left: '50%', transform: 'translateX(-50%)',
+          background: '#166534', color: '#fff', padding: '10px 20px',
+          borderRadius: 'var(--border-radius-md, 6px)', fontSize: 13, fontWeight: 500,
+          boxShadow: '0 4px 12px rgba(0,0,0,0.25)', zIndex: 1000, whiteSpace: 'nowrap',
+        }}>
+          {localToast}
+        </div>
+      )}
+
+      {ioConflictData && (
+        <IoConflictModal
+          conflictData={ioConflictData}
+          onApply={handleIOConflictApply}
+          onCancel={handleIOConflictCancel}
+          applying={ioConflictApplying}
+        />
+      )}
     </div>
   );
 }

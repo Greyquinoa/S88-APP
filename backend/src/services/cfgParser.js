@@ -381,14 +381,10 @@ function parseCfgDevices(text) {
       const slotN   = parseInt(slotNo, 10);
       const subN    = parseInt(subslotNo, 10);
       const orderNo = stripVersion(rawOrder);
-      // Skip DEFAULT: port/iface subslots (they are AUTOCREATED infrastructure)
-      const isPort = /DEFAULT:/i.test(rawOrder) || /^_S7H_/.test(rawOrder);
-      if (!isPort) {
-        const st   = stations.get(addrN);
-        const slot = st && st.slots.find(s => s.slot === slotN);
-        if (slot) {
-          slot.subslots.push({ subslotNo: subN, orderNo, name });
-        }
+      const st   = stations.get(addrN);
+      const slot = st && st.slots.find(s => s.slot === slotN);
+      if (slot) {
+        slot.subslots.push({ subslotNo: subN, orderNo, name });
       }
       // Collect the block to extract IP from slot 0 subslot 0/1
       const block = collectBlock(lines, i);
@@ -422,7 +418,7 @@ function parseCfgDevices(text) {
       const block = collectBlock(lines, i);
       i = block.nextLine;
 
-      // Slot 0 = IM/interface module — extract IP + MLFB then skip (not a hw_signals row)
+      // Slot 0 = IM/interface module — extract IP + MLFB, add to st.slots so subslots can be collected
       if (slotN === 0) {
         const ipM = block.text.match(/\bIPADDRESS\s+"([0-9A-Fa-f]{8})"/);
         const rtM = block.text.match(/\bROUTERADDRESS\s+"([0-9A-Fa-f]{8})"/);
@@ -432,6 +428,10 @@ function parseCfgDevices(text) {
           if (ipM && !st.ip)            st.ip            = hexToIp(ipM[1]);
           if (rtM && !st.routerAddress) st.routerAddress = hexToIp(rtM[1]);
           if (mlM && !st.mlfbNo)        st.mlfbNo        = mlM[1].trim();
+          // Add slot 0 stub so subslots parsed below can be pushed onto it
+          if (!st.slots.find(s => s.slot === 0)) {
+            st.slots.push({ slot: 0, orderNo, name, pipNo: null, potentialGroup: null, symbols: [], subslots: [], mlfb: null });
+          }
         }
         continue;
       }

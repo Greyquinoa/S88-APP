@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import './InstancesGrid.css';
 import './StationAutoSlotsEditor.css';
 
@@ -595,6 +595,136 @@ export default function StationAutoSlotsEditor({ station, catalogue: preloadedCa
   );
 }
 
+function CatalogueCombobox({ catalogue, value, onChange }) {
+  const [query, setQuery]     = useState('');
+  const [open, setOpen]       = useState(false);
+  const [focused, setFocused] = useState(-1);
+  const containerRef          = useRef(null);
+  const listRef               = useRef(null);
+
+  const selected = catalogue.find(m => m.order_no === value) || null;
+
+  const hasQuery = query.trim().length > 0;
+  const filtered = hasQuery
+    ? catalogue.filter(m => {
+        const q = query.toLowerCase();
+        return m.order_no.toLowerCase().includes(q) || (m.display_name || '').toLowerCase().includes(q);
+      })
+    : [];
+
+  function labelFor(m) {
+    return `${m.order_no} | ${m.display_name || ''} | ${m.hw_category || '—'}`;
+  }
+
+  function pick(m) {
+    onChange(m ? m.order_no : '');
+    setQuery('');
+    setOpen(false);
+    setFocused(-1);
+  }
+
+  function handleKey(e) {
+    if (!open) { if (e.key === 'ArrowDown' || e.key === 'Enter') setOpen(true); return; }
+    if (e.key === 'ArrowDown')  { e.preventDefault(); setFocused(f => Math.min(f + 1, filtered.length - 1)); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); setFocused(f => Math.max(f - 1, 0)); }
+    else if (e.key === 'Enter')   { if (focused >= 0 && filtered[focused]) pick(filtered[focused]); }
+    else if (e.key === 'Escape')  { setOpen(false); setFocused(-1); setQuery(''); }
+  }
+
+  useEffect(() => {
+    if (!open) return;
+    function onDown(e) {
+      if (containerRef.current && !containerRef.current.contains(e.target)) {
+        setOpen(false); setFocused(-1);
+      }
+    }
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [open]);
+
+  useEffect(() => {
+    if (focused >= 0 && listRef.current) {
+      const el = listRef.current.children[focused];
+      if (el) el.scrollIntoView({ block: 'nearest' });
+    }
+  }, [focused]);
+
+  return (
+    <div ref={containerRef} style={{ position: 'relative', width: '100%' }}>
+      <div style={{ display: 'flex', gap: 4 }}>
+        <input
+          type="text"
+          placeholder={selected ? labelFor(selected) : 'Search order no or name…'}
+          value={query}
+          onChange={e => { setQuery(e.target.value); setOpen(true); setFocused(-1); }}
+          onFocus={() => setOpen(true)}
+          onKeyDown={handleKey}
+          style={{ flex: 1, padding: '4px 6px', fontSize: 12, border: '1px solid #ccc', borderRadius: 4, minWidth: 0 }}
+        />
+        {value && (
+          <button
+            type="button"
+            onClick={() => pick(null)}
+            title="Clear selection"
+            style={{ padding: '2px 6px', fontSize: 12, cursor: 'pointer', border: '1px solid #ccc', borderRadius: 4, background: '#f5f5f5' }}
+          >×</button>
+        )}
+      </div>
+      {selected && !query && (
+        <div style={{ fontSize: 11, color: '#555', marginTop: 3, fontFamily: 'monospace', wordBreak: 'break-all' }}>
+          {labelFor(selected)}
+        </div>
+      )}
+      {open && (hasQuery || value) && (
+        <div
+          ref={listRef}
+          style={{
+            position: 'absolute', top: '100%', left: 0, right: 0, zIndex: 9999,
+            background: '#fff', border: '1px solid #bbb', borderRadius: 4,
+            maxHeight: 240, overflowY: 'auto', boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+            marginTop: 2,
+          }}
+        >
+          {!hasQuery && (
+            <div style={{ padding: '5px 8px', fontSize: 12, color: '#aaa', fontStyle: 'italic' }}>
+              Type to search by order no or name…
+            </div>
+          )}
+          {value && (
+            <div
+              onMouseDown={() => pick(null)}
+              style={{ padding: '5px 8px', fontSize: 12, color: '#888', cursor: 'pointer',
+                background: focused === -1 ? '#e8f0fe' : '#fff', borderTop: hasQuery ? '1px solid #f0f0f0' : 'none' }}
+            >
+              — Clear selection —
+            </div>
+          )}
+          {hasQuery && filtered.length === 0 && (
+            <div style={{ padding: '5px 8px', fontSize: 12, color: '#aaa' }}>No matches</div>
+          )}
+          {filtered.map((m, i) => (
+            <div
+              key={m.order_no}
+              onMouseDown={() => pick(m)}
+              style={{
+                padding: '5px 8px', fontSize: 12, cursor: 'pointer', wordBreak: 'break-all',
+                background: focused === i ? '#e8f0fe' : '#fff',
+                borderTop: '1px solid #f0f0f0',
+              }}
+            >
+              <span style={{ fontFamily: 'monospace', color: '#1a56db' }}>{m.order_no}</span>
+              {' | '}
+              <span>{m.display_name}</span>
+              {' | '}
+              <span style={{ color: '#888' }}>{m.hw_category || '—'}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /**
  * Item Details Panel - Edit form for selected slot/subslot
  */
@@ -655,17 +785,11 @@ function ItemDetailsPanel({ item, onUpdateField, onUpdateFields, catalogue, conf
 
         <div className="form-group">
           <label>Module Type (from Catalogue):</label>
-          <select
+          <CatalogueCombobox
+            catalogue={catalogue}
             value={currentOrderNo}
-            onChange={(e) => handleModuleChange(e.target.value)}
-          >
-            <option value="">-- Select from catalogue --</option>
-            {catalogue.map(m => (
-              <option key={m.order_no} value={m.order_no}>
-                {m.display_name} ({m.order_no})
-              </option>
-            ))}
-          </select>
+            onChange={handleModuleChange}
+          />
         </div>
 
         <div className="form-group">

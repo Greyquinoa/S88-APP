@@ -109,11 +109,18 @@ function buildFolderPath(folderId, folderById) {
   return 'rIX\\' + parts.join('\\') + '\\';
 }
 
-// ── GET /api/simit-export/:projectId ─────────────────────────────────────────
-router.get('/:projectId', async (req, res) => {
+// ── POST /api/simit-export/:projectId ────────────────────────────────────────
+// Body: { instances: [{ cmType, instanceName, samplingTime, hwControllerId, folderId, enabledBlocks }] }
+// Uses the frontend's current enabledBlocks instead of the saved DB state, matching generateXML behavior.
+router.post('/:projectId', async (req, res) => {
   try {
     const db        = getDb();
     const projectId = req.params.projectId;
+    const { instances: payloadInstances } = req.body || {};
+
+    if (!Array.isArray(payloadInstances)) {
+      return res.status(400).json({ error: 'instances array required in body' });
+    }
 
     const project = await db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
     if (!project) return res.status(404).json({ error: 'Project not found' });
@@ -135,17 +142,40 @@ router.get('/:projectId', async (req, res) => {
       ctrlById[c.id] = name;
     }
 
-    // ── Instances ─────────────────────────────────────────────────────────────
-    const instanceRows = await db.prepare(`
-      SELECT cm_type, instance_name, hw_controller_id, folder_id
+    // ── Load DB instances to get folder and connection rules ───────────────────
+    const dbInstanceRows = await db.prepare(`
+      SELECT cm_type, instance_name, connections
       FROM project_instances
       WHERE project_id = ?
       ORDER BY sort_order, id
     `).all(projectId);
 
+    // Build a map: instanceName → { connections }
+    const dbInstanceMap = {};
+    for (const inst of dbInstanceRows) {
+      let conns = [];
+      try {
+        const connStr = inst.connections || '[]';
+        const parsed = typeof connStr === 'string' ? JSON.parse(connStr) : connStr;
+        conns = Array.isArray(parsed) ? parsed : [];
+      } catch (e) {
+        console.warn(`[simitExport] Failed to parse connections for ${inst.instance_name}: ${e.message}`);
+      }
+      dbInstanceMap[inst.instance_name] = { cm_type: inst.cm_type, connections: conns };
+    }
+
+    // Merge payload with DB data: use payload's enabledBlocks but DB's connections.
+    // Field names kept snake_case to match the rest of this module's conventions.
+    const instanceRows = payloadInstances.map(pi => ({
+      cm_type:         pi.cmType,
+      instance_name:   pi.instanceName,
+      hw_controller_id: pi.hwControllerId,
+      folder_id:       pi.folderId,
+      enabledBlocks:   pi.enabledBlocks || [],
+      connections:     (dbInstanceMap[pi.instanceName]?.connections) || [],
+    }));
+
     // ── Per-instance signal tag lookups (same as XML generator) ───────────────
-    // Priority: manual signal_mappings wins over reconciled instance_ios.
-    // signalMaps[instanceName]["block.var"] = { tag, dummy? }
     const signalMaps  = await loadMappingsForProject(db, projectId);
     const connIOs     = await loadConnectionIOsForProject(db, projectId);
 
@@ -158,10 +188,9 @@ router.get('/:projectId', async (req, res) => {
     }
 
     // ── Load all blocks + variables per CM type ───────────────────────────────
-    // cmTypeVars: { cmTypeName → Map<"Block.Var", { val, isSignal }> }
-    // isSignal=true  → write the instance's actual signal tag as the value
-    // isSignal=false → write lib default val
-    const cmTypeVars = new Map();
+    // cmTypeBlocks: { cmTypeName → [{ name, optional, varMap }] }
+    // varMap: { varName → { val, isSignal } }
+    const cmTypeBlocks = new Map();
     const distinctTypes = [...new Set(instanceRows.map(r => r.cm_type))];
 
     for (const cmTypeName of distinctTypes) {
@@ -171,32 +200,111 @@ router.get('/:projectId', async (req, res) => {
       if (!cm) continue;
 
       const blocks = await db.prepare(`
-        SELECT id, name FROM lib_blocks WHERE cm_type_id = ? ORDER BY sort_order, id
+        SELECT id, name, optional FROM lib_blocks WHERE cm_type_id = ? ORDER BY sort_order, id
       `).all(cm.id);
 
-      const varMap = new Map(); // "Block.Var" → { val, isSignal }
+      const blockList = [];
       for (const blk of blocks) {
         const vars = await db.prepare(`
           SELECT name, val, vtype FROM lib_variables
           WHERE block_id = ? ORDER BY sort_order, id
         `).all(blk.id);
+        const varMap = new Map();
         for (const v of vars) {
-          const key      = `${blk.name}.${v.name}`;
           const isSignal = v.vtype === 'Signal';
-          varMap.set(key, { val: v.val ?? '', isSignal });
+          varMap.set(v.name, { val: v.val ?? '', isSignal });
         }
+        blockList.push({ name: blk.name, optional: !!blk.optional, varMap });
       }
-      cmTypeVars.set(cmTypeName, varMap);
+      cmTypeBlocks.set(cmTypeName, blockList);
     }
 
-    // ── Build global ordered column list (union, preserving insertion order) ──
+    // ── Compute cascade omit sets (same logic as generate.js) ────────────────
+    // Blocks whose required pins are unmatched are omitted, and child blocks cascade.
+    const cascadeOmitByInstance = {};
+    for (const inst of instanceRows) {
+      const instSigMap = signalMaps[inst.instance_name] || {};
+      const rules = inst.connections || [];
+
+      // Parent → [children] from rules with childBlocks
+      const childMap = {};
+      for (const c of rules) {
+        if (!c.target_block || !Array.isArray(c.childBlocks) || !c.childBlocks.length) continue;
+        (childMap[c.target_block] ||= []).push(...c.childBlocks);
+      }
+      if (!Object.keys(childMap).length) continue;
+
+      // Which parent drivers are omitted? (required unmatched + no real signal)
+      const omitted = new Set();
+      const blockList = cmTypeBlocks.get(inst.cm_type);
+      if (blockList) {
+        for (const parent of Object.keys(childMap)) {
+          let hasReal = false, hasRequiredUnmatched = false;
+          for (const blkInfo of blockList) {
+            if (blkInfo.name !== parent) continue;
+            for (const varName of blkInfo.varMap.keys()) {
+              const key = `${parent}.${varName}`;
+              const s = instSigMap[key];
+              if (s && !s.dummy) hasReal = true;
+              else if (s && s.dummy && (s.required ?? 1)) hasRequiredUnmatched = true;
+            }
+            break;
+          }
+          if (hasRequiredUnmatched && !hasReal) omitted.add(parent);
+        }
+      }
+
+      // Fixed-point: cascade children.
+      const cascade = new Set(omitted);
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const [parent, children] of Object.entries(childMap)) {
+          if (!cascade.has(parent)) continue;
+          for (const child of children) {
+            if (!cascade.has(child)) { cascade.add(child); changed = true; }
+          }
+        }
+      }
+      // Remove parents — only children cascade.
+      for (const parent of Object.keys(childMap)) cascade.delete(parent);
+      if (cascade.size) cascadeOmitByInstance[inst.instance_name] = cascade;
+    }
+
+    // ── Build global ordered column list (only from active blocks) ────────────
     const globalColOrder = [];
     const globalColSet   = new Set();
+
     for (const inst of instanceRows) {
-      const varMap = cmTypeVars.get(inst.cm_type);
-      if (!varMap) continue;
-      for (const key of varMap.keys()) {
-        if (!globalColSet.has(key)) { globalColSet.add(key); globalColOrder.push(key); }
+      const blockList = cmTypeBlocks.get(inst.cm_type);
+      if (!blockList) continue;
+
+      const cascadeOmit = cascadeOmitByInstance[inst.instance_name] || new Set();
+
+      // Filter to active blocks (same logic as XML generator).
+      for (const blkInfo of blockList) {
+        const { name: blkName, optional, varMap } = blkInfo;
+
+        // Skip if cascade-omitted or if optional and not enabled.
+        if (cascadeOmit.has(blkName)) continue;
+        if (optional && !inst.enabledBlocks.includes(blkName)) continue;
+
+        // Check block-omission rule: required unmatched + no real signal.
+        const instSigMap = signalMaps[inst.instance_name] || {};
+        let hasReal = false, hasRequiredUnmatched = false;
+        for (const varName of varMap.keys()) {
+          const key = `${blkName}.${varName}`;
+          const s = instSigMap[key];
+          if (s && !s.dummy) hasReal = true;
+          else if (s && s.dummy && (s.required ?? 1)) hasRequiredUnmatched = true;
+        }
+        if (hasRequiredUnmatched && !hasReal) continue; // Block omitted.
+
+        // Add variables from this active block.
+        for (const varName of varMap.keys()) {
+          const key = `${blkName}.${varName}`;
+          if (!globalColSet.has(key)) { globalColSet.add(key); globalColOrder.push(key); }
+        }
       }
     }
 
@@ -219,30 +327,52 @@ router.get('/:projectId', async (req, res) => {
       row[4] = inst.instance_name   || '';
       // row[5] ChartComment stays ''
 
-      // Dynamic variable columns
-      const varMap    = cmTypeVars.get(inst.cm_type);
-      const instSigMap = signalMaps[inst.instance_name] || {};
+      // Dynamic variable columns — only for active blocks
+      const blockList = cmTypeBlocks.get(inst.cm_type);
+      if (blockList) {
+        const cascadeOmit = cascadeOmitByInstance[inst.instance_name] || new Set();
+        const instSigMap = signalMaps[inst.instance_name] || {};
 
-      if (varMap) {
-        for (const [key, { val, isSignal }] of varMap.entries()) {
-          const colIdx = colIndexOf.get(key);
+        for (const blkInfo of blockList) {
+          const { name: blkName, optional, varMap } = blkInfo;
 
-          if (isSignal) {
-            // Use the actual mapped signal tag; skip dummy signals (unmatched).
-            const sig = instSigMap[key];
-            if (sig && !sig.dummy && sig.tag) {
-              row[colIdx] = sig.tag;
+          // Skip if cascade-omitted or optional+disabled.
+          if (cascadeOmit.has(blkName)) continue;
+          if (optional && !inst.enabledBlocks.includes(blkName)) continue;
+
+          // Skip if block would be omitted (required unmatched + no real).
+          let hasReal = false, hasRequiredUnmatched = false;
+          for (const varName of varMap.keys()) {
+            const key = `${blkName}.${varName}`;
+            const s = instSigMap[key];
+            if (s && !s.dummy) hasReal = true;
+            else if (s && s.dummy && (s.required ?? 1)) hasRequiredUnmatched = true;
+          }
+          if (hasRequiredUnmatched && !hasReal) continue;
+
+          // Fill variables from this block.
+          for (const [varName, { val, isSignal }] of varMap.entries()) {
+            const key = `${blkName}.${varName}`;
+            const colIdx = colIndexOf.get(key);
+            if (colIdx === undefined) {
+              console.warn(`[simitExport] Column not found for ${key} in instance ${inst.instance_name}`);
+              continue;
             }
-            // If no real signal mapping exists, leave cell empty.
-          } else {
-            // Parameter variable: check if a static value override exists
-            // from the signal map (composite wire spec overwrites val via tag field).
-            const sig = instSigMap[key];
-            if (sig && !sig.dummy && sig.tag) {
-              // A non-dummy signal on a parameter var means it was wired to a value
-              row[colIdx] = sig.tag;
-            } else if (val !== '') {
-              row[colIdx] = val;
+
+            if (isSignal) {
+              // Write actual signal tag if it's a real (non-dummy) mapping.
+              const sig = instSigMap[key];
+              if (sig && !sig.dummy && sig.tag) {
+                row[colIdx] = sig.tag;
+              }
+            } else {
+              // Parameter variable: prefer signal-mapped value, else lib default.
+              const sig = instSigMap[key];
+              if (sig && !sig.dummy && sig.tag) {
+                row[colIdx] = sig.tag;
+              } else if (val !== '') {
+                row[colIdx] = val;
+              }
             }
           }
         }
@@ -285,7 +415,7 @@ router.get('/:projectId', async (req, res) => {
   } catch (err) {
     console.error('[simitExport] Error:', err.message || err);
     if (err.stack) console.error(err.stack);
-    res.status(500).json({ error: err.message || String(err) });
+    res.status(500).json({ error: err.message || String(err), stack: process.env.NODE_ENV === 'development' ? err.stack : undefined });
   }
 });
 

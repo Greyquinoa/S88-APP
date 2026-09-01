@@ -473,20 +473,25 @@ export default function InstancesGrid({
         },
       },
       {
-        headerName: "Controller (AS)",
+        headerName: "Controller",
         field: "hwControllerId",
         editable: true,
         cellEditor: "agSelectCellEditor",
         cellEditorParams: {
           values: hwControllerValues,
         } as ISelectCellEditorParams,
-        valueFormatter: (p) => hwControllerLabels[p.value ?? ""] ?? p.value ?? "",
+        valueFormatter: (p) => {
+          const controllerId = p.value ?? "";
+          if (!controllerId) return "";
+          const controller = sortedControllers.find((c) => c.id === controllerId);
+          return controller ? (controller.name || `Controller #${controller.id}`) : "";
+        },
         filter: "agTextColumnFilter",
         floatingFilter: true,
         sortable: true,
         resizable: true,
-        minWidth: 160,
-        flex: 1.5,
+        minWidth: 120,
+        flex: 1,
         cellStyle: (p) =>
           !p.value
             ? { background: "#FEF3C7", color: "#92400E" }
@@ -506,7 +511,7 @@ export default function InstancesGrid({
         cellStyle: { color: "var(--color-text-secondary, #6b7280)" },
       },
       {
-        headerName: "Folder",
+        headerName: "Hierarchy",
         field: "folderId",
         editable: true,
         cellEditor: "agSelectCellEditor",

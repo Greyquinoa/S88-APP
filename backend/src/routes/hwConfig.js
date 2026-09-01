@@ -2,6 +2,7 @@
 'use strict';
 const express = require('express');
 const multer  = require('multer');
+const ExcelJS = require('exceljs');
 const { getDb } = require('../db');
 const { parseCfg, parseCfgDevices } = require('../services/cfgParser');
 const { parseHwExcel, parseRawExcelRows, suggestColumnMappingByLevenshtein }  = require('../services/hwExcelParser');
@@ -653,25 +654,14 @@ router.post('/imports/:id/backfill-from-cfg', upload.single('cfg'), async (req, 
           // export — skip it on import so it is never stored as a configurable slot.
           if ((slot.orderNo || '').includes('193-6PA00-0AA0')) continue;
 
-          const tpl        = tplMap.get(slot.orderNo);
-          const signalType = tpl ? tpl.signal_type : null;
+          // Slot 0 hw_signals row already inserted above as the station placeholder — skip re-insert,
+          // but still fall through to process its subslots into hw_slot_subslots.
+          if (slot.slot !== 0) {
+            const tpl        = tplMap.get(slot.orderNo);
+            const signalType = tpl ? tpl.signal_type : null;
 
-          if (slot.symbols.length === 0) {
-            // No SYMBOL lines — insert one representative row for the slot
-            await insertSignal.run(
-              importId,
-              dev.address, dev.name, dev.ip, dev.routerAddress, dev.asAssignment || null,
-              dev.subsystemNo, slot.slot,
-              slot.orderNo, slot.name,
-              signalType,
-              slot.pipNo, slot.potentialGroup,
-              null, null,
-              slot.mlfb || null,
-            );
-            slotCount++;
-          } else {
-            // Insert one row per SYMBOL (channel-level tag data)
-            for (const sym of slot.symbols) {
+            if (slot.symbols.length === 0) {
+              // No SYMBOL lines — insert one representative row for the slot
               await insertSignal.run(
                 importId,
                 dev.address, dev.name, dev.ip, dev.routerAddress, dev.asAssignment || null,
@@ -679,14 +669,29 @@ router.post('/imports/:id/backfill-from-cfg', upload.single('cfg'), async (req, 
                 slot.orderNo, slot.name,
                 signalType,
                 slot.pipNo, slot.potentialGroup,
-                sym.tag || null, sym.description || null,
+                null, null,
                 slot.mlfb || null,
               );
+              slotCount++;
+            } else {
+              // Insert one row per SYMBOL (channel-level tag data)
+              for (const sym of slot.symbols) {
+                await insertSignal.run(
+                  importId,
+                  dev.address, dev.name, dev.ip, dev.routerAddress, dev.asAssignment || null,
+                  dev.subsystemNo, slot.slot,
+                  slot.orderNo, slot.name,
+                  signalType,
+                  slot.pipNo, slot.potentialGroup,
+                  sym.tag || null, sym.description || null,
+                  slot.mlfb || null,
+                );
+              }
+              slotCount++;
             }
-            slotCount++;
           }
 
-          // PA subslots — pass orderNo as pa_profile so CFU_PA function type round-trips
+          // Subslots for all slots including slot 0
           for (const ss of slot.subslots) {
             await insertSubslot.run(importId, dev.address, slot.slot, ss.subslotNo, ss.orderNo || null);
           }
@@ -836,7 +841,7 @@ router.post('/project/:id/ingest-io-rows-split', async (req, res) => {
   try {
     const db        = getDb();
     const projectId = parseInt(req.params.id, 10);
-    const { ioImportId, asColumn } = req.body || {};
+    const { ioImportId, asColumn, orderNoColumn } = req.body || {};
     if (!ioImportId) return err(res, 400, 'ioImportId required');
     if (!asColumn)   return err(res, 400, 'asColumn required');
 
@@ -865,25 +870,48 @@ router.post('/project/:id/ingest-io-rows-split', async (req, res) => {
       return err(res, 400, 'No controllers with a station name found for this project. Upload a baseline CFG first.');
     }
 
+    // ── 1b. Load catalogue order numbers for missing-device detection ──────────
+    const catalogueRows = await db.prepare(
+      `SELECT DISTINCT order_no FROM hw_module_templates`
+    ).all();
+    const catalogueOrderNos = new Set(catalogueRows.map(r => String(r.order_no).trim()));
+
     // ── 2. Bucket the IO rows by AS value ──────────────────────────────────────
     const ioRows = await db.prepare(
       'SELECT row_number, raw_data FROM io_tags WHERE import_id=? ORDER BY row_number, id'
     ).all(parseInt(ioImportId, 10));
     if (ioRows.length === 0) return err(res, 400, 'IO import has no rows to ingest');
 
-    const buckets = new Map();  // importId → [row_json, ...]
-    const skipped = new Map();  // raw AS value → { rowCount, sampleRowNumbers }
+    const buckets           = new Map();  // importId → [row_json, ...]
+    // skipped entries carry warningType: 'wrong_as' | 'missing_catalogue'
+    const skippedWrongAs    = new Map();  // raw AS value → { rowCount, sampleRowNumbers, warningType }
+    const skippedMissingCat = new Map();  // orderNo → { rowCount, sampleRowNumbers, warningType }
 
     for (const row of ioRows) {
       let obj;
       try { obj = JSON.parse(row.raw_data || '{}'); } catch (_) { obj = {}; }
       const hit = index.get(normAs(obj[asColumn]));
       if (!hit) {
-        const key = String(obj[asColumn] ?? '').trim();
-        const s = skipped.get(key) || { rowCount: 0, sampleRowNumbers: [] };
-        s.rowCount++;
-        if (s.sampleRowNumbers.length < 5) s.sampleRowNumbers.push(row.row_number);
-        skipped.set(key, s);
+        const rawAs   = String(obj[asColumn] ?? '').trim();
+        const orderNo = orderNoColumn ? String(obj[orderNoColumn] ?? '').trim() : '';
+
+        // Blank AS + known order number → station head row with unrecognised station
+        // Blank AS + unknown order number → station head with device not in catalogue
+        // Non-blank AS → genuinely wrong AS value
+        if (!rawAs && orderNo && !catalogueOrderNos.has(orderNo)) {
+          // Missing from catalogue
+          const s = skippedMissingCat.get(orderNo) || { rowCount: 0, sampleRowNumbers: [], warningType: 'missing_catalogue' };
+          s.rowCount++;
+          if (s.sampleRowNumbers.length < 5) s.sampleRowNumbers.push(row.row_number);
+          skippedMissingCat.set(orderNo, s);
+        } else {
+          // Wrong or blank AS value
+          const key = rawAs || '(blank)';
+          const s = skippedWrongAs.get(key) || { rowCount: 0, sampleRowNumbers: [], warningType: 'wrong_as' };
+          s.rowCount++;
+          if (s.sampleRowNumbers.length < 5) s.sampleRowNumbers.push(row.row_number);
+          skippedWrongAs.set(key, s);
+        }
         continue;
       }
       if (!buckets.has(hit.importId)) buckets.set(hit.importId, []);
@@ -913,9 +941,14 @@ router.post('/project/:id/ingest-io-rows-split', async (req, res) => {
       }
     }
 
+    const skipped = [
+      ...[...skippedWrongAs.entries()].map(([asValue, s]) => ({ asValue, ...s })),
+      ...[...skippedMissingCat.entries()].map(([orderNo, s]) => ({ orderNo, ...s })),
+    ];
+
     res.json({
       groups,
-      skipped:   [...skipped.entries()].map(([asValue, s]) => ({ asValue, ...s })),
+      skipped,
       ambiguous: [...ambiguous.entries()].map(([normalized, controllerNames]) => ({ normalized, controllerNames })),
       totalRows: ioRows.length,
     });
@@ -964,7 +997,7 @@ router.post('/imports/:id/suggest-column-mappings', async (req, res) => {
     // Define mandatory and optional fields that can be mapped
     const MANDATORY_FIELDS = ['station_address', 'module_order_no', 'slot', 'tag', 'channel'];
     const OPTIONAL_FIELDS = [
-      'station_name', 'ip_address', 'description', 'signal_type', 'subsystem_no', 'router_address',
+      'station_name', 'module_name', 'ip_address', 'description', 'signal_type', 'subsystem_no', 'router_address',
       'as_assignment'
     ];
     const ALL_FIELDS = [...MANDATORY_FIELDS, ...OPTIONAL_FIELDS];
@@ -2433,6 +2466,61 @@ router.get('/imports/:id/stations/:addr/slots/:slot/channels', async (req, res) 
   } catch (e) { err(res, 500, e.message); }
 });
 
+// ── Batch load all channels for all slots in an import (for Symbol Table) ────
+// Uses symbol_table_flat view for database-side processing instead of JavaScript grouping
+router.get('/imports/:id/all-slot-channels', async (req, res) => {
+  try {
+    const db = getDb();
+    const importId = parseInt(req.params.id, 10);
+
+    // Query pre-computed view (all grouping done by PostgreSQL)
+    const rows = await db.prepare(`
+      SELECT station_address, station_name, slot, channel, tag, description, signal_type
+      FROM symbol_table_flat
+      WHERE hw_import_id = ?
+    `).all(importId);
+
+    if (rows.length === 0) {
+      return res.json([]);
+    }
+
+    // Single pass to build result structure (minimal processing)
+    const stationMap = new Map();
+
+    for (const row of rows) {
+      if (!stationMap.has(row.station_address)) {
+        stationMap.set(row.station_address, {
+          stationAddress: row.station_address,
+          stationName: row.station_name,
+          slots: new Map(),
+        });
+      }
+
+      const station = stationMap.get(row.station_address);
+      if (!station.slots.has(row.slot)) {
+        station.slots.set(row.slot, { slot: row.slot, channels: [] });
+      }
+
+      station.slots.get(row.slot).channels.push({
+        channel: row.channel,
+        tag: row.tag,
+        description: row.description,
+        signal_type: row.signal_type,
+      });
+    }
+
+    // Convert to arrays
+    const result = Array.from(stationMap.values())
+      .map(station => ({
+        stationAddress: station.stationAddress,
+        stationName: station.stationName,
+        slots: Array.from(station.slots.values()).sort((a, b) => a.slot - b.slot),
+      }));
+
+    res.json(result);
+  } catch (e) { err(res, 500, e.message); }
+});
+
 // PATCH /imports/:id/stations/:addr/slots/:slot/channels/:ch
 router.patch('/imports/:id/stations/:addr/slots/:slot/channels/:ch', async (req, res) => {
   try {
@@ -2858,6 +2946,325 @@ router.delete('/station-auto-slots/:orderNo', async (req, res) => {
     await db.prepare('DELETE FROM hw_station_auto_slots WHERE order_no=?').run(orderNo);
 
     res.json({ ok: true, deleted: orderNo });
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// ── Export HW Config to Excel (full slot hierarchy) ──
+router.get('/imports/:id/export', async (req, res) => {
+  try {
+    const db = getDb();
+    const importId = parseInt(req.params.id, 10);
+
+    // One row per station+slot (GROUP BY deduplicates channels)
+    const rows = await db.prepare(`
+      SELECT
+        hw_import_id,
+        station_address,
+        MIN(station_name)   AS station_name,
+        MIN(ip_address)     AS ip_address,
+        MIN(subsystem_no)   AS subsystem_no,
+        MIN(router_address) AS router_address,
+        MIN(as_assignment)  AS as_assignment,
+        slot,
+        module_order_no,
+        MIN(module_name)    AS module_name,
+        MIN(signal_type)    AS signal_type,
+        MIN(pip_no)         AS pip_no,
+        MIN(potential_group) AS potential_group,
+        MIN(pa_profile)     AS pa_profile,
+        COUNT(*)            AS channel_count
+      FROM hw_signals
+      WHERE hw_import_id = ? AND module_order_no != 'PLACEHOLDER'
+      GROUP BY hw_import_id, station_address, slot, module_order_no
+      ORDER BY station_address, slot
+    `).all(importId);
+
+    if (rows.length === 0) {
+      return err(res, 404, 'No configuration found for this import');
+    }
+
+    // Build Excel workbook with two sheets: Stations (deduplicated) and Slots (detailed)
+    const workbook = new ExcelJS.Workbook();
+
+    // ── Sheet 1: Stations (one row per station) ──
+    const stationsSheet = workbook.addWorksheet('Stations');
+    stationsSheet.columns = [
+      { header: 'Device #', key: 'station_address', width: 12 },
+      { header: 'Device Name', key: 'station_name', width: 20 },
+      { header: 'IP Address', key: 'ip_address', width: 18 },
+      { header: 'Subsystem No', key: 'subsystem_no', width: 14 },
+      { header: 'Router Address', key: 'router_address', width: 18 },
+      { header: 'AS Assignment', key: 'as_assignment', width: 20 },
+    ];
+
+    // Deduplicate stations (take first row per station)
+    const stationMap = new Map();
+    for (const row of rows) {
+      if (!stationMap.has(row.station_address)) {
+        stationMap.set(row.station_address, {
+          station_address: row.station_address,
+          station_name: row.station_name,
+          ip_address: row.ip_address,
+          subsystem_no: row.subsystem_no,
+          router_address: row.router_address,
+          as_assignment: row.as_assignment,
+        });
+      }
+    }
+    for (const st of stationMap.values()) {
+      stationsSheet.addRow(st);
+    }
+    stationsSheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFF' } };
+    stationsSheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: '366092' } };
+
+    // ── Sheet 2: Slots (all rows with per-slot config) ──
+    const slotsSheet = workbook.addWorksheet('Slots');
+    slotsSheet.columns = [
+      { header: 'Station Address', key: 'station_address', width: 14 },
+      { header: 'Station Name', key: 'station_name', width: 18 },
+      { header: 'Slot', key: 'slot', width: 8 },
+      { header: 'Order No', key: 'module_order_no', width: 22 },
+      { header: 'Module Name', key: 'module_name', width: 20 },
+      { header: 'Signal Type', key: 'signal_type', width: 14 },
+      { header: 'Channels', key: 'channel_count', width: 10 },
+      { header: 'PIP No', key: 'pip_no', width: 10 },
+      { header: 'Potential Group', key: 'potential_group', width: 18 },
+      { header: 'PA Profile', key: 'pa_profile', width: 20 },
+    ];
+
+    for (const row of rows) {
+      slotsSheet.addRow(row);
+    }
+    slotsSheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFF' } };
+    slotsSheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: '366092' } };
+
+    // Generate Excel file and send as download
+    const buffer = await workbook.xlsx.writeBuffer();
+    const timestamp = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="hw-config-${importId}-${timestamp}.xlsx"`);
+    res.send(buffer);
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// ── Import HW Config from Excel (strict validation) ──
+router.post('/imports/:id/import', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return err(res, 400, 'No file uploaded');
+    }
+
+    const db = getDb();
+    const importId = parseInt(req.params.id, 10);
+
+    // Parse Excel file
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(req.file.buffer);
+
+    const slotsSheet = workbook.getWorksheet('Slots');
+    const stationsSheet = workbook.getWorksheet('Stations');
+
+    if (!slotsSheet) {
+      return err(res, 400, 'Excel file must contain a "Slots" sheet');
+    }
+
+    // ── Load station IP/Router from Stations sheet ──
+    const stationIpMap = new Map(); // stationAddr -> {ip, router}
+    if (stationsSheet) {
+      const stHeaders = {};
+      stationsSheet.getRow(1).eachCell((cell, colNumber) => {
+        stHeaders[cell.value] = colNumber;
+      });
+      for (let rowNum = 2; rowNum <= stationsSheet.rowCount; rowNum++) {
+        const row = stationsSheet.getRow(rowNum);
+        const addr = row.getCell(stHeaders['Device #'] || 1).value;
+        const ip = row.getCell(stHeaders['IP Address'] || 3).value;
+        const router = row.getCell(stHeaders['Router Address'] || 5).value;
+        if (addr != null) {
+          stationIpMap.set(parseInt(addr, 10), {
+            ipAddress: ip || null,
+            routerAddress: router || null,
+          });
+        }
+      }
+    }
+
+    // ── Validation Phase (strict: all-or-nothing) ──
+    const validationErrors = [];
+    const slotRows = [];
+
+    // Get header row
+    const headers = {};
+    slotsSheet.getRow(1).eachCell((cell, colNumber) => {
+      headers[cell.value] = colNumber;
+    });
+
+    // Validate all rows
+    for (let rowNum = 2; rowNum <= slotsSheet.rowCount; rowNum++) {
+      const row = slotsSheet.getRow(rowNum);
+      const data = {};
+
+      // Extract cell values by header
+      for (const [header, colNum] of Object.entries(headers)) {
+        data[header] = row.getCell(colNum).value;
+      }
+
+      // Skip fully empty rows (e.g. trailing blank rows in the sheet)
+      if (data['Station Address'] == null && data['Slot'] == null) continue;
+
+      // Validate Station Address and Slot are present and integers
+      // Use != null (not falsy) so slot 0 and address 0 are accepted
+      const stationAddr = parseInt(data['Station Address'], 10);
+      const slotNum = parseInt(data['Slot'], 10);
+
+      if (data['Station Address'] == null || isNaN(stationAddr) || stationAddr < 0) {
+        validationErrors.push({
+          row: rowNum,
+          field: 'Station Address',
+          message: 'Station Address must be a non-negative integer',
+        });
+      }
+      if (data['Slot'] == null || isNaN(slotNum) || slotNum < 0) {
+        validationErrors.push({
+          row: rowNum,
+          field: 'Slot',
+          message: 'Slot must be a non-negative integer',
+        });
+      }
+
+      // Validate PIP No is null or integer
+      if (data['PIP No'] != null && data['PIP No'] !== '') {
+        const pipNum = parseInt(data['PIP No'], 10);
+        if (isNaN(pipNum) || pipNum < 0) {
+          validationErrors.push({
+            row: rowNum,
+            field: 'PIP No',
+            message: 'PIP No must be a non-negative integer or empty',
+          });
+        }
+      }
+
+      // Skip further checks if basic address/slot failed
+      if (validationErrors.length > 0) continue;
+
+      // Check that station + slot exists in database
+      const existing = await db.prepare(
+        'SELECT id FROM hw_signals WHERE hw_import_id = ? AND station_address = ? AND slot = ?'
+      ).get(importId, stationAddr, slotNum);
+
+      if (!existing) {
+        validationErrors.push({
+          row: rowNum,
+          field: 'Station Address / Slot',
+          message: `Station ${stationAddr}, Slot ${slotNum} does not exist in this import`,
+        });
+      }
+
+      if (validationErrors.length === 0) {
+        const stationData = stationIpMap.get(stationAddr) || { ipAddress: null, routerAddress: null };
+        slotRows.push({
+          rowNum,
+          stationAddr,
+          slotNum,
+          ipAddress: stationData.ipAddress,
+          routerAddress: stationData.routerAddress,
+          moduleName: data['Module Name'] || null,
+          pipNo: (data['PIP No'] != null && data['PIP No'] !== '') ? parseInt(data['PIP No'], 10) : null,
+          potentialGroup: data['Potential Group'] || null,
+          paProfile: data['PA Profile'] || null,
+        });
+      }
+    }
+
+    // If validation failed, return all errors
+    if (validationErrors.length > 0) {
+      return res.status(400).json({ errors: validationErrors });
+    }
+
+    // ── Snapshot current values so we can compute a diff ──
+    const currentRows = await db.prepare(`
+      SELECT station_address, slot, module_order_no,
+             MIN(station_name) AS station_name,
+             MIN(ip_address) AS ip_address,
+             MIN(router_address) AS router_address,
+             MIN(module_name) AS module_name,
+             MIN(pip_no) AS pip_no,
+             MIN(potential_group) AS potential_group,
+             MIN(pa_profile) AS pa_profile
+      FROM hw_signals
+      WHERE hw_import_id = ?
+      GROUP BY station_address, slot, module_order_no
+    `).all(importId);
+
+    const currentMap = new Map();
+    for (const r of currentRows) {
+      currentMap.set(`${r.station_address}:${r.slot}`, r);
+    }
+
+    // ── Update Phase (strict validation passed) ──
+    // Only track slot-level changes (not station-level IP/Router, which are shared across all slots)
+    const FIELD_LABELS = {
+      module_name:     'Module Name',
+      pip_no:          'PIP No',
+      potential_group: 'Potential Group',
+      pa_profile:      'PA Profile',
+    };
+    const changes = [];
+    let updated = 0;
+
+    await db.transaction(async () => {
+      for (const row of slotRows) {
+        const cur = currentMap.get(`${row.stationAddr}:${row.slotNum}`);
+        const newVals = {
+          ip_address:      row.ipAddress      ?? null,
+          router_address:  row.routerAddress  ?? null,
+          module_name:     row.moduleName     ?? null,
+          pip_no:          row.pipNo          ?? null,
+          potential_group: row.potentialGroup ?? null,
+          pa_profile:      row.paProfile      ?? null,
+        };
+
+        // Collect field-level diffs for the summary
+        if (cur) {
+          for (const [field, label] of Object.entries(FIELD_LABELS)) {
+            const oldVal = cur[field] ?? null;
+            const newVal = newVals[field];
+            const oldStr = oldVal == null ? '—' : String(oldVal);
+            const newStr = newVal == null ? '—' : String(newVal);
+            if (oldStr !== newStr) {
+              changes.push({
+                station: cur.station_name || `Station ${row.stationAddr}`,
+                stationAddr: row.stationAddr,
+                slot: row.slotNum,
+                orderNo: cur.module_order_no,
+                field: label,
+                from: oldStr,
+                to: newStr,
+              });
+            }
+          }
+        }
+
+        await db.prepare(`
+          UPDATE hw_signals
+          SET ip_address = ?, router_address = ?, module_name = ?, pip_no = ?, potential_group = ?, pa_profile = ?
+          WHERE hw_import_id = ? AND station_address = ? AND slot = ?
+        `).run(
+          newVals.ip_address,
+          newVals.router_address,
+          newVals.module_name,
+          newVals.pip_no,
+          newVals.potential_group,
+          newVals.pa_profile,
+          importId,
+          row.stationAddr,
+          row.slotNum
+        );
+        updated++;
+      }
+    })();
+
+    res.json({ updated, changes, errors: [] });
   } catch (e) { err(res, 500, e.message); }
 });
 

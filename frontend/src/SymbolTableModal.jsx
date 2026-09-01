@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from "react";
 import SymbolTableGrid from "./SymbolTableGrid.tsx";
-import { getSlotChannels } from "./api.js";
+import { getAllSlotChannels } from "./api.js";
 
 export default function SymbolTableModal({ importId, stations, onClose }) {
   const [symbolData, setSymbolData] = useState([]);
@@ -9,6 +9,51 @@ export default function SymbolTableModal({ importId, stations, onClose }) {
   useEffect(() => {
     loadSymbolTable();
   }, [importId, stations]);
+
+  function calculateMnemonic(signalType, channelIndex) {
+    // Format matches PCS7 CFG: "{identifier} {offset}.{bit}" or "{identifier} {byteOfs}.0" for words
+    const chIdx = Number(channelIndex) || 0;
+
+    // Digital modules: bit-packed (DI, DO) → byte_offset.bit_position (8 bits per byte)
+    // I 0.0, I 0.1, I 0.2, ..., I 1.0 (at channel 8)
+    if (signalType === 'DI' || signalType === 'MIXED') {
+      const byteOfs = Math.floor(chIdx / 8);
+      const bitPos = chIdx % 8;
+      return `I ${byteOfs}.${bitPos}`;
+    }
+    if (signalType === 'DO') {
+      const byteOfs = Math.floor(chIdx / 8);
+      const bitPos = chIdx % 8;
+      return `Q ${byteOfs}.${bitPos}`;
+    }
+
+    // Analog modules: word-based (AI, AO) → byte offset (2 bytes per channel)
+    // IW 0.0, IW 2.0, IW 4.0, etc.
+    if (signalType === 'AI') {
+      const byteOfs = chIdx * 2;
+      return `IW ${byteOfs}.0`;
+    }
+    if (signalType === 'AO') {
+      const byteOfs = chIdx * 2;
+      return `QW ${byteOfs}.0`;
+    }
+
+    // PROFIBUS PA: bit format
+    if (signalType === 'PA') {
+      const byteOfs = Math.floor(chIdx / 8);
+      const bitPos = chIdx % 8;
+      return `I ${byteOfs}.${bitPos}`;
+    }
+
+    // Infrastructure: bit format
+    if (signalType === 'INFRA') {
+      const byteOfs = Math.floor(chIdx / 8);
+      const bitPos = chIdx % 8;
+      return `I ${byteOfs}.${bitPos}`;
+    }
+
+    return '—';
+  }
 
   async function loadSymbolTable() {
     if (!importId || !stations || stations.length === 0) {
@@ -19,54 +64,33 @@ export default function SymbolTableModal({ importId, stations, onClose }) {
 
     setLoading(true);
     try {
+      // Single batch API call instead of looping through 100+ slots
+      const stationData = await getAllSlotChannels(importId);
       const allChannels = [];
 
-      // Batch all API calls in parallel for better performance
-      const slotPromises = [];
-      for (const station of stations) {
-        const stationName = station.name || `Station ${station.address}`;
-        if (!station.slots || station.slots.length === 0) continue;
-
+      for (const station of stationData) {
         for (const slot of station.slots) {
-          slotPromises.push(
-            getSlotChannels(importId, station.address, slot.slot)
-              .then(channels => {
-                const slotChannels = [];
-                for (const channel of channels) {
-                  // Filter to only channels with assigned signal names
-                  if (!channel.tag) continue;
+          for (const channel of slot.channels) {
+            // Filter to only channels with assigned signal names
+            if (!channel.tag) continue;
 
-                  const address = `${station.address}:${slot.slot}:${channel.channel}`;
-                  const dataType = mapSignalType(channel.signal_type);
+            const deviceSlotChannel = `${station.stationAddress}:${slot.slot}:${channel.channel}`;
+            const mnemonic = calculateMnemonic(channel.signal_type, channel.channel);
+            const dataType = mapSignalType(channel.signal_type);
 
-                  slotChannels.push({
-                    station: stationName,
-                    address,
-                    signalName: channel.tag,
-                    dataType,
-                    description: channel.description || "—",
-                  });
-                }
-                return slotChannels;
-              })
-              .catch(err => {
-                console.error(
-                  `Failed to load channels for station ${station.address} slot ${slot.slot}:`,
-                  err
-                );
-                return [];
-              })
-          );
+            allChannels.push({
+              station: station.stationName,
+              deviceSlotChannel,
+              address: mnemonic,
+              signalName: channel.tag,
+              dataType,
+              description: channel.description || "—",
+            });
+          }
         }
       }
 
-      // Wait for all API calls and combine results
-      const results = await Promise.all(slotPromises);
-      for (const slotChannels of results) {
-        allChannels.push(...slotChannels);
-      }
-
-      // Add row numbers after combining
+      // Add row numbers
       allChannels.forEach((ch, i) => {
         ch.rowNum = i + 1;
       });
@@ -164,7 +188,7 @@ const modalContentStyle = {
   flexDirection: "column",
   width: "98%",
   maxWidth: 1800,
-  maxHeight: "90vh",
+  height: "90vh",
   background: "#ffffff",
   borderRadius: 12,
   boxShadow: "0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04)",

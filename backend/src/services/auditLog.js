@@ -38,6 +38,9 @@ async function recordAudit(db, {
   batchId = null,
   entityType,
   entityId,
+  // Durable string identity, for entities whose row id churns (project_instances
+  // is wiped and reinserted on every save). Null for entities keyed by entityId.
+  entityKey = null,
   action,
   fieldChanges = null,
   description,
@@ -57,13 +60,14 @@ async function recordAudit(db, {
 
   await db.prepare(`
     INSERT INTO audit_log
-      (project_id, batch_id, entity_type, entity_id, action, field_changes, description, changed_by, reason, source, location, object_label, context_cm_type)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+      (project_id, batch_id, entity_type, entity_id, entity_key, action, field_changes, description, changed_by, reason, source, location, object_label, context_cm_type)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `).run(
     projectId,
     batchId,
     entityType,
     entityId,
+    entityKey,
     action,
     fieldChanges ? JSON.stringify(fieldChanges) : null,
     description,

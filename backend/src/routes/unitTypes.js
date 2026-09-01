@@ -2,6 +2,8 @@
 'use strict';
 const express = require('express');
 const { getDb } = require('../db');
+const { newBatchId } = require('../services/auditLog');
+const { auditInstanceCreate } = require('../services/instanceAudit');
 
 const router = express.Router({ mergeParams: true });
 
@@ -458,6 +460,9 @@ router.delete('/project/:projectId/unit-instances/:id', async (req, res) => {
 // Extracted from the route handler below so the conflict-aware expand endpoint
 // (routes/instanceConflicts.js) runs this exact logic rather than a copy of it.
 async function expandUnitInstances(db, projectId) {
+  // One batch id for the whole expansion, so every instance it creates reads as
+  // a single operation in the audit log.
+  const auditBatchId = newBatchId();
   {
     // Load enabled_blocks profile per cm_type for this project (or default to all required)
     const profileRows = await db.prepare(
@@ -701,6 +706,8 @@ async function expandUnitInstances(db, projectId) {
                 SET is_generated=true, last_reconciled_at=NOW()
                 WHERE id=?
               `).run(existingInst.id);
+              // No audited column changes here — only the is_generated flag — so
+              // nothing is logged. The row's own creation was logged at its source.
             } else {
               // Create new instance marked as generated
               await db.prepare(`
@@ -726,6 +733,13 @@ async function expandUnitInstances(db, projectId) {
                 JSON.stringify(connections),
                 true
               );
+              await auditInstanceCreate(db, {
+                projectId,
+                instance: { instance_name: instanceName, cm_type: cm.cm_type_name },
+                batchId: auditBatchId,
+                source: 'import',
+                location: 'Unit Types > Expand',
+              });
             }
             instanceCount++;
           }

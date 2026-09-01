@@ -25,6 +25,7 @@ const connectionRoutes     = require('./routes/connections');
 const moduleParametersRoutes = require('./routes/moduleParameters');
 const workflowRoutes       = require('./routes/workflow');
 const instanceConflictRoutes = require('./routes/instanceConflicts');
+const ioConflictRoutes       = require('./routes/ioConflicts');
 const reconciliationRoutes = require('./routes/reconciliation');
 const simitExportRoutes    = require('./routes/simitExport');
 
@@ -67,6 +68,7 @@ app.use('/api/connections',      connectionRoutes);
 app.use('/api/module-parameters', moduleParametersRoutes);
 app.use('/api/workflow',         workflowRoutes);
 app.use('/api/instance-conflicts', instanceConflictRoutes);
+app.use('/api/io-conflicts',       ioConflictRoutes);
 app.use('/api/reconciliation',   reconciliationRoutes);
 app.use('/api/simit-export',     simitExportRoutes);
 

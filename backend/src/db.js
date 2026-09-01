@@ -464,6 +464,13 @@ async function ensureSchema() {
   await addColumnIfMissing('audit_log', 'object_label', 'object_label TEXT');
   await addColumnIfMissing('audit_log', 'context_cm_type', 'context_cm_type TEXT');
 
+  // Migration: durable string identity for entities whose row id is not stable.
+  // project_instances is wiped and reinserted on every project save, so entity_id
+  // cannot identify an instance across saves — entity_key holds instance_name.
+  // Library rows leave it NULL and keep using entity_id.
+  await addColumnIfMissing('audit_log', 'entity_key', 'entity_key TEXT');
+  await rawRun(`CREATE INDEX IF NOT EXISTS idx_audit_entity_key ON audit_log(entity_key)`);
+
   // Migration: add project_config table (per-project PCS7 hardware IDs)
   await rawRun(`CREATE TABLE IF NOT EXISTS project_config (
     id               SERIAL PRIMARY KEY,
@@ -987,6 +994,7 @@ async function ensureSchema() {
 
   // Migration: add default_datatype to hw_module_templates if missing
   await addColumnIfMissing('hw_module_templates', 'default_datatype', 'default_datatype TEXT');
+  await rawRun(`CREATE INDEX IF NOT EXISTS idx_hwmt_order_no ON hw_module_templates(order_no)`);
 
   await rawRun(`CREATE TABLE IF NOT EXISTS hw_imports (
     id           SERIAL PRIMARY KEY,
@@ -1021,6 +1029,7 @@ async function ensureSchema() {
     as_assignment   TEXT
   )`);
   await rawRun(`CREATE INDEX IF NOT EXISTS idx_hws_import ON hw_signals(hw_import_id)`);
+  await rawRun(`CREATE INDEX IF NOT EXISTS idx_hws_import_tag ON hw_signals(hw_import_id, tag)`);
 
   // Migration: add subsystem_no to hw_signals if missing
   await addColumnIfMissing('hw_signals', 'subsystem_no', 'subsystem_no INTEGER');
@@ -1819,6 +1828,10 @@ async function ensureSchema() {
     console.log('[DB] Migration: instance→controller backfill skipped:', e.message);
   }
 
+  // ── Create hw_config_flat view for denormalized hardware config display ──
+  await createHwConfigFlatView();
+  await createSymbolTableView();
+
   // ── Migration: scope Library / Composite CM Types / Unit Types to a project ──
   // Previously global (one shared pool for every project). Each project now owns
   // its own copy — cm_type_name references from composites/unit-types are only
@@ -2195,6 +2208,60 @@ async function migrateLibraryToProjectScope() {
   await rawRun('CREATE UNIQUE INDEX IF NOT EXISTS uq_user_cm_block_prefs_proj_name ON user_cm_block_prefs(project_id, cm_type_name)');
 
   console.log('[DB] Migration: library/composites/unit-types are now project-scoped');
+}
+
+// Creates hw_config_flat VIEW that denormalizes station + slot config data
+// for bulk export/import and reporting. Always mirrors hw_signals truth — not a table.
+async function createHwConfigFlatView() {
+  try {
+    await rawRun(`
+      CREATE OR REPLACE VIEW hw_config_flat AS
+      SELECT
+        s.hw_import_id,
+        s.station_address,
+        s.station_name,
+        s.ip_address,
+        s.subsystem_no,
+        s.router_address,
+        s.as_assignment,
+        s.slot,
+        s.module_order_no,
+        s.module_name,
+        s.signal_type,
+        s.pip_no,
+        s.potential_group,
+        s.pa_profile
+      FROM hw_signals s
+      WHERE s.module_order_no != 'PLACEHOLDER'
+      ORDER BY s.station_address, s.slot;
+    `);
+  } catch (e) {
+    console.error('[DB] Failed to create hw_config_flat view:', e.message);
+  }
+}
+
+// Creates a view for Symbol Table: flattens all tagged channels grouped by station/slot
+// Querying this view eliminates all JavaScript-side grouping/processing
+async function createSymbolTableView() {
+  try {
+    await rawRun(`
+      CREATE OR REPLACE VIEW symbol_table_flat AS
+      SELECT
+        hw_import_id,
+        station_address,
+        station_name,
+        slot,
+        channel,
+        tag,
+        description,
+        signal_type
+      FROM hw_signals
+      WHERE tag IS NOT NULL
+      ORDER BY station_address, slot, channel;
+    `);
+  } catch (e) {
+    console.error('[DB] Failed to create symbol_table_flat view:', e.message);
+  }
 }
 
 // Collapses duplicate (project_id, name) clones left behind by an interrupted

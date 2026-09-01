@@ -543,11 +543,8 @@ function parseCfgForCatalogue(text) {
         if (servicePos > 1 && subslotNum === servicePos) isServiceModule = true;
       }
 
-      // SUBSLOT 1 IFACE infrastructure heads have order_no starting with "_S7H_".
-      // These are auto-imported alongside their parent and hidden from the user preview.
-      // Plain PA profile types appearing at SUBSLOT 1 (e.g. "Analog Input (AI)long") are
-      // real function subslots — they should be visible and importable independently.
-      const isIfaceHead = !!(slotM && subslotNo === 1 && order_no.startsWith('_S7H_'));
+      // All subslots are visible and importable — no background hiding.
+      const isIfaceHead = false;
 
       // Determine hw_category generically based on presence of SLOT and SUBSLOT
       // No family-specific logic - same rules apply to all hardware types
@@ -600,9 +597,7 @@ function parseCfgForCatalogue(text) {
         ioAddress,     // numeric IO station address — used to group entries in the import UI
         hw_category,   // 'station' | 'slot' | 'subslot'
         subslotNo,     // null for non-subslot entries; 1-based subslot number otherwise
-        // SUBSLOT 1 _S7H_ IFACE heads: hidden from preview, auto-imported alongside their parent slot.
-        // Plain PA profile types at SUBSLOT 1 (e.g. "Analog Input (AI)long") are visible function subslots.
-        isBackground: isIfaceHead,
+        isBackground: false,
         // Service modules (highest-numbered subslot = AUTOCREATED diagnostic block): excluded entirely
         isServiceModule,
         parseError: null,

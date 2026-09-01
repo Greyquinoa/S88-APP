@@ -27,6 +27,7 @@ export interface Channel {
 export interface SymbolRow {
   rowNum: number;
   station: string;
+  deviceSlotChannel: string;
   address: string;
   signalName: string;
   dataType: string;
@@ -112,14 +113,24 @@ export default function SymbolTableGrid({ data, loading = false }: SymbolTableGr
       floatingFilter: true,
     },
     {
-      field: "address",
-      headerName: "Address",
+      field: "deviceSlotChannel",
+      headerName: "Device/Slot/Channel",
       width: 160,
       sortable: true,
       filter: "agTextColumnFilter",
       suppressMenu: true,
       floatingFilter: true,
-      cellStyle: { fontFamily: "monospace", color: "#2255cc", fontWeight: 500 },
+      cellStyle: { fontFamily: "monospace", color: "#6b7280", fontSize: 11 },
+    },
+    {
+      field: "address",
+      headerName: "ADDRESS",
+      width: 120,
+      sortable: true,
+      filter: "agTextColumnFilter",
+      suppressMenu: true,
+      floatingFilter: true,
+      cellStyle: { fontFamily: "monospace", color: "#2255cc", fontWeight: 600, fontSize: 13 },
     },
     {
       field: "signalName",
@@ -137,7 +148,9 @@ export default function SymbolTableGrid({ data, loading = false }: SymbolTableGr
       headerName: "Data Type",
       width: 130,
       sortable: true,
-      filter: "agSetColumnFilter",
+      /* agSetColumnFilter is an enterprise module and is not registered here —
+         using it logs AG Grid error #200 and leaves the column unfilterable. */
+      filter: "agTextColumnFilter",
       suppressMenu: true,
       floatingFilter: true,
       cellRenderer: DataTypeBadgeRenderer,
@@ -196,10 +209,14 @@ export default function SymbolTableGrid({ data, loading = false }: SymbolTableGr
             headerHeight={36}
             floatingFilterHeight={32}
             animateRows={false}
-            rowBuffer={20}
+            rowBuffer={10}
             onGridReady={onGridReady}
-            getRowId={({ data }) => `${data.address}-${data.signalName}`}
-            domLayout="autoHeight"
+            /* deviceSlotChannel is the only globally-unique key: the mnemonic
+               address repeats across stations (ET1 and ET2 both have "I 0.0"). */
+            getRowId={({ data }) => data.deviceSlotChannel}
+            /* NOT autoHeight — that renders every row into the DOM and costs
+               seconds at a few thousand signals. Normal layout virtualizes. */
+            style={{ height: "100%" }}
           />
         )}
       </div>
