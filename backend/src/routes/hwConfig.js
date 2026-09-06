@@ -4195,52 +4195,49 @@ router.post('/imports/:id/import', upload.single('file'), async (req, res) => {
   } catch (e) { err(res, 500, e.message); }
 });
 
-// GET /hw-config/templates/io-list-excel — Download Excel template with AS01 current configuration
+// GET /hw-config/templates/io-list-excel — Download Excel template with AS01 IOLink/CFU configuration
 router.get('/templates/io-list-excel', async (req, res) => {
   try {
     const db = getDb();
 
-    // Get AS01 hardware configuration (all slots from all stations matching 'AS01')
-    const hwData = await db.prepare(`
-      SELECT DISTINCT
+    // Get AS01 channel-level data (all signals with tags for IOLink/CFU)
+    const signals = await db.prepare(`
+      SELECT
         s.station_address,
         s.station_name,
+        s.ip_address,
+        s.subsystem_no,
+        s.router_address,
         s.slot,
         s.module_order_no,
         s.module_name,
+        s.tag,
         s.signal_type,
-        s.subsystem_no
+        s.description
       FROM hw_signals s
       WHERE s.station_name LIKE '%AS01%'
         AND s.slot > 0
-      ORDER BY s.station_address, s.slot
+      ORDER BY s.station_address, s.slot, s.tag
     `).all();
-
-    // Get station reference info
-    const stationRef = await db.prepare(`
-      SELECT DISTINCT station_address, station_name
-      FROM hw_signals
-      WHERE station_name LIKE '%AS01%'
-      LIMIT 1
-    `).get();
-
-    const stationName = stationRef?.station_name || 'AS01';
-    const ctrlAddr = stationRef?.station_address || 4;
 
     // Create workbook
     const workbook = new ExcelJS.Workbook();
     const worksheet = workbook.addWorksheet('HW IO List');
 
-    // Define headers
+    // Define headers matching the export structure
     const headers = [
+      'Station Address',
       'Station Name',
-      'Controller Address',
-      'Unit Name',
-      'Unit Type',
+      'IP Address',
+      'Subsystem No',
+      'Router Address',
       'Slot',
-      'Module Type (Order No)',
+      'Module Order No',
       'Module Name',
-      'Signal Type'
+      'Channel',
+      'Tag',
+      'Signal Type',
+      'Description'
     ];
 
     // Add header row with styling
@@ -4250,49 +4247,77 @@ router.get('/templates/io-list-excel', async (req, res) => {
 
     // Set column widths
     worksheet.columns = [
-      { width: 12 },
+      { width: 16 },
       { width: 18 },
-      { width: 20 },
-      { width: 20 },
+      { width: 15 },
+      { width: 12 },
+      { width: 15 },
       { width: 6 },
-      { width: 35 },
       { width: 28 },
-      { width: 15 }
+      { width: 22 },
+      { width: 8 },
+      { width: 20 },
+      { width: 14 },
+      { width: 24 }
     ];
 
     // Freeze header row
     worksheet.views = [{ state: 'frozen', ySplit: 1 }];
 
-    // Add AS01 data rows from current configuration
-    const addedSlots = new Set();
-    for (const hw of hwData) {
-      const slotKey = `${hw.station_address}:${hw.slot}`;
-      if (addedSlots.has(slotKey)) continue;
-      addedSlots.add(slotKey);
+    // Add AS01 signal/channel data
+    let channelNum = 0;
+    let lastSlot = null;
+    for (const sig of signals) {
+      if (sig.slot !== lastSlot) {
+        channelNum = 0;
+        lastSlot = sig.slot;
+      }
 
       worksheet.addRow([
-        stationName,                    // Station Name
-        ctrlAddr,                       // Controller Address
-        '',                             // Unit Name (user fills)
-        '',                             // Unit Type (user fills)
-        hw.slot,                        // Slot
-        hw.module_order_no || '',       // Module Type (Order No)
-        hw.module_name || '',           // Module Name
-        hw.signal_type || ''            // Signal Type
+        sig.station_address,       // Station Address
+        sig.station_name,          // Station Name
+        sig.ip_address || '',      // IP Address
+        sig.subsystem_no || '',    // Subsystem No
+        sig.router_address || '',  // Router Address
+        sig.slot,                  // Slot
+        sig.module_order_no || '', // Module Order No
+        sig.module_name || '',     // Module Name
+        sig.tag ? channelNum : '', // Channel (only if tag exists)
+        sig.tag || '',             // Tag
+        sig.signal_type || '',     // Signal Type
+        sig.description || ''      // Description
       ]);
+
+      if (sig.tag) channelNum++;
     }
 
-    // Add 5 blank rows for user to fill
-    for (let i = 0; i < 5; i++) {
-      worksheet.addRow([stationName, ctrlAddr, '', '', '', '', '', '']);
+    // Add 10 blank rows for user to fill
+    const firstSig = signals[0];
+    if (firstSig) {
+      for (let i = 0; i < 10; i++) {
+        worksheet.addRow([
+          firstSig.station_address,
+          firstSig.station_name,
+          firstSig.ip_address || '',
+          firstSig.subsystem_no || '',
+          firstSig.router_address || '',
+          '', // Slot
+          '', // Module Order No
+          '', // Module Name
+          '', // Channel
+          '', // Tag
+          '', // Signal Type
+          ''  // Description
+        ]);
+      }
     }
 
-    // Stream as download
+    // Set response headers
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="HW_IO_List_AS01_$(date).xlsx"`);
+    res.setHeader('Content-Disposition', `attachment; filename="HW_IO_List_AS01_Template.xlsx"`);
 
+    // Write and end response properly
     await workbook.xlsx.write(res);
-    res.end();
   } catch (e) { err(res, 500, e.message); }
 });
 

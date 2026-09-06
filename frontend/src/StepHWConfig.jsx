@@ -2489,7 +2489,7 @@ function ImportPanel({
               onChange={onIoListChange}
               disabled={!importId}
               extraBtn={true}
-              extraBtnLabel="⬇ Download Excel Template (AS01)"
+              extraBtnLabel="⬇ Download Excel Template (AS01 IOLink/CFU)"
               onExtraBtn={async () => {
                 try {
                   const res = await fetch('/api/hw-config/templates/io-list-excel');
@@ -2498,7 +2498,7 @@ function ImportPanel({
                   const url = URL.createObjectURL(blob);
                   const a = document.createElement('a');
                   a.href = url;
-                  a.download = `HW_IO_List_AS01_${new Date().toISOString().split('T')[0]}.xlsx`;
+                  a.download = `HW_IO_List_AS01_Template.xlsx`;
                   a.click();
                   URL.revokeObjectURL(url);
                 } catch (e) {
