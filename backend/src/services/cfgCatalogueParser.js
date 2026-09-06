@@ -6,7 +6,8 @@
 // Returns an array of candidate objects, deduplicated by order_no:
 //   { order_no, version, display_name, family, signal_type,
 //     input_bytes, output_bytes, in_addr_fmt, out_addr_fmt,
-//     param_template, channel_count, parseError }
+//     param_template, channel_count, parent_order_no, is_autocreated,
+//     is_removable, parseError }
 'use strict';
 
 // ── Family derivation ─────────────────────────────────────────────────────────
@@ -264,12 +265,101 @@ function extractScalanceDevices(lines) {
   return devices;
 }
 
+// ── Station head order_no per IOADDRESS (for parent_order_no threading) ────────
+// Head records are the IOSUBSYSTEM/IOADDRESS lines with no SLOT at all — the parent
+// of every SLOT-level candidate at that station.
+function buildStationHeadsByAddr(lines) {
+  const heads = new Map(); // ioAddress → order_no
+  for (const raw of lines) {
+    const l = raw.trimEnd();
+    if (!/^IOSUBSYSTEM\s+\d+,\s*IOADDRESS\s+\d+/.test(l)) continue;
+    if (/\bSLOT\s+\d+/i.test(l)) continue; // has a SLOT → not a head record
+    const ioAddrM = l.match(/\bIOADDRESS\s+(\d+)/i);
+    if (!ioAddrM) continue;
+    const quoted = [];
+    const qRe = /"([^"]*)"/g; let qm;
+    while ((qm = qRe.exec(l)) !== null) quoted.push(qm[1]);
+    if (quoted.length === 0) continue;
+    const ioAddress = parseInt(ioAddrM[1], 10);
+    if (!heads.has(ioAddress)) heads.set(ioAddress, quoted[0]);
+  }
+  return heads;
+}
+
+// ── Full slot/subslot tree per station (for Auto-Slots Config seeding) ─────────
+// Unlike imPortsByAddr (SLOT 0 only, used for port_config), this walks every
+// SLOT/SUBSLOT header for a given IOADDRESS so the complete hierarchy — e.g.
+// SLOT 0 (interface + ports) AND SLOT 1+ (function modules) — can be used to
+// pre-populate a station's hw_station_auto_slots config at import time.
+// Returns Map<ioAddress, [{slot, order_no, label, subslots:[{subslot, order_no, label, port_label}]}]>
+function buildStationSlotTrees(lines) {
+  const trees = new Map(); // ioAddress → Map<slotNo, {order_no, label, subslots: Map<subslotNo, {order_no,label}>}>
+
+  for (const raw of lines) {
+    const l = raw.trimEnd();
+    if (!/^IOSUBSYSTEM\s+\d+,\s*IOADDRESS\s+\d+/.test(l)) continue;
+
+    const ioAddrM = l.match(/\bIOADDRESS\s+(\d+)/i);
+    const slotM   = l.match(/\bSLOT\s+(\d+)/i);
+    if (!ioAddrM || !slotM) continue; // station-head lines (no SLOT) aren't part of the slot tree
+
+    const ioAddress = parseInt(ioAddrM[1], 10);
+    const slotNo    = parseInt(slotM[1], 10);
+    const ssM       = l.match(/\bSUBSLOT\s+(\d+)/i);
+
+    const quoted = [];
+    const qRe = /"([^"]*)"/g; let qm;
+    while ((qm = qRe.exec(l)) !== null) quoted.push(qm[1]);
+    const orderNo = quoted[0] || '';
+    const label   = quoted[quoted.length - 1] || '';
+
+    if (!trees.has(ioAddress)) trees.set(ioAddress, new Map());
+    const slotMap = trees.get(ioAddress);
+    if (!slotMap.has(slotNo)) slotMap.set(slotNo, { order_no: '', label: '', subslots: new Map() });
+    const slotEntry = slotMap.get(slotNo);
+
+    if (ssM) {
+      slotEntry.subslots.set(parseInt(ssM[1], 10), { order_no: orderNo, label });
+    } else {
+      slotEntry.order_no = orderNo;
+      slotEntry.label = label;
+    }
+  }
+
+  const result = new Map();
+  for (const [ioAddress, slotMap] of trees) {
+    const slots = [...slotMap.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([slotNo, s]) => ({
+        slot: slotNo,
+        order_no: s.order_no,
+        label: s.label,
+        subslots: [...s.subslots.entries()]
+          .sort((a, b) => a[0] - b[0])
+          .map(([ssNo, ss]) => ({
+            subslot: ssNo,
+            order_no: ss.order_no,
+            label: ss.label,
+            port_label: /port/i.test(ss.label || '') ? ss.label : '',
+          })),
+      }));
+    result.set(ioAddress, slots);
+  }
+  return result;
+}
+
 // ── Main par───────────────────────────────────────────────────────
 function parseCfgForCatalogue(text) {
   const lines = text.split(/\r?\n/);
 
   // ── Pre-pass: extract GSDML Scalance device records ──────────────────────────
   const scalanceDevices = extractScalanceDevices(lines);
+
+  // ── Pre-pass: full per-station slot/subslot tree, for Auto-Slots Config seeding ──
+  const slotTrees = buildStationSlotTrees(lines);
+
+  // ── Pre-pass: station head order_no per IOADDRESS, for parent_order_no threading ──
+  const stationHeadsByAddr = buildStationHeadsByAddr(lines);
 
   // Collect all IOSUBSYSTEM IOADDRESS blocks (device heads + slot cards).
   // Each candidate block: { header_line, body_lines[] }
@@ -557,15 +647,54 @@ function parseCfgForCatalogue(text) {
         hw_category = 'station';
       }
 
+      // AUTOCREATED marker is a standalone line immediately after the header ⇒ fixed
+      // node (locked, always emitted, never user-addable) — ground truth rule 2.
+      const is_autocreated = bodyLines.length > 0 && bodyLines[0].trim() === 'AUTOCREATED';
+
+      // OBJECT_REMOVEABLE "0"/"1" in the body ⇒ shipped-default vs. removable/replaceable.
+      // An AUTOCREATED node is always fixed, regardless of what OBJECT_REMOVEABLE says.
+      const removeableM = body.match(/\bOBJECT_REMOVEABLE\s+"(\d)"/);
+      let is_removable = removeableM ? removeableM[1] === '1' : true;
+      if (is_autocreated) is_removable = false;
+
+      // parent_order_no: the immediate parent's order_no — station head for slots,
+      // owning slot for subslots. Child identity is parent-scoped (ground truth rule 5).
+      let parent_order_no = null;
+      if (hw_category === 'slot') {
+        parent_order_no = stationHeadsByAddr.get(ioAddress) || null;
+      } else if (hw_category === 'subslot') {
+        const treeSlots = slotTrees.get(ioAddress) || [];
+        const slotEntry = treeSlots.find(ts => ts.slot === slotNum);
+        parent_order_no = (slotEntry && slotEntry.order_no) || null;
+      }
+
       // For station-head entries (hw_category === 'station'), attach any SLOT 0 subslots
       // collected in the pre-pass. These are stored as port_config so the auto-slot system
       // can use them. Applies to ALL hardware types (ET200, CFU, GSDML, etc.)
       let port_config = null;
+      let auto_slots_seed = null;
+      let default_subslots_seed = null;
       if (hw_category === 'station') {
         const imPorts = imPortsByAddr.get(ioAddress);
         if (imPorts && imPorts.length > 0) {
           const sorted = [...imPorts].sort((a, b) => a.subslot - b.subslot);
           port_config = JSON.stringify(sorted);
+        }
+
+        // Full slot/subslot hierarchy (SLOT 0 interface/ports AND SLOT 1+ function
+        // modules) for pre-populating this station's Auto-Slots Config on import.
+        const treeSlots = slotTrees.get(ioAddress);
+        if (treeSlots && treeSlots.length > 0) {
+          auto_slots_seed = JSON.stringify({ slots: treeSlots });
+        }
+      } else if (hw_category === 'slot') {
+        // This slot's own default subslot tree (function positions + trailing Service
+        // module) for pre-populating its Auto-Slots Config on import. Same shape as a
+        // station's auto_slots_seed, one level shallower.
+        const treeSlots = slotTrees.get(ioAddress) || [];
+        const slotEntry = treeSlots.find(ts => ts.slot === slotNum);
+        if (slotEntry && Array.isArray(slotEntry.subslots) && slotEntry.subslots.length > 0) {
+          default_subslots_seed = JSON.stringify({ subslots: slotEntry.subslots });
         }
       }
 
@@ -592,19 +721,22 @@ function parseCfgForCatalogue(text) {
         channel_count,
         subslot_defaults, // For slots with function subslots: JSON array [{ssNo,paProfile},...] — null for others
         port_config,   // For station heads: JSON [{subslot, name, orderNo},...] of all SLOT 0 subslots
+        auto_slots_seed, // For station heads: JSON {slots:[...]} full SLOT/SUBSLOT tree — seeds hw_station_auto_slots
+        default_subslots_seed, // For slots: JSON {subslots:[...]} this slot's own default subslot tree — seeds hw_default_children
         mlfb: mlfbValue,  // Module type ID extracted directly from SLOT block
         slotInfo,      // e.g. "Slot 1", "Station head", "Slot 3 / Subslot 2" — for display only
         ioAddress,     // numeric IO station address — used to group entries in the import UI
         hw_category,   // 'station' | 'slot' | 'subslot'
         subslotNo,     // null for non-subslot entries; 1-based subslot number otherwise
+        parent_order_no, // immediate parent's order_no (station head for slots, slot for subslots); null for station heads
+        is_autocreated,  // true when AUTOCREATED immediately follows the header — fixed, locked node
+        is_removable,    // OBJECT_REMOVEABLE "1" in the body; always false when is_autocreated
         isBackground: false,
-        // Service modules (highest-numbered subslot = AUTOCREATED diagnostic block): excluded entirely
+        // Service modules (highest-numbered subslot, AUTOCREATED diagnostic block): still
+        // imported like any other subslot — flagged here for informational/UI purposes only.
         isServiceModule,
         parseError: null,
       };
-
-      // Service modules are AUTOCREATED infrastructure — never import them
-      if (isServiceModule) continue;
 
       // Dedup by (order_no, hw_category, slot, subslot) — allow same order_no in different categories.
       // For subslots, include (slot, subslot) in the key so SUBSLOT 2 and SUBSLOT 3 of the same type

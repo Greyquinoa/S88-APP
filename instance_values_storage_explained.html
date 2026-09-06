@@ -1,0 +1,517 @@
+<title>Instance-Specific Values Storage</title>
+<style>
+:root {
+  --primary: #2563eb;
+  --secondary: #059669;
+  --danger: #dc2626;
+  --warning: #d97706;
+  --bg-light: #f0f9ff;
+  --border: #0ea5e9;
+  --text: #1e293b;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg-light: #082f49;
+    --border: #0284c7;
+    --text: #f1f5f9;
+  }
+}
+
+body {
+  font-family: system-ui, sans-serif;
+  line-height: 1.6;
+  color: var(--text);
+  max-width: 1000px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
+h1, h2 {
+  color: var(--primary);
+  border-bottom: 2px solid var(--border);
+  padding-bottom: 10px;
+}
+
+.table-section {
+  margin: 30px 0;
+}
+
+.db-table {
+  background: var(--bg-light);
+  border-left: 4px solid var(--primary);
+  padding: 20px;
+  margin: 15px 0;
+  border-radius: 6px;
+}
+
+.db-table h3 {
+  color: var(--primary);
+  margin-top: 0;
+}
+
+.column-list {
+  display: grid;
+  grid-template-columns: 1fr 2fr;
+  gap: 10px;
+  margin: 15px 0;
+}
+
+.col-name {
+  font-weight: bold;
+  color: var(--secondary);
+  font-family: 'Courier New', monospace;
+  font-size: 14px;
+}
+
+.col-desc {
+  font-size: 14px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 15px 0;
+  background: var(--bg-light);
+}
+
+th, td {
+  border: 1px solid var(--border);
+  padding: 12px;
+  text-align: left;
+}
+
+th {
+  background: var(--primary);
+  color: white;
+  font-weight: bold;
+}
+
+.example-box {
+  background: var(--bg-light);
+  border-left: 4px solid var(--secondary);
+  padding: 15px;
+  margin: 15px 0;
+  border-radius: 6px;
+  font-family: 'Courier New', monospace;
+  font-size: 13px;
+  overflow-x: auto;
+}
+
+.highlight {
+  background: var(--warning);
+  color: white;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-weight: bold;
+}
+
+.badge {
+  display: inline-block;
+  padding: 4px 10px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: bold;
+  margin: 5px 0;
+}
+
+.badge-table {
+  background: var(--primary);
+  color: white;
+}
+
+.badge-main {
+  background: var(--secondary);
+  color: white;
+}
+
+.badge-io {
+  background: var(--warning);
+  color: white;
+}
+
+.flow-diagram {
+  background: var(--bg-light);
+  padding: 20px;
+  border-radius: 6px;
+  margin: 20px 0;
+  border-left: 4px solid var(--primary);
+}
+
+.step {
+  margin: 10px 0;
+  padding: 10px;
+  background: white;
+  border-radius: 4px;
+}
+
+code {
+  background: var(--bg-light);
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-family: 'Courier New', monospace;
+}
+
+.key-point {
+  background: var(--bg-light);
+  border-left: 4px solid var(--danger);
+  padding: 15px;
+  margin: 15px 0;
+  border-radius: 6px;
+}
+
+ul, ol {
+  margin: 10px 0;
+  padding-left: 20px;
+}
+
+li {
+  margin: 8px 0;
+}
+</style>
+
+<h1>💾 Where Instance-Specific VALUES Are Stored</h1>
+
+<p style="font-size: 16px; margin-bottom: 30px;">Instance values are scattered across 5 different database tables. Each table stores different types of values for the same instance.</p>
+
+<h2>📊 Quick Reference Table</h2>
+
+<table>
+  <tr>
+    <th>Database Table</th>
+    <th>What Values It Stores</th>
+    <th>Example Value</th>
+  </tr>
+  <tr>
+    <td><span class="badge badge-main">project_instances</span></td>
+    <td>Basic instance settings</td>
+    <td>sampling_time: "1000"</td>
+  </tr>
+  <tr>
+    <td><span class="badge badge-main">project_cmt_profiles</span></td>
+    <td>Which blocks are enabled</td>
+    <td>enabled_blocks: ["AIF_FRONT", "CSF"]</td>
+  </tr>
+  <tr>
+    <td><span class="badge badge-io">instance_ios</span></td>
+    <td>Hardware signal connections</td>
+    <td>signal_name: "PLC_Pressure_01"</td>
+  </tr>
+  <tr>
+    <td><span class="badge badge-table">instance_derived_values</span></td>
+    <td>Calculated values from IO lists</td>
+    <td>value: "100.5"</td>
+  </tr>
+  <tr>
+    <td><span class="badge badge-table">instance_matrix_overrides</span></td>
+    <td>Custom matrix cell values</td>
+    <td>cells: {1: {"column1": 5}}</td>
+  </tr>
+</table>
+
+<h2>1️⃣ project_instances Table</h2>
+
+<div class="db-table">
+  <h3><span class="badge badge-main">project_instances</span> - Main Instance Data</h3>
+
+  <p><strong>Purpose:</strong> Stores the core settings for each instance</p>
+
+  <div class="column-list">
+    <div class="col-name">instance_name</div>
+    <div class="col-desc">Name of the instance (e.g., "CM_A01")</div>
+
+    <div class="col-name">cm_type</div>
+    <div class="col-desc">What type of CM is this (e.g., "CM_AO", "CM_AV")</div>
+
+    <div class="col-name">sampling_time</div>
+    <div class="col-desc"><span class="highlight">⭐ INSTANCE VALUE:</span> How often to sample (e.g., "1000" = 1 second)</div>
+
+    <div class="col-name">user_project</div>
+    <div class="col-desc">Which user project this instance belongs to (e.g., "AS01")</div>
+
+    <div class="col-name">role_assignments</div>
+    <div class="col-desc"><span class="highlight">⭐ INSTANCE VALUE:</span> Custom role settings stored as JSON</div>
+
+    <div class="col-name">connections</div>
+    <div class="col-desc"><span class="highlight">⭐ INSTANCE VALUE:</span> Hardware connection rules stored as JSON</div>
+
+    <div class="col-name">folder_id</div>
+    <div class="col-desc">Where this instance is located in the hierarchy</div>
+
+    <div class="col-name">hw_controller_id</div>
+    <div class="col-desc">Which hardware controller owns this instance</div>
+  </div>
+
+  <div class="example-box">
+Example Row:
+{
+  id: 1,
+  instance_name: "CM_A01",
+  cm_type: "CM_AO",
+  sampling_time: "1000",         ← INSTANCE VALUE
+  user_project: "AS01",
+  role_assignments: '{"R001": "Tank01"}',  ← INSTANCE VALUE (JSON)
+  connections: '[{...}]',        ← INSTANCE VALUE (JSON)
+  folder_id: 5,
+  hw_controller_id: 2
+}
+  </div>
+</div>
+
+<h2>2️⃣ project_cmt_profiles Table</h2>
+
+<div class="db-table">
+  <h3><span class="badge badge-main">project_cmt_profiles</span> - Enabled Blocks Per CM Type</h3>
+
+  <p><strong>Purpose:</strong> Stores which optional blocks are enabled for each CM type</p>
+
+  <div class="column-list">
+    <div class="col-name">project_id</div>
+    <div class="col-desc">Which project this belongs to</div>
+
+    <div class="col-name">cm_type</div>
+    <div class="col-desc">CM type name (e.g., "CM_AO")</div>
+
+    <div class="col-name">enabled_blocks</div>
+    <div class="col-desc"><span class="highlight">⭐ INSTANCE VALUE:</span> List of enabled blocks stored as JSON array</div>
+  </div>
+
+  <div class="example-box">
+Example Row:
+{
+  project_id: 1,
+  cm_type: "CM_AO",
+  enabled_blocks: '["AIF_FRONT","CSF","GMP","IF_BACK"]'  ← INSTANCE VALUE
+}
+  </div>
+</div>
+
+<h2>3️⃣ instance_ios Table</h2>
+
+<div class="db-table">
+  <h3><span class="badge badge-io">instance_ios</span> - Hardware Signal Connections</h3>
+
+  <p><strong>Purpose:</strong> Stores which hardware signals are connected to each block/variable</p>
+
+  <div class="column-list">
+    <div class="col-name">instance_name</div>
+    <div class="col-desc">Which instance this IO belongs to</div>
+
+    <div class="col-name">block_name</div>
+    <div class="col-desc">Block name (e.g., "AIF_FRONT")</div>
+
+    <div class="col-name">var_name</div>
+    <div class="col-desc">Variable name in that block</div>
+
+    <div class="col-name">signal_name</div>
+    <div class="col-desc"><span class="highlight">⭐ INSTANCE VALUE:</span> Hardware signal connected (e.g., "PLC_Pressure_01")</div>
+
+    <div class="col-name">signal_type</div>
+    <div class="col-desc"><span class="highlight">⭐ INSTANCE VALUE:</span> Type of signal (e.g., "analog", "digital")</div>
+
+    <div class="col-name">hw_signal_id</div>
+    <div class="col-desc">Reference to the actual hardware signal in the hardware library</div>
+
+    <div class="col-name">status</div>
+    <div class="col-desc">Is this a real connection or dummy? ("real" or "dummy")</div>
+  </div>
+
+  <div class="example-box">
+Example Rows (for instance "CM_A01"):
+{
+  instance_name: "CM_A01",
+  block_name: "AIF_FRONT",
+  var_name: "Pressure",
+  signal_name: "PLC_Pressure_01",     ← INSTANCE VALUE
+  signal_type: "analog",               ← INSTANCE VALUE
+  status: "real"
+}
+
+{
+  instance_name: "CM_A01",
+  block_name: "CSF",
+  var_name: "Temperature",
+  signal_name: "PLC_Temp_02",         ← INSTANCE VALUE
+  signal_type: "analog",               ← INSTANCE VALUE
+  status: "real"
+}
+  </div>
+</div>
+
+<h2>4️⃣ instance_derived_values Table</h2>
+
+<div class="db-table">
+  <h3><span class="badge badge-table">instance_derived_values</span> - Calculated Values</h3>
+
+  <p><strong>Purpose:</strong> Stores calculated values for matrix connections or IO-based calculations</p>
+
+  <div class="column-list">
+    <div class="col-name">instance_name</div>
+    <div class="col-desc">Which instance this value belongs to</div>
+
+    <div class="col-name">to_var_name</div>
+    <div class="col-desc">Variable receiving the value</div>
+
+    <div class="col-name">symbol_name</div>
+    <div class="col-desc">Symbol from the hardware library</div>
+
+    <div class="col-name">column_name</div>
+    <div class="col-desc">Matrix column name</div>
+
+    <div class="col-name">value</div>
+    <div class="col-desc"><span class="highlight">⭐ INSTANCE VALUE:</span> The calculated/resolved value (e.g., "4.5")</div>
+
+    <div class="col-name">override_value</div>
+    <div class="col-desc"><span class="highlight">⭐ INSTANCE VALUE:</span> User override (if user manually changed it)</div>
+
+    <div class="col-name">status</div>
+    <div class="col-desc">Was this value resolved? ("resolved" or "unresolved")</div>
+  </div>
+
+  <div class="example-box">
+Example Row:
+{
+  instance_name: "CM_A01",
+  to_var_name: "OutputValue",
+  symbol_name: "PLC_Tank_Level",
+  column_name: "ScaleFactor",
+  value: "100.5",                 ← INSTANCE VALUE (calculated)
+  override_value: "95.0",         ← INSTANCE VALUE (user override)
+  status: "resolved"
+}
+  </div>
+</div>
+
+<h2>5️⃣ instance_matrix_overrides Table</h2>
+
+<div class="db-table">
+  <h3><span class="badge badge-table">instance_matrix_overrides</span> - Custom Matrix Values</h3>
+
+  <p><strong>Purpose:</strong> Stores custom values users entered for matrix instances</p>
+
+  <div class="column-list">
+    <div class="col-name">instance_name</div>
+    <div class="col-desc">Which instance this override belongs to</div>
+
+    <div class="col-name">enabled</div>
+    <div class="col-desc"><span class="highlight">⭐ INSTANCE VALUE:</span> Is this override active? (true/false)</div>
+
+    <div class="col-name">cells</div>
+    <div class="col-desc"><span class="highlight">⭐ INSTANCE VALUE:</span> Custom cell values stored as JSON</div>
+  </div>
+
+  <div class="example-box">
+Example Row:
+{
+  instance_name: "ValveMatrix_01",
+  enabled: true,                   ← INSTANCE VALUE
+  cells: '{
+    "1": {"Open": 50, "Close": 100},
+    "2": {"Open": 60, "Close": 110}
+  }'                               ← INSTANCE VALUE (JSON)
+}
+  </div>
+</div>
+
+<h2>🔍 How These Values Are Retrieved During XML Generation</h2>
+
+<div class="flow-diagram">
+  <strong>Step-by-step retrieval:</strong>
+
+  <div class="step">
+    <strong>1. Get Instance Metadata</strong><br>
+    <code>SELECT * FROM project_instances WHERE instance_name = ?</code>
+    <br>→ Gets: sampling_time, role_assignments, connections, folder_id, etc.
+  </div>
+
+  <div class="step">
+    <strong>2. Get Enabled Blocks</strong><br>
+    <code>SELECT enabled_blocks FROM project_cmt_profiles WHERE cm_type = ?</code>
+    <br>→ Gets: which blocks to include in XML (e.g., ["AIF_FRONT", "CSF"])
+  </div>
+
+  <div class="step">
+    <strong>3. Get Hardware Connections</strong><br>
+    <code>SELECT * FROM instance_ios WHERE instance_name = ?</code>
+    <br>→ Gets: signal_name for each variable (what hardware it connects to)
+  </div>
+
+  <div class="step">
+    <strong>4. Get Calculated Values</strong><br>
+    <code>SELECT * FROM instance_derived_values WHERE instance_name = ?</code>
+    <br>→ Gets: calculated values and overrides
+  </div>
+
+  <div class="step">
+    <strong>5. Get Matrix Overrides (if matrix instance)</strong><br>
+    <code>SELECT * FROM instance_matrix_overrides WHERE instance_name = ?</code>
+    <br>→ Gets: custom cell values for matrix instances
+  </div>
+
+  <div class="step">
+    <strong>6. Combine All Values</strong><br>
+    Create a complete picture of the instance with all its values<br>
+    → Then pass to xmlGenerator to create XML
+  </div>
+</div>
+
+<h2>📋 Real-World Example</h2>
+
+<div class="example-box">
+Instance Name: CM_A01 (CM_AO type)
+
+VALUES STORED ACROSS 5 TABLES:
+
+project_instances:
+  - sampling_time: "1000"
+  - role_assignments: '{"R001": "Tank01"}'
+  - connections: '[{...}]'
+
+project_cmt_profiles:
+  - enabled_blocks: ["AIF_FRONT", "CSF", "GMP"]
+
+instance_ios (multiple rows):
+  Row 1: block="AIF_FRONT", var="Pressure", signal="PLC_Pressure_01"
+  Row 2: block="CSF", var="SetPoint", signal="PLC_SetPoint_02"
+  Row 3: block="GMP", var="Output", signal="PLC_Output_03"
+
+instance_derived_values:
+  - to_var_name="CalcValue", value="100.5", override_value="95.0"
+
+instance_matrix_overrides:
+  - (none for this instance)
+</div>
+
+<h2>🎯 Key Takeaways</h2>
+
+<div class="key-point">
+  <strong>📌 Instance Values Are Spread Across Multiple Tables:</strong>
+  <ul>
+    <li><span class="badge badge-main">project_instances</span> → Basic settings (sampling time, roles, connections)</li>
+    <li><span class="badge badge-main">project_cmt_profiles</span> → Which blocks to include</li>
+    <li><span class="badge badge-io">instance_ios</span> → Hardware signal connections</li>
+    <li><span class="badge badge-table">instance_derived_values</span> → Calculated/resolved values</li>
+    <li><span class="badge badge-table">instance_matrix_overrides</span> → Custom matrix cell values</li>
+  </ul>
+</div>
+
+<div class="key-point">
+  <strong>💡 Why Multiple Tables?</strong>
+  <ul>
+    <li><strong>Separation of Concerns:</strong> Each table holds one specific type of data</li>
+    <li><strong>Flexibility:</strong> Easy to add/remove values without changing the main table</li>
+    <li><strong>Performance:</strong> Only query the tables you need</li>
+    <li><strong>Clarity:</strong> Clear what each table stores</li>
+  </ul>
+</div>
+
+<div class="key-point">
+  <strong>⭐ When Generating XML:</strong>
+  <ul>
+    <li><code>generate.js</code> queries ALL these tables to get complete instance data</li>
+    <li>Combines data from all tables into one object</li>
+    <li>Passes the combined object to <code>xmlGenerator.js</code></li>
+    <li>XML generator uses all these values to create the XML file</li>
+  </ul>
+</div>
+

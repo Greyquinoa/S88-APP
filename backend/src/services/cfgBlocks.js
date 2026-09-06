@@ -25,7 +25,7 @@ function ifaceOrderString(imOrder, imVersion) {
 }
 
 // ── Device header block (the IM "station" object) ─────────────────────────────
-function deviceHeaderBlock({ ioNo, addr, imOrder, imVersion, name, posX, posY }) {
+function deviceHeaderBlock({ ioNo, addr, imOrder, imVersion, name, posX, posY, scfL, updTime }) {
   const ver = imVersion ? ` "${imVersion}"` : '';
   // NOTE: PCS7 writes THIS block's BEGIN/END WITHOUT a trailing space (unlike the
   // AUTOCREATED submodule blocks below, which do have one). Matches as01_final.cfg.
@@ -49,7 +49,7 @@ function deviceHeaderBlock({ ioNo, addr, imOrder, imVersion, name, posX, posY })
     `  SIZE_X "78"`,
     `  SIZE_Y "64"`,
     `  MODULE_ADD_FLAGS "0"`,
-    `  PN_DEVICE_SCF_L "32"`,
+    `  PN_DEVICE_SCF_L "${scfL != null ? scfL : '32'}"`,
     `  CAX_APP_ID ""`,
     `  PN_GENERATED_SCF "0"`,
     `  SHARED_PROXY_DATA ""`,
@@ -58,10 +58,63 @@ function deviceHeaderBlock({ ioNo, addr, imOrder, imVersion, name, posX, posY })
     `  CREATOR ""`,
     `  LIST_SUBMODULES ""`,
     `  COMMENT ""`,
-    `  PN_DEVICE_UPD_TIME "2"`,
+    `  PN_DEVICE_UPD_TIME "${updTime != null ? updTime : '2'}"`,
     `  PLANT_DESIGNATION ""`,
     `  IRT_GROUP_NR "1"`,
     `END`,
+  ].join('\n');
+}
+
+// ── Device header block rendered from a captured, per-order_no body template ──
+// Ground-truth rule 6 (see plan): header body text is per (order_no, role), not
+// one fixed field list — e.g. a GSDML/IO-Link head carries PDM_PARAM/PN_HW_RELEASE/
+// PN_SW_RELEASE/PN_VENDOR_ID/PN_DEVICE_ID and omits PN_EQUIDISTANT_CYCLE/PN_MSOT/
+// IRT_DOMAIN_NAME, while an ET200SP head is the opposite. Rather than hardcoding
+// a field list per family, `hw_module_templates.body_template` stores the literal
+// captured BEGIN..END body (minus END) for a given order_no's own device header,
+// with only the instance-varying values placeholderized. This function fills
+// those placeholders and reassembles the block — fully generic, no per-device code.
+function fillBodyTemplatePlaceholders(bodyTemplate, vars) {
+  return bodyTemplate.replace(/\{\{(\w+)\}\}/g, (_, key) => (vars[key] != null ? String(vars[key]) : ''));
+}
+
+function deviceHeaderBlockFromTemplate({ ioNo, addr, imOrder, imVersion, name, bodyTemplate, posX, posY }) {
+  const ver  = imVersion ? ` "${imVersion}"` : '';
+  const body = fillBodyTemplatePlaceholders(bodyTemplate, {
+    ASSET_ID: newGuid(),
+    POS_X: posX != null ? posX : 609,
+    POS_Y: posY != null ? posY : 247,
+  });
+  return [
+    `IOSUBSYSTEM ${ioNo}, IOADDRESS ${addr}, "${imOrder}"${ver}, "${name}"`,
+    `BEGIN`,
+    body,
+    `END`,
+  ].join('\n');
+}
+
+// ── SLOT 0 rendered from a captured, per-order_no body template ───────────────
+// Same rationale as deviceHeaderBlockFromTemplate: SLOT 0's real field list is
+// per (order_no, role) too (e.g. GSDML/IO-Link SLOT 0 carries PN_TI/PN_TO/
+// PN_MODULE_IDENTNUMBER/PN_SUBMODULE_IDENTNUMBER and no PARAMETER block, while
+// ET200SP's SLOT 0 is the opposite) — use the captured body verbatim when the
+// slot's own catalogue row (hw_category='slot') has one.
+function slot0BlockFromTemplate({ ioNo, addr, imOrder, name, bodyTemplate, hexIp, hexRouter, diag, mlfb }) {
+  const body = fillBodyTemplatePlaceholders(bodyTemplate, {
+    ASSET_ID: newGuid(),
+    IPADDRESS: hexIp,
+    ROUTERADDRESS: hexRouter || hexIp,
+    POS_X: 0,
+    POS_Y: 0,
+    MLFB: mlfb || '',
+    DIAG: diag,
+  });
+  return [
+    `IOSUBSYSTEM ${ioNo}, IOADDRESS ${addr}, SLOT 0, "${imOrder}", "${name}"`,
+    `AUTOCREATED `,
+    `BEGIN `,
+    body,
+    `END `,
   ].join('\n');
 }
 
@@ -165,10 +218,87 @@ function ifaceBlock({ ioNo, addr, ifaceOrder, diag }) {
   ].join('\n');
 }
 
-// ── SLOT 0 SUBSLOT 2/3 (RJ45 port submodule, AUTOCREATED) ─────────────────────
-function portBlock({ ioNo, addr, subslot, portLabel, portOrder, diag }) {
+// ── SLOT 0 SUBSLOT 1 (PN-IO interface) rendered from a captured body template ──
+// The generic (non-ET200SP/CFU/Scalance) fallback path has no per-order_no HSP
+// interface name (ground-truth rule 6 still applies, but here the identity
+// itself — not just the body — is a single shared, family-agnostic catalogue
+// entry: order_no "_S7H_IO_NORM_INTERFACE_CT", hw_category='subslot'). Any
+// device using the generic fallback renders its SLOT 0 SUBSLOT 1 from that one
+// captured template — no per-device code, just one shared row.
+function ifaceBlockFromTemplate({ ioNo, addr, ifaceOrder, bodyTemplate, diag }) {
+  const body = fillBodyTemplatePlaceholders(bodyTemplate, {
+    ASSET_ID: newGuid(),
+    DIAG: diag,
+  });
+  return [
+    `IOSUBSYSTEM ${ioNo}, IOADDRESS ${addr}, SLOT 0, SUBSLOT 1, "${ifaceOrder}", "PN-IO"`,
+    `AUTOCREATED `,
+    `BEGIN `,
+    body,
+    `END `,
+  ].join('\n');
+}
+
+// ── SLOT 0 SUBSLOT 2/3 (RJ45 port submodule) rendered from a captured body ────
+// template — ground-truth rule 6's "both ports" case: the device's own order_no
+// is reused as the port's header order_no, and one captured body (from either
+// port) serves all of a device's SLOT 0 ports since they're identical apart
+// from ASSET_ID/diag address. Generic across any device on the fallback path.
+function portBlockFromTemplate({ ioNo, addr, subslot, portLabel, portOrder, bodyTemplate, diag }) {
+  const body = fillBodyTemplatePlaceholders(bodyTemplate, {
+    ASSET_ID: newGuid(),
+    DIAG: diag,
+  });
   return [
     `IOSUBSYSTEM ${ioNo}, IOADDRESS ${addr}, SLOT 0, SUBSLOT ${subslot}, "${portOrder}", "${portLabel}"`,
+    `AUTOCREATED `,
+    `BEGIN `,
+    body,
+    `END `,
+  ].join('\n');
+}
+
+// ── SLOT n SUBSLOT m (any slot's own subslot) rendered from a captured body ───
+// template — same rule-6 shape as portBlockFromTemplate, but generalized to any
+// slot number (not just SLOT 0's RJ45 ports). Used for slots ≥1 whose own
+// subslots (from hw_slot_subslots) carry a real captured body_template keyed by
+// their own order_no (hw_category='subslot'). AUTOCREATED is only emitted when
+// the captured body itself says OBJECT_REMOVEABLE "0", mirroring
+// ioModuleBlockFromTemplate's own AUTOCREATED detection.
+function subslotBlockFromTemplate({ ioNo, addr, slot, subslot, label, order, bodyTemplate, symbolLines, localAddress }) {
+  // {{SUBSLOT}} fills the ADDRESS line's own process-image address field — real
+  // per-instance data (e.g. 8 IO-Link ports sharing one catalogue order_no each
+  // occupy a different process-image byte), captured via cfgParser.js into
+  // hw_slot_subslots.local_address. It is NOT the subslot number itself (they
+  // coincide in the fixture used to capture this template, but must not be
+  // assumed equal in general) — fall back to the subslot number only when no
+  // real address was captured (e.g. legacy rows predating this column).
+  const addressValue = localAddress != null ? localAddress : subslot;
+  const body = fillBodyTemplatePlaceholders(bodyTemplate, {
+    ASSET_ID: newGuid(),
+    SUBSLOT: addressValue,
+    SYMBOLS: (symbolLines && symbolLines.length) ? '\n' + symbolLines.join('\n') : '',
+  });
+  const isAutocreated = /OBJECT_REMOVEABLE\s+"0"/.test(bodyTemplate);
+  const out = [
+    `IOSUBSYSTEM ${ioNo}, IOADDRESS ${addr}, SLOT ${slot}, SUBSLOT ${subslot}, "${order}", "${label}"`,
+  ];
+  if (isAutocreated) out.push(`AUTOCREATED `);
+  out.push(`BEGIN `, body, `END `);
+  return out.join('\n');
+}
+
+// ── SLOT n SUBSLOT m (RJ45 port submodule / generic auto-slot default, AUTOCREATED) ──
+// `slot` defaults to 0 (its original SLOT-0-port use); callers rendering a
+// non-zero slot's own default subslots must pass their real slot number, or
+// the emitted subslot numerically collides with SLOT 0's own subslots.
+// `addressLines`, when given, replaces the trailing diagnostic-address block with
+// the submodule's real process-image address block(s) and SYMBOL lines — a
+// subslot that carries actual I/O bytes (e.g. an IO-Link byte port) needs those,
+// not the placeholder diag address a plain RJ45 port gets.
+function portBlock({ ioNo, addr, slot = 0, subslot, portLabel, portOrder, diag, includePrivate6, addressLines }) {
+  return [
+    `IOSUBSYSTEM ${ioNo}, IOADDRESS ${addr}, SLOT ${slot}, SUBSLOT ${subslot}, "${portOrder}", "${portLabel}"`,
     `AUTOCREATED `,
     `BEGIN `,
     `  ASSET_ID "${newGuid()}"`,
@@ -195,6 +325,7 @@ function portBlock({ ioNo, addr, subslot, portLabel, portOrder, diag }) {
     `  SIZE_X "0"`,
     `  IRT_LINE_RX_DELAY "0"`,
     `  SIZE_Y "0"`,
+    ...(includePrivate6 ? [`  PRIVATE_6 "0"`] : []),
     `  PNDX_MODE "0"`,
     `  CAX_APP_ID ""`,
     `  OBJECT_COPYABLE "0"`,
@@ -205,8 +336,9 @@ function portBlock({ ioNo, addr, subslot, portLabel, portOrder, diag }) {
     `  PLANT_DESIGNATION ""`,
     `  LINE_DELAY_SELECTOR "0"`,
     `  IRT_GROUP_NR "1"`,
-    `LOCAL_IN_ADDRESSES `,
-    `  ADDRESS  ${diag}, 0, 0, 0, 0, 0`,
+    ...((addressLines && addressLines.length)
+      ? addressLines
+      : [`LOCAL_IN_ADDRESSES `, `  ADDRESS  ${diag}, 0, 0, 0, 0, 0`]),
     `END `,
   ].join('\n');
 }
@@ -220,6 +352,25 @@ function portBlock({ ioNo, addr, subslot, portLabel, portOrder, diag }) {
  *                       ['LOCAL_OUT_ADDRESSES', '  ADDRESS  512, 0, 8, 0, 2, 0']
  * @param paramLines    optional array, e.g. ['PARAMETER', '  POTENTIAL_GROUP, "NEW_GROUP"']
  */
+// A slot's own module header rendered from a captured body template — for
+// devices whose slot-header body shape isn't the generic ET200SP-style
+// CPU_NO/ALARM_OB_NO layout `ioModuleBlock` hardcodes (e.g. a GSDML DAP
+// submodule, which uses PN_TI/PN_TO/... fields). AUTOCREATED is emitted
+// whenever the captured source body itself was AUTOCREATED (ground-truth
+// rule 2), tracked by the caller via `isAutocreated`.
+function ioModuleBlockFromTemplate({ ioNo, addr, slot, order, version, name, bodyTemplate, isAutocreated }) {
+  const ver = version ? ` "${version}"` : '';
+  const body = fillBodyTemplatePlaceholders(bodyTemplate, {
+    ASSET_ID: newGuid(),
+  });
+  const out = [
+    `IOSUBSYSTEM ${ioNo}, IOADDRESS ${addr}, SLOT ${slot}, "${order}"${ver}, "${name}"`,
+  ];
+  if (isAutocreated) out.push(`AUTOCREATED `);
+  out.push(`BEGIN `, body, `END `);
+  return out.join('\n');
+}
+
 function ioModuleBlock({ ioNo, addr, slot, order, version, name, redundant, addressLines, paramLines, mlfb }) {
   const ver = version ? ` "${version}"` : '';
   const out = [
@@ -323,9 +474,10 @@ function cfuPaDeviceHeaderBlock({ ioNo, addr, imOrder, imVersion, name, posX, po
 }
 
 // CFU_PA SLOT 0 (ethernet head, AUTOCREATED)
-function cfuPaSlot0Block({ ioNo, addr, slot0Order, name, hexIp, hexRouter, diag }) {
+function cfuPaSlot0Block({ ioNo, addr, slot0Order, version, name, hexIp, hexRouter, diag }) {
+  const ver = version ? ` "${version}"` : '';
   return [
-    `IOSUBSYSTEM ${ioNo}, IOADDRESS ${addr}, SLOT 0, "${slot0Order}", "${name}"`,
+    `IOSUBSYSTEM ${ioNo}, IOADDRESS ${addr}, SLOT 0, "${slot0Order}"${ver}, "${name}"`,
     `AUTOCREATED `,
     `BEGIN `,
     `  ASSET_ID "${newGuid()}"`,
@@ -361,9 +513,9 @@ function cfuPaSlot0Block({ ioNo, addr, slot0Order, name, hexIp, hexRouter, diag 
 }
 
 // CFU_PA SLOT 0 SUBSLOT 1 (IFACE, AUTOCREATED) — fixed order string for V2.0
-function cfuPaIfaceBlock({ ioNo, addr, diag }) {
+function cfuPaIfaceBlock({ ioNo, addr, name, diag }) {
   return [
-    `IOSUBSYSTEM ${ioNo}, IOADDRESS ${addr}, SLOT 0, SUBSLOT 1, "_S7H_HSP_CFU_PA_V2_0_IFACE_CT", "${addr}"`,
+    `IOSUBSYSTEM ${ioNo}, IOADDRESS ${addr}, SLOT 0, SUBSLOT 1, "_S7H_HSP_CFU_PA_V2_0_IFACE_CT", "${name}"`,
     `AUTOCREATED `,
     `BEGIN `,
     `  ASSET_ID "${newGuid()}"`,
@@ -886,8 +1038,14 @@ module.exports = {
   newGuid,
   ifaceOrderString,
   deviceHeaderBlock,
+  deviceHeaderBlockFromTemplate,
   slot0Block,
+  slot0BlockFromTemplate,
   ifaceBlock,
+  ifaceBlockFromTemplate,
+  portBlockFromTemplate,
+  subslotBlockFromTemplate,
+  ioModuleBlockFromTemplate,
   portBlock,
   ioModuleBlock,
   serverModuleBlock,

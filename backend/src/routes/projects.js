@@ -700,6 +700,44 @@ router.delete('/:id', async (req, res) => {
     if (!project) return res.status(404).json({ error: 'Project not found' });
 
     const del = db.transaction(async () => {
+      // hw_controllers/hw_imports (and everything hanging off an import) carry
+      // a project_id FK but were never cascaded here — only the separate
+      // DELETE /api/hw-controllers/:id route cascaded them, keyed by
+      // controller not project. Any project with hardware data therefore hit
+      // an FK violation on delete and couldn't be removed from the UI at all.
+      const controllers = await db.prepare('SELECT id FROM hw_controllers WHERE project_id = ?').all(req.params.id);
+      for (const { id: controllerId } of controllers) {
+        const imports = await db.prepare('SELECT id FROM hw_imports WHERE hw_controller_id = ?').all(controllerId);
+        for (const { id: importId } of imports) {
+          const signals = await db.prepare('SELECT id FROM hw_signals WHERE hw_import_id = ?').all(importId);
+          for (const { id: sigId } of signals) {
+            await db.prepare('DELETE FROM instance_ios WHERE hw_signal_id = ?').run(sigId);
+          }
+          await db.prepare('DELETE FROM hw_signals WHERE hw_import_id = ?').run(importId);
+          await db.prepare('DELETE FROM hw_excel_raw WHERE hw_import_id = ?').run(importId);
+          await db.prepare('DELETE FROM hw_slot_subslots WHERE hw_import_id = ?').run(importId);
+          await db.prepare('DELETE FROM hw_generated_cfgs WHERE hw_import_id = ?').run(importId);
+          await db.prepare('DELETE FROM mrp_configs WHERE hw_import_id = ?').run(importId);
+          await db.prepare('DELETE FROM hw_imports WHERE id = ?').run(importId);
+        }
+        await db.prepare('DELETE FROM hw_fieldbuses WHERE hw_controller_id = ?').run(controllerId);
+        await db.prepare('DELETE FROM hw_controllers WHERE id = ?').run(controllerId);
+      }
+      // Imports created standalone before a controller was assigned.
+      const strayImports = await db.prepare('SELECT id FROM hw_imports WHERE project_id = ?').all(req.params.id);
+      for (const { id: importId } of strayImports) {
+        const signals = await db.prepare('SELECT id FROM hw_signals WHERE hw_import_id = ?').all(importId);
+        for (const { id: sigId } of signals) {
+          await db.prepare('DELETE FROM instance_ios WHERE hw_signal_id = ?').run(sigId);
+        }
+        await db.prepare('DELETE FROM hw_signals WHERE hw_import_id = ?').run(importId);
+        await db.prepare('DELETE FROM hw_excel_raw WHERE hw_import_id = ?').run(importId);
+        await db.prepare('DELETE FROM hw_slot_subslots WHERE hw_import_id = ?').run(importId);
+        await db.prepare('DELETE FROM hw_generated_cfgs WHERE hw_import_id = ?').run(importId);
+        await db.prepare('DELETE FROM mrp_configs WHERE hw_import_id = ?').run(importId);
+        await db.prepare('DELETE FROM hw_imports WHERE id = ?').run(importId);
+      }
+
       await db.prepare(`DELETE FROM project_instances         WHERE project_id = ?`).run(req.params.id);
       await db.prepare(`DELETE FROM project_cmt_profiles      WHERE project_id = ?`).run(req.params.id);
       await db.prepare(`DELETE FROM project_user_projects     WHERE project_id = ?`).run(req.params.id);

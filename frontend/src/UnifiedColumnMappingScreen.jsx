@@ -39,11 +39,10 @@ const glassRadioCss = `
 .glass-label-text {
   flex: 1;
   display: flex;
-  align-items: center;
-  justify-content: flex-start;
+  flex-direction: column;
+  justify-content: center;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  min-width: 0;
 }
 
 /* Rendered before the rows so it paints beneath them; the rows are transparent

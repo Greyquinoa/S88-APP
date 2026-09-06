@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { HierarchyDiagram } from './HierarchyDiagram';
 
 /**
  * UnitTypeSpirograph - Visualizes EPH → EM → CM relationships within a unit type.
@@ -23,6 +24,82 @@ export default function UnitTypeSpirograph({
   const canvasRef = useRef(null);
   const [hoveredNodeId, setHoveredNodeId] = useState(null);
   const [infoText, setInfoText] = useState("hover a node to explore relationships");
+  const [viewMode, setViewMode] = useState('spirograph'); // 'spirograph' or 'hierarchy'
+
+  // Reset hover state when switching views
+  useEffect(() => {
+    setHoveredNodeId(null);
+    setInfoText("hover a node to explore relationships");
+  }, [viewMode]);
+
+  const libTypeOf = (cmTypeName) =>
+    cmtProfiles.find(p => p.id === cmTypeName)?.libType || '';
+  const nodeTypeOf = (libType) =>
+    libType === 'EquipmentPhase' ? 'EPH' : libType === 'EquipmentModule' ? 'EM' : 'CM';
+
+  const buildHierarchyGraph = React.useCallback(() => {
+    const nodes = [];
+    const edges = [];
+
+    const memberNodeType = (m) => {
+      const comp = compDetails[m.compositeCmId];
+      if (!comp || !comp.members) return 'CM';
+      const types = new Set(comp.members.map(sm => nodeTypeOf(libTypeOf(sm.cm_type_name))));
+      if (types.has('EPH')) return 'EPH';
+      if (types.has('EM')) return 'EM';
+      return 'CM';
+    };
+
+    // Create one node per member (like spirograph), classify by highest level
+    members.forEach((m, memberIdx) => {
+      if (!m.compositeCmId) return;
+      const type = memberNodeType(m);
+      const level = type === 'EPH' ? 'top' : type === 'EM' ? 'mid' : 'bottom';
+
+      nodes.push({
+        id: String(memberIdx),
+        label: m.alias || `Member ${memberIdx}`,
+        type,
+        level,
+        memberAlias: m.alias,
+      });
+    });
+
+    // Build edges from role assignments and unit connections
+    const nodeIdByAlias = new Map(members.map((m, idx) => [m.alias, String(idx)]));
+    const nodeIds = new Set(nodes.map(n => n.id));
+    const seenEdges = new Set();
+
+    const addEdge = (a, b, isUnitConnection = false) => {
+      if (!nodeIds.has(a) || !nodeIds.has(b) || a === b) return;
+      const key = a < b ? `${a}|${b}` : `${b}|${a}`;
+      if (seenEdges.has(key)) return;
+      seenEdges.add(key);
+      edges.push({ a, b, isUnitConnection });
+    };
+
+    // Member-to-member edges from role assignments (solid lines)
+    members.forEach((m, memberIdx) => {
+      (m.roleAssignments || []).forEach(role => {
+        const targetNodeId = nodeIdByAlias.get(role.targetAlias);
+        if (targetNodeId == null) return;
+        addEdge(String(memberIdx), targetNodeId, false);
+      });
+    });
+
+    // Unit-level connections (dotted lines - IO/wiring)
+    (unitLevelConnections || []).forEach(conn => {
+      if (conn.from_alias && conn.to_alias) {
+        const fromId = nodeIdByAlias.get(conn.from_alias);
+        const toId = nodeIdByAlias.get(conn.to_alias);
+        if (fromId != null && toId != null) {
+          addEdge(fromId, toId, true);
+        }
+      }
+    });
+
+    return { nodes, edges };
+  }, [members, compDetails, cmtProfiles, unitLevelConnections, libTypeOf, nodeTypeOf]);
 
   useEffect(() => {
     if (!canvasRef.current) return;
@@ -111,7 +188,7 @@ export default function UnitTypeSpirograph({
     if (nodes.length > 0) {
       drawSpirograph(canvasRef.current, nodes, edges, unitConnEdges, hoveredNodeId, setHoveredNodeId, setInfoText);
     }
-  }, [members, compDetails, cmtProfiles, unitLevelConnections, hoveredNodeId]);
+  }, [members, compDetails, cmtProfiles, unitLevelConnections, hoveredNodeId, viewMode]);
 
   // Canvas mouse move handler for hover detection
   const handleCanvasMouseMove = (e) => {
@@ -144,26 +221,58 @@ export default function UnitTypeSpirograph({
         background: 'var(--color-background-secondary)'
       }}>
         <div>
-          <h2 style={{ margin: 0, fontSize: 14, fontWeight: 600 }}>S88 Spirograph View</h2>
+          <h2 style={{ margin: 0, fontSize: 14, fontWeight: 600 }}>
+            S88 {viewMode === 'spirograph' ? 'Spirograph' : 'Hierarchy'} View
+          </h2>
           <div style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginTop: 2 }}>
             {unitTypeName} — EPH → EM → CM relationships across all members
           </div>
         </div>
-        {onClose && (
-          <button
-            onClick={onClose}
-            style={{
-              background: 'transparent',
-              border: 'none',
-              cursor: 'pointer',
-              fontSize: 18,
-              color: 'var(--color-text-secondary)',
-              padding: '4px 8px',
-            }}
-          >
-            ✕
-          </button>
-        )}
+        <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+          <div style={{
+            display: 'flex',
+            gap: '6px',
+            background: 'rgba(0, 0, 0, 0.05)',
+            padding: '4px 8px',
+            borderRadius: '6px'
+          }}>
+            {['spirograph', 'hierarchy'].map(mode => (
+              <button
+                key={mode}
+                onClick={() => setViewMode(mode)}
+                style={{
+                  background: viewMode === mode ? 'white' : 'transparent',
+                  border: 'none',
+                  padding: '4px 10px',
+                  borderRadius: '4px',
+                  fontSize: '12px',
+                  fontWeight: 500,
+                  cursor: 'pointer',
+                  color: 'var(--color-text-primary)',
+                  boxShadow: viewMode === mode ? '0 1px 2px rgba(0,0,0,.05)' : 'none',
+                  textTransform: 'capitalize'
+                }}
+              >
+                {mode}
+              </button>
+            ))}
+          </div>
+          {onClose && (
+            <button
+              onClick={onClose}
+              style={{
+                background: 'transparent',
+                border: 'none',
+                cursor: 'pointer',
+                fontSize: 18,
+                color: 'var(--color-text-secondary)',
+                padding: '4px 8px',
+              }}
+            >
+              ✕
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Canvas area */}
@@ -175,6 +284,7 @@ export default function UnitTypeSpirograph({
         overflow: 'hidden',
         position: 'relative',
         background: 'linear-gradient(135deg,#e8e4ff 0%,#f0f4ff 30%,#e4f5ee 60%,#fff5f0 100%)',
+        padding: '20px'
       }}>
         {members.length === 0 || !Object.keys(compDetails).some(id => compDetails[id]?.members?.length) ? (
           <div style={{ textAlign: 'center', color: 'var(--color-text-secondary)' }}>
@@ -184,7 +294,7 @@ export default function UnitTypeSpirograph({
               Add composite CM types as members to see their structure.
             </p>
           </div>
-        ) : (
+        ) : viewMode === 'spirograph' ? (
           <>
             <canvas
               ref={canvasRef}
@@ -247,6 +357,47 @@ export default function UnitTypeSpirograph({
               ))}
             </div>
           </>
+        ) : (
+          <>
+            <HierarchyDiagram
+              nodes={buildHierarchyGraph().nodes}
+              edges={buildHierarchyGraph().edges}
+              levelStyles={{
+                top:    { label: 'EQUIPMENT PHASE', color: '#5B4FD6', colorLight: '#7B70EF', fill: 'rgba(91,79,214,0.12)', shape: 'square',  radiusScale: 1.2 },
+                mid:    { label: 'EQUIPMENT MODULE',       color: '#0A8F6A', colorLight: '#12B887', fill: 'rgba(10,143,106,0.12)', shape: 'circle',  radiusScale: 1 },
+                bottom: { label: 'CONTROL MODULE',     color: '#C04B1A', colorLight: '#E06030', fill: 'rgba(192,75,26,0.12)', shape: 'diamond', radiusScale: 0.8 },
+              }}
+              emptyMessage="No hierarchy data to display."
+            />
+            {/* Legend */}
+            <div style={{
+              position: 'absolute',
+              top: '20px',
+              right: '20px',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '6px',
+              background: 'rgba(255,255,255,.85)',
+              backdropFilter: 'blur(12px)',
+              border: '1px solid rgba(255,255,255,.9)',
+              borderRadius: '10px',
+              padding: '10px 12px',
+              boxShadow: '0 2px 12px rgba(80,60,180,.08)',
+            }}>
+              {[
+                { color: '#5B4FD6', label: 'EPH – equipment phase', shape: 'square' },
+                { color: '#0A8F6A', label: 'EM – equipment module', shape: 'circle' },
+                { color: '#C04B1A', label: 'CM – control module', shape: 'diamond' },
+              ].map((item, i) => (
+                <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', color: 'var(--color-text-secondary)', fontWeight: 500 }}>
+                  {item.shape === 'square' && <div style={{ width: '9px', height: '9px', background: item.color, borderRadius: '2px' }} />}
+                  {item.shape === 'circle' && <div style={{ width: '9px', height: '9px', background: item.color, borderRadius: '50%' }} />}
+                  {item.shape === 'diamond' && <div style={{ width: '9px', height: '9px', background: item.color, transform: 'rotate(45deg)' }} />}
+                  {item.label}
+                </div>
+              ))}
+            </div>
+          </>
         )}
       </div>
     </div>
@@ -261,8 +412,15 @@ function drawSpirograph(canvas, nodes, edges, unitConnEdges, hoveredNodeId, setH
   if (!canvas || !canvas.parentElement) return;
 
   // Full-bleed: canvas fills its parent rectangle exactly (no card, no cap).
+  // Force recalculation by using getComputedStyle if needed
   const W = canvas.parentElement.clientWidth || 800;
   const H = canvas.parentElement.clientHeight || 800;
+
+  if (W === 0 || H === 0) {
+    // Container not yet sized, try again soon
+    requestAnimationFrame(() => drawSpirograph(canvas, nodes, edges, unitConnEdges, hoveredNodeId, setHoveredNodeId, setInfoText));
+    return;
+  }
   canvas.width = W;
   canvas.height = H;
   const sz = Math.min(W, H); // reference scale for radii/fonts, so layout stays proportional

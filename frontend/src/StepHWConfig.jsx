@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useRef, useMemo } from "react";
+import React, { useState, useEffect, useRef, useMemo, useLayoutEffect, Fragment } from "react";
+import { glassPanelSx, glassPanelHeaderSx, PanelHeading } from "./ImportUIKit.jsx";
 import MRPTopologyView from "./MRPTopologyView.jsx";
 import HwImportReview from "./HwImportReview.jsx";
 import HwColumnMappingPanel from "./HwColumnMappingPanel.jsx";
@@ -28,6 +29,7 @@ import {
 import StepController from "./StepController.jsx";
 import HwConfigGrid from "./HwConfigGrid.tsx";
 import CatalogueGrid from "./CatalogueGrid.jsx";
+import CatalogueExportImportPanel from "./CatalogueExportImport.jsx";
 import SymbolTableModal from "./SymbolTableModal.jsx";
 import StationAutoSlotsEditor from "./StationAutoSlotsEditor.jsx";
 import ContextMenu from "./ContextMenu.jsx";
@@ -562,10 +564,10 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
   // ── Add Slot ───────────────────────────────────────────────────────────────
   function openAddSlot(stationAddr) {
     const station = stations.find(s => s.address === stationAddr);
-    const imSlot  = station && station.slots.find(s => s.slot === 0);
-    const imTpl   = imSlot ? templates.find(t => t.order_no === imSlot.orderNo) : null;
-    const isCfuPa = imTpl && imTpl.family === 'CFU_PA';
-    const minSlot = isCfuPa ? 3 : 1;
+    // Lowest addable slot number is one past the highest AUTOCREATED (fixed) slot present —
+    // data-driven, no family-specific "reserved slots" rule.
+    const autocreatedSlotNos = station ? station.slots.filter(sl => sl.isAutocreated).map(sl => sl.slot) : [];
+    const minSlot = autocreatedSlotNos.length ? Math.max(...autocreatedSlotNos) + 1 : 1;
     const maxSlot = station && station.slots.length > 0
       ? Math.max(...station.slots.map(sl => sl.slot))
       : 0;
@@ -591,11 +593,12 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
         moduleName: newSlot.moduleName,
       });
 
-      // CFU_PA only: apply per-subslot defaults captured from the CFG file at import time.
-      // subslot_defaults is a JSON array of {ssNo, paProfile} — one entry per function subslot.
-      // ET200 stations are never affected — they have no per-subslot paProfile concept.
+      // Apply per-subslot defaults captured from the CFG file at import time, when the
+      // selected module template carries them. subslot_defaults is a JSON array of
+      // {ssNo, paProfile} — one entry per function subslot. Modules without this catalogue
+      // field (e.g. ET200 modules, which have no per-subslot paProfile concept) are unaffected.
       const selectedTpl = templates.find(t => t.order_no === newSlot.moduleOrderNo);
-      if (selectedTpl && selectedTpl.family === 'CFU_PA') {
+      if (selectedTpl && selectedTpl.subslot_defaults) {
         let defaults = [];
         try { defaults = selectedTpl.subslot_defaults ? JSON.parse(selectedTpl.subslot_defaults) : []; } catch {}
         for (const { ssNo, paProfile } of defaults) {
@@ -699,7 +702,24 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
   const selectedController = controllers.find(c => c.id === selectedId) || null;
 
   return (
-    <div style={{ padding: 24, fontFamily: "system-ui, sans-serif", display: "flex", gap: 0, alignItems: "flex-start" }}>
+    <div style={{ padding: 24, fontFamily: "system-ui, sans-serif", display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
+
+      {/* ── Page tab strip — mirrors the IO Import sub-tab bar so this page
+             reads the same as "Function Mapping" there. ─────────────────── */}
+      <div style={{ display: "flex", borderBottom: "0.5px solid var(--color-border-tertiary)",
+          marginBottom: "1rem", flexShrink: 0 }}>
+        <div style={{
+          padding: "7px 18px", fontSize: "1rem", fontWeight: 600,
+          color: "var(--color-text-primary)",
+          borderBottom: "2px solid var(--color-text-primary)", marginBottom: -1,
+        }}>
+          Hardware Configuration Generator
+        </div>
+      </div>
+      <PanelHeading title="" subtitle="Import and configure controllers, stations, and slots." />
+
+      {/* ── Body: sidebar + content, below the tab strip ─────────────────── */}
+      <div style={{ display: "flex", gap: 12, alignItems: "stretch", flex: 1, minHeight: 0 }}>
 
       {/* ── Collapsible left panel ───────────────────────────────────── */}
       <NavPanel
@@ -717,9 +737,7 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
       />
 
       {/* ── Main content ─────────────────────────────────────────────── */}
-      <div style={{ flex: 1, minWidth: 0, paddingLeft: 24 }}>
-        <h2 style={{ marginTop: 0, marginBottom: 12 }}>Hardware Configuration Generator</h2>
-
+      <div style={{ flex: 1, minWidth: 0, overflowY: "auto", minHeight: 0 }}>
         {error && (
           <div style={alertStyle("#ffeaea", "#e88", "#b00")}>
             <div>{error}</div>
@@ -949,6 +967,7 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
                 stations={stations}
                 addrMap={addrMap}
                 templates={templates}
+                slotCompat={slotCompat}
                 fieldbuses={fieldbuses}
                 cfgs={cfgs}
                 loading={loading}
@@ -1015,6 +1034,7 @@ export default function StepHWConfig({ projectId, pendingHwMapping, onPendingHwM
             )}
           </>
         )}
+      </div>
       </div>
 
       {/* ── Delta-review modal — one per queued controller, in sequence ──── */}
@@ -2164,6 +2184,22 @@ function NavPanel({ hwTab, setHwTab, controllers, selectedId, onSelect, hasClipb
   const [collapsed, setCollapsed] = useState(false);
   const [menu, setMenu] = useState(null); // { x, y, controller | null }
 
+  // Row heights are not guaranteed uniform, so `idx * rowHeight` drifts down
+  // the list; offsetTop of the actual selected row does not. Matches the
+  // Library/IO-Import sidebar glider pattern (App.jsx, StepIOImport.jsx).
+  const rowRef = useRef(null);
+  const [glider, setGlider] = useState({ top: 0, height: 44 });
+  const isControllerActive = hwTab === "controller" || hwTab === "config" || hwTab === "mrp";
+  const selectedIdx = isControllerActive ? controllers.findIndex(c => c.id === selectedId) : -1;
+  useLayoutEffect(() => {
+    const el = rowRef.current;
+    if (!el) return;
+    setGlider(prev =>
+      prev.top === el.offsetTop && prev.height === el.offsetHeight
+        ? prev
+        : { top: el.offsetTop, height: el.offsetHeight });
+  });
+
   function openMenu(e, controller) {
     e.preventDefault();
     e.stopPropagation();
@@ -2179,21 +2215,18 @@ function NavPanel({ hwTab, setHwTab, controllers, selectedId, onSelect, hasClipb
     return items;
   }
 
-  const navBtn = (id, label) => {
-    const active = hwTab === id;
-    return (
-      <button key={id} onClick={() => setHwTab(id)}
-        style={{
-          display: "block", width: "100%", textAlign: "left",
-          padding: "8px 14px", border: "none", cursor: "pointer", fontSize: 13,
-          fontWeight: active ? 700 : 400,
-          background: active ? "#EEEDFE" : "transparent",
-          color: active ? "#2255cc" : "var(--color-text-primary)",
-          borderLeft: active ? "3px solid #2255cc" : "3px solid transparent",
-        }}
-      >{label}</button>
-    );
-  };
+  // Glider state for Actions buttons (same pattern as Controllers list)
+  const actionsRowRef = useRef(null);
+  const [actionsGlider, setActionsGlider] = useState({ top: 0, height: 44 });
+  const isActionActive = ["import", "catalogue"].includes(hwTab);
+  useLayoutEffect(() => {
+    const el = actionsRowRef.current;
+    if (!el) return;
+    setActionsGlider(prev =>
+      prev.top === el.offsetTop && prev.height === el.offsetHeight
+        ? prev
+        : { top: el.offsetTop, height: el.offsetHeight });
+  });
 
   if (collapsed) {
     return (
@@ -2213,62 +2246,106 @@ function NavPanel({ hwTab, setHwTab, controllers, selectedId, onSelect, hasClipb
 
   return (
     <div style={{
-      width: 210, flexShrink: 0,
-      borderRight: "0.5px solid var(--color-border-tertiary)",
+      width: 220, flexShrink: 0,
       display: "flex", flexDirection: "column",
       minHeight: 400,
+      position: "relative",
     }}>
-      {/* Collapse toggle */}
-      <div style={{ display: "flex", justifyContent: "flex-end", padding: "6px 8px 2px" }}>
-        <button onClick={() => setCollapsed(true)}
-          title="Collapse panel"
-          style={{ background: "none", border: "none", cursor: "pointer", fontSize: 16, color: "#aaa", padding: "2px 4px" }}>
-          ‹
-        </button>
-      </div>
-
-      {/* Global actions */}
-      <div style={{ paddingBottom: 8, borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
-        {navBtn("import", "Import")}
-        {navBtn("catalogue", "Catalogue")}
-      </div>
-
-      {/* Controllers section */}
-      <div style={{ flex: 1, display: "flex", flexDirection: "column", overflowY: "auto", paddingTop: 6 }}
-        onContextMenu={e => openMenu(e, null)}>
-        <div style={{
-          padding: "4px 14px 6px",
-          fontSize: 10, fontWeight: 700, textTransform: "uppercase",
-          letterSpacing: "0.06em", color: "var(--color-text-secondary)",
+      {/* Collapse toggle — floats above the Actions panel so it doesn't add row height */}
+      <button onClick={() => setCollapsed(true)}
+        title="Collapse panel"
+        style={{
+          position: "absolute", top: -22, right: 2, zIndex: 1,
+          background: "none", border: "none", cursor: "pointer", fontSize: 16, color: "#aaa", padding: "2px 4px",
         }}>
-          Controllers
+        ‹
+      </button>
+
+      {/* Glass panel with glider selection */}
+      <div style={{ ...glassPanelSx, marginBottom: 12 }}>
+        <div className="glass-radio-group-vertical" style={{ position: "relative", paddingBottom: 12 }}>
+          {isActionActive && (
+            <div className="glass-glider-vertical" style={{
+              height: actionsGlider.height,
+              transform: `translateY(${actionsGlider.top}px)`,
+            }} />
+          )}
+          {["import", "catalogue"].map(id => (
+            <Fragment key={id}>
+              <input
+                type="radio"
+                id={`hw-action-${id}`}
+                name="hw-action"
+                checked={hwTab === id}
+                onChange={() => setHwTab(id)} />
+              <label ref={hwTab === id ? actionsRowRef : undefined}
+                htmlFor={`hw-action-${id}`}
+                style={{ padding: "10px 12px", fontSize: 13, fontWeight: hwTab === id ? 600 : 500 }}>
+                <div className="glass-label-text" style={{ textAlign: "left" }}>
+                  {id === "import" ? "Import" : "Catalog"}
+                </div>
+              </label>
+            </Fragment>
+          ))}
         </div>
-        {controllers.length === 0 ? (
-          <div style={{ padding: "8px 14px", fontSize: 12, color: "var(--color-text-secondary)", fontStyle: "italic" }}>
-            Upload a CFG first
+      </div>
+
+      {/* Controllers section — glass panel matching IO Import's imports list
+          and the Library's CM/composite lists. */}
+      <div style={{ ...glassPanelSx, flex: 1, minHeight: 0 }}
+        onContextMenu={e => openMenu(e, null)}>
+        <div style={glassPanelHeaderSx}>
+          <div style={{
+            fontSize: 10, fontWeight: 700, textTransform: "uppercase",
+            letterSpacing: "0.06em", color: "var(--color-text-secondary)",
+          }}>
+            Controllers
           </div>
-        ) : controllers.map(c => {
-          const isSelected = selectedId === c.id;
-          const isActive = isSelected && (hwTab === "controller" || hwTab === "config" || hwTab === "mrp");
-          return (
-            <div key={c.id} onClick={() => onSelect(c.id)}
-              onContextMenu={e => openMenu(e, c)}
-              style={{
-                padding: "7px 14px", cursor: "pointer",
-                borderLeft: isActive ? "3px solid #2255cc" : "3px solid transparent",
-                background: isActive ? "#EEEDFE" : "transparent",
-              }}>
-              <div style={{ fontSize: 13, fontWeight: isActive ? 700 : 400,
-                            color: isActive ? "#2255cc" : "var(--color-text-primary)",
-                            fontFamily: "var(--font-mono, monospace)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                {c.T16_Controller_TagName || "—"}
-              </div>
-              <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 1 }}>
-                {c.T16_Station_Type || ""}
-              </div>
+        </div>
+        <div className="glass-radio-group-vertical" style={{ flex: 1, overflowY: "auto" }}>
+          {controllers.length === 0 ? (
+            <div style={{ padding: "1rem", fontSize: 12, color: "var(--color-text-secondary)", textAlign: "center" }}>
+              Upload a CFG first
             </div>
-          );
-        })}
+          ) : (
+            <>
+              {selectedIdx >= 0 && (
+                <div className="glass-glider-vertical" style={{
+                  height: glider.height,
+                  transform: `translateY(${glider.top}px)`,
+                }} />
+              )}
+              {controllers.map(c => {
+                const isSelected = selectedId === c.id;
+                const isActive = isSelected && isControllerActive;
+                return (
+                  <Fragment key={c.id}>
+                    <input
+                      type="radio"
+                      id={`hw-controller-${c.id}`}
+                      name="hw-controller"
+                      checked={isActive}
+                      onChange={() => onSelect(c.id)} />
+                    <label ref={isActive ? rowRef : undefined}
+                      htmlFor={`hw-controller-${c.id}`}
+                      onContextMenu={e => openMenu(e, c)}>
+                      <div className="glass-label-text" style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", width: "100%", textAlign: "left" }}>
+                        <div style={{ fontSize: 13, fontWeight: 600, fontFamily: "var(--font-mono, monospace)",
+                                      lineHeight: 1.3, color: "inherit", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", width: "100%" }}>
+                          {c.T16_Controller_TagName || "—"}
+                        </div>
+                        <div style={{ fontSize: 11, lineHeight: 1.3, color: "currentColor", opacity: 0.65, marginTop: 3,
+                                      whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", width: "100%" }}>
+                          {c.T16_Station_Type || ""}
+                        </div>
+                      </div>
+                    </label>
+                  </Fragment>
+                );
+              })}
+            </>
+          )}
+        </div>
       </div>
 
       {menu && (
@@ -2305,12 +2382,12 @@ function ImportWorkspace({
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
       {/* Tab bar */}
-      <div style={{ display: 'flex', borderBottom: '1px solid var(--color-border-secondary)', flexShrink: 0 }}>
-        <button style={tabStyle('import')} onClick={() => setSubTab('import')}>Import</button>
-        {showColmap && (
+      {showColmap && (
+        <div style={{ display: 'flex', borderBottom: '1px solid var(--color-border-secondary)', flexShrink: 0 }}>
+          <button style={tabStyle('import')} onClick={() => setSubTab('import')}>Import</button>
           <button style={tabStyle('colmap')} onClick={() => setSubTab('colmap')}>Column Mapping</button>
-        )}
-      </div>
+        </div>
+      )}
 
       {/* Tab content */}
       <div style={{ flex: 1, overflowY: 'auto' }}>
@@ -2361,113 +2438,128 @@ function ImportPanel({
 
   return (
     <div>
-      <div style={{ marginBottom: 20, padding: "12px 16px", background: "#e3f2fd", border: "1px solid #90caf9", borderRadius: 8 }}>
-        <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8, color: "#1565c0" }}>Downloads</div>
-        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-          <button
-            onClick={() => dlFile('HW_IMPORT_TEMPLATE.xlsx')}
-            style={{ padding: "8px 16px", background: "#1976d2", color: "#fff", border: "none", borderRadius: 6, fontSize: 13, fontWeight: 600, cursor: "pointer" }}
-            onMouseEnter={(e) => e.target.style.background = "#1565c0"}
-            onMouseLeave={(e) => e.target.style.background = "#1976d2"}
-          >
-            ⬇ Blank Template
-          </button>
-          <button
-            onClick={() => dlFile('HW_TEST_IMPORT.xlsx')}
-            style={{ padding: "8px 16px", background: "#388e3c", color: "#fff", border: "none", borderRadius: 6, fontSize: 13, fontWeight: 600, cursor: "pointer" }}
-            onMouseEnter={(e) => e.target.style.background = "#2e7d32"}
-            onMouseLeave={(e) => e.target.style.background = "#388e3c"}
-          >
-            ⬇ Test File (current config)
-          </button>
-        </div>
-      </div>
-
-      <div style={{ display: "flex", gap: 24, marginBottom: 24, flexWrap: "wrap" }}>
-        <UploadCard
-          label="1. Import Empty Controller"
-          ok={baselineOk} okLabel="✓ Loaded"
-          btnLabel={baselineOk ? "Upload" : "Upload .cfg"}
-          onBtn={onBaselineBtn}
-          accept=".cfg"
-          inputRef={baselineRef}
-          onChange={onBaselineChange}
-        />
-        <UploadCard
-          label="2. HW IO List (Excel)"
-          ok={ioListOk} okLabel="✓ Loaded"
-          btnLabel={ioListOk ? "Upload" : "Upload Excel"}
-          onBtn={onIoListBtn}
-          accept=".xlsx,.xlsm,.xls"
-          inputRef={ioListRef}
-          onChange={onIoListChange}
-          disabled={!importId}
-        />
-      </div>
-
-      {/* Divider with OR label */}
-      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
-        <div style={{ flex: 1, height: 1, background: "var(--color-border-tertiary, #e5e7eb)" }} />
-        <span style={{ fontSize: 12, color: "var(--color-text-secondary, #6b7280)", fontWeight: 500 }}>OR</span>
-        <div style={{ flex: 1, height: 1, background: "var(--color-border-tertiary, #e5e7eb)" }} />
-      </div>
-
-      {/* Import from CFG option */}
-      <div style={{
-        display: "flex", alignItems: "center", gap: 16,
-        padding: "14px 18px",
-        background: baselineOk ? "var(--color-background-secondary, #f5f5f5)" : "#f9fafb",
-        border: `1px solid ${baselineOk ? "var(--color-border-secondary, rgba(0,0,0,.2))" : "#e5e7eb"}`,
-        borderRadius: "var(--border-radius-lg, 12px)",
-        opacity: baselineOk ? 1 : 0.5,
-      }}>
-        <div style={{ flex: 1 }}>
-          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 3, color: "var(--color-text-primary, #1a1a1a)" }}>
-            2. Import device list from CFG
+        {/* Empty Controller */}
+        <div style={{
+          padding: "16px",
+          border: "1px solid #ccd",
+          borderRadius: 8,
+          background: "#f8f9ff",
+          marginBottom: 24,
+        }}>
+          <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 16, color: "#333" }}>Import Empty Controller</div>
+          <div style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
+            <UploadCard
+              ok={baselineOk} okLabel="✓ Loaded"
+              btnLabel={baselineOk ? "Upload" : "Upload .cfg"}
+              onBtn={onBaselineBtn}
+              accept=".cfg"
+              inputRef={baselineRef}
+              onChange={onBaselineChange}
+            />
           </div>
-          <div style={{ fontSize: 12, color: "var(--color-text-secondary, #6b7280)", lineHeight: 1.5 }}>
-            Select a previously generated CFG file to restore station, module, IP,
-            PIP, POTENTIAL_GROUP and tag data — no Excel sheet needed.
-            {!baselineOk && " Upload a baseline CFG first."}
+          <div style={{ marginTop: 16, padding: "12px", background: "#fff", border: "1px solid #ddd", borderRadius: 6, fontSize: 12 }}>
+            <div style={{ fontWeight: 600, marginBottom: 8, color: "#333" }}>Export Settings from PCS 7:</div>
+            <div style={{ fontSize: 11, color: "#666", lineHeight: 1.6 }}>
+              <div>✓ Check: <strong>Export default values</strong></div>
+              <div>✓ Check: <strong>Export symbols</strong></div>
+              <div>✓ Check: <strong>Export subnets</strong></div>
+              <div style={{ marginTop: 8 }}>Format: <strong>Readable</strong> (not Compact)</div>
+            </div>
           </div>
         </div>
-        <input
-          ref={cfgBackfillRef}
-          type="file"
-          accept=".cfg"
-          style={{ display: "none" }}
-          onChange={onCfgBackfillChange}
-        />
-        <button
-          onClick={onBackfillFromCfg}
-          disabled={!baselineOk || !!loading}
-          style={{
-            ...btnStyle,
-            background: baselineOk ? "#0C447C" : "#e5e7eb",
-            color: baselineOk ? "#fff" : "#9ca3af",
-            border: "none",
-            padding: "8px 18px",
-            fontSize: 13,
-            flexShrink: 0,
-            opacity: !baselineOk || !!loading ? 0.6 : 1,
-            cursor: !baselineOk || !!loading ? "not-allowed" : "pointer",
-          }}
-        >
-          {loading && loading.includes("Reading") ? "Reading…" : "Select & Import CFG"}
-        </button>
-      </div>
 
-      {ioListInfo && (
-        <div style={{ marginTop: 20, fontSize: 13, color: "#444",
-                      background: "#f5fff5", border: "1px solid #9d9", borderRadius: 6, padding: "8px 14px" }}>
-          Device data imported — <strong>{ioListInfo.stationCount}</strong> station{ioListInfo.stationCount !== 1 ? "s" : ""},{" "}
-          <strong>{ioListInfo.signalCount}</strong> slot{ioListInfo.signalCount !== 1 ? "s" : ""}.{" "}
-          <span style={{ color: "#2255cc", cursor: "pointer", textDecoration: "underline" }}
-                onClick={() => {}}>
-            Switch to Configuration tab to review and generate.
-          </span>
+        {/* Bulk Import box */}
+        <div style={{
+          padding: "16px",
+          border: "1px solid #ccd",
+          borderRadius: 8,
+          background: "#f8f9ff",
+          marginBottom: 24,
+        }}>
+          <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 16, color: "#333" }}>Bulk Import</div>
+
+          <div style={{ display: "flex", gap: 24, marginBottom: 16, flexWrap: "wrap" }}>
+            <UploadCard
+              label="1. HW IO List (Excel)"
+              ok={ioListOk} okLabel="✓ Loaded"
+              btnLabel={ioListOk ? "Upload" : "Upload Excel"}
+              onBtn={onIoListBtn}
+              accept=".xlsx,.xlsm,.xls"
+              inputRef={ioListRef}
+              onChange={onIoListChange}
+              disabled={!importId}
+              extraBtn={true}
+              extraBtnLabel="⬇ Download Excel Template (AS01)"
+              onExtraBtn={async () => {
+                try {
+                  const res = await fetch('/api/hw-config/templates/io-list-excel');
+                  if (!res.ok) throw new Error('Failed to download template');
+                  const blob = await res.blob();
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement('a');
+                  a.href = url;
+                  a.download = `HW_IO_List_AS01_${new Date().toISOString().split('T')[0]}.xlsx`;
+                  a.click();
+                  URL.revokeObjectURL(url);
+                } catch (e) {
+                  alert('Error downloading template: ' + e.message);
+                }
+              }}
+            />
+          </div>
+
+          {/* Divider with OR label */}
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
+            <div style={{ flex: 1, height: 1, background: "var(--color-border-tertiary, #e5e7eb)" }} />
+            <span style={{ fontSize: 12, color: "var(--color-text-secondary, #6b7280)", fontWeight: 500 }}>OR</span>
+            <div style={{ flex: 1, height: 1, background: "var(--color-border-tertiary, #e5e7eb)" }} />
+          </div>
+
+          {/* Import from CFG option */}
+          <div style={{
+            padding: "14px 16px",
+            background: "#f8f9ff",
+            border: "1px solid #ccd",
+            borderRadius: 8,
+          }}>
+            <label style={{ fontWeight: 700, display: "block", marginBottom: 8, fontSize: 14 }}>2. IMPORT CONFIGURED CONTROLLER</label>
+            <div style={{ fontSize: 12, color: "var(--color-text-secondary, #6b7280)", lineHeight: 1.5, marginBottom: 8 }}>
+              Import a fully engineered controller from PCS 7.
+              {!baselineOk && " Upload a baseline CFG first."}
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <input
+                ref={cfgBackfillRef}
+                type="file"
+                accept=".cfg"
+                style={{ display: "none" }}
+                onChange={onCfgBackfillChange}
+              />
+              <button
+                onClick={onBackfillFromCfg}
+                disabled={!baselineOk || !!loading}
+                style={{
+                  ...btnStyle,
+                  opacity: !baselineOk || !!loading ? 0.5 : 1,
+                }}
+              >
+                {loading && loading.includes("Reading") ? "Reading…" : "Select & Import CFG"}
+              </button>
+            </div>
+          </div>
         </div>
-      )}
+
+        {ioListInfo && (
+          <div style={{ marginTop: 20, fontSize: 13, color: "#444",
+                        background: "#f5fff5", border: "1px solid #9d9", borderRadius: 6, padding: "8px 14px" }}>
+            Device data imported — <strong>{ioListInfo.stationCount}</strong> station{ioListInfo.stationCount !== 1 ? "s" : ""},{" "}
+            <strong>{ioListInfo.signalCount}</strong> slot{ioListInfo.signalCount !== 1 ? "s" : ""}.{" "}
+            <span style={{ color: "#2255cc", cursor: "pointer", textDecoration: "underline" }}
+                  onClick={() => {}}>
+              Switch to Configuration tab to review and generate.
+            </span>
+          </div>
+        )}
     </div>
   );
 }
@@ -2704,7 +2796,7 @@ function ProtocolMappingModal({ initial, templates, onClose, onSave }) {
               style={{ width: "100%", padding: "7px 10px", fontSize: 12, fontFamily: "var(--font-mono, monospace)", border: "0.5px solid var(--color-border-secondary)", borderRadius: 4, background: "var(--color-background-secondary)", color: "var(--color-text-primary)" }}>
               <option value="">— Select card module —</option>
               {templates.filter(t => t.hw_category === 'slot' || !t.hw_category).map(t => (
-                <option key={t.id} value={t.order_no}>{t.order_no} · {t.display_name}</option>
+                <option key={t.id} value={t.order_no}>{t.display_name} | {t.order_no}</option>
               ))}
             </select>
           ) : (
@@ -2721,7 +2813,7 @@ function ProtocolMappingModal({ initial, templates, onClose, onSave }) {
               style={{ width: "100%", padding: "7px 10px", fontSize: 12, fontFamily: "var(--font-mono, monospace)", border: "0.5px solid var(--color-border-secondary)", borderRadius: 4, background: "var(--color-background-secondary)", color: "var(--color-text-primary)" }}>
               <option value="">— Select station module —</option>
               {templates.filter(t => t.hw_category === 'station').map(t => (
-                <option key={t.id} value={t.order_no}>{t.order_no} · {t.display_name}</option>
+                <option key={t.id} value={t.order_no}>{t.display_name} | {t.order_no}</option>
               ))}
             </select>
           ) : (
@@ -2783,7 +2875,7 @@ function CataloguePanel({ templates, slotCompat, sigTypes, onTemplatesChanged, o
     <div>
       {/* Tab bar */}
       <div style={{ display: "flex", gap: 4, marginBottom: 20, borderBottom: "2px solid #dde" }}>
-        {[["modules", "Modules"], ["hwImportMapping", "HW Import Mapping"]].map(([id, label]) => (
+        {[["modules", "Modules"], ["hwImportMapping", "HW Import Mapping"], ["exportImportCatalog", "Export Import Catalog"]].map(([id, label]) => (
           <button key={id} onClick={() => setCatalogueTab(id)}
             style={{
               padding: "7px 18px", border: "none", background: "none", cursor: "pointer",
@@ -2840,6 +2932,11 @@ function CataloguePanel({ templates, slotCompat, sigTypes, onTemplatesChanged, o
       {/* HW Import Mapping Tab */}
       {catalogueTab === "hwImportMapping" && (
         <HwImportMappingPanel templates={templates} />
+      )}
+
+      {/* Export Import Catalog Tab */}
+      {catalogueTab === "exportImportCatalog" && (
+        <CatalogueExportImportPanel onImported={() => { window.location.reload(); }} />
       )}
     </div>
   );
@@ -2939,6 +3036,8 @@ function CfgImportModal({ file, sigTypes, onClose, onDone }) {
         hw_category: c.hw_category || null,
         subslot_defaults: c.subslot_defaults || null,
         port_config: c.port_config || null,
+        auto_slots_seed: c.auto_slots_seed || null,
+        default_subslots_seed: c.default_subslots_seed || null,
         mlfb: c.mlfb || null,
         action: deriveAction(c),
       });
@@ -3609,7 +3708,7 @@ function HierarchyCheckbox({ checked, partial, onChange, title }) {
 
 // ── Configuration Panel ────────────────────────────────────────────────────────
 function ConfigurationPanel({
-  importId, baselineOk, baselineInfo, controllerTagName, stations, addrMap, templates, fieldbuses, cfgs, loading,
+  importId, baselineOk, baselineInfo, controllerTagName, stations, addrMap, templates, slotCompat, fieldbuses, cfgs, loading,
   addingStation, newStation, addingSlot, newSlot,
   editing, editVal,
   selectedAddrs, onToggleSelect, onToggleSelectAll, onClearSelection, onSetSelectedAddrs,
@@ -3736,13 +3835,14 @@ function ConfigurationPanel({
             >
               <option value="">— select Interface Module —</option>
               {templates.filter(t => (
-                // INFRA: ET200SP/CFU_PA heads — exclude old GSDML-path/SCALANCE entries that have no port_config
-                (t.signal_type === "INFRA" && t.family !== 'SCALANCE' && t.family !== 'GSDML') ||
+                // INFRA: ET200SP/CFU_PA heads — exclude old GSDML-path/SCALANCE entries
+                // Allow new-style GSDML entries with human-readable display_name
+                (t.signal_type === "INFRA" && t.family !== 'SCALANCE' && (t.family !== 'GSDML' || !t.display_name.startsWith('GSDML-'))) ||
                 // New-style Scalance: MLFB as order_no, port_config populated
                 t.family === 'Scalance'
               ) && t.hw_category === 'station' && !t.order_no.startsWith("V1_1:")).map(t => (
                 <option key={t.id} value={t.order_no}>
-                  {t.order_no} — {t.display_name}
+                  {t.display_name} | {t.order_no}
                 </option>
               ))}
             </select>
@@ -3899,6 +3999,7 @@ function ConfigurationPanel({
           importId={importId}
           station={configureStation}
           templates={templates}
+          slotCompat={slotCompat}
           addrMap={addrMap}
           pipMappings={baselineInfo?.pipMappings || []}
           addingSlot={addingSlot}
@@ -3932,7 +4033,7 @@ function ConfigurationPanel({
 
 // ── Station Detail Panel ───────────────────────────────────────────────────────
 function StationDetailPanel({
-  station, templates, addrMap, pipMappings, addingSlot, newSlot, editing, editVal, activeSlot,
+  station, templates, slotCompat, addrMap, pipMappings, addingSlot, newSlot, editing, editVal, activeSlot,
   onSlotClick, onCopyStation, onDeleteStation,
   onOpenAddSlot, onCancelAddSlot, onModuleSelect, onSetNewSlot, onCommitAddSlot,
   onDeleteSlot, onSaveSlotPip, onSaveSlotPotentialGroup, onSaveSlotPaProfile, onSaveSlotSubslotProfile,
@@ -3965,19 +4066,20 @@ function StationDetailPanel({
     imTpl = templates.find(t => t.gsdml_file === gsdmlFile);
   }
 
-  const stationFamily    = imTpl ? imTpl.family : null;
-  const isEt200Station   = stationFamily ? stationFamily.startsWith("ET200") : false;
-  const isCfuPaStation   = stationFamily === 'CFU_PA';
-  // GSDML devices (Festo transmitters, valves, analyzers) — treated like CFU_PA with I/O modules
-  const isGsdmlStation   = stationFamily && /^GSDML/i.test(stationFamily);
-  // Scalance network switches — ONLY when family is explicitly 'Scalance' or 'SCALANCE'
-  const isScalanceStation = stationFamily === 'Scalance' || stationFamily === 'SCALANCE';
+  // Family-free: "what can plug into order_no X" comes solely from hw_slot_subslot_compat
+  // (ground-truth rule 11 — family is cosmetic only). Same helper serves the add-slot
+  // module combobox (parent = station head order_no) and the per-subslot profile combobox
+  // (parent = the slot's own order_no).
+  const compatChildrenFor = (parentOrderNo) =>
+    (slotCompat || []).filter(c => c.slot_order_no === parentOrderNo);
 
-  // Parse port_config for Scalance stations
-  let scalancePorts = [];
-  if (isScalanceStation && imTpl && imTpl.port_config) {
-    try { scalancePorts = JSON.parse(imTpl.port_config); } catch (_) {}
-  }
+  // A "port-only" station (network switch, no addressable I/O slots) is recognized by the
+  // interface template actually carrying port_config data — a real catalogue field, not a
+  // family-name comparison. A station with real addressable slots beyond slot 0 (e.g. CFU,
+  // whose slot-0 template also happens to carry port_config for its 2 RJ45 ports) is not
+  // port-only even though its head has port_config — it needs the rich slot table below.
+  const hasOtherSlots = station.slots.some(sl => sl.slot !== 0);
+  const isPortOnlyStation = !!(imTpl && imTpl.port_config) && !hasOtherSlots;
 
   // Get ports from auto-slot configuration only (no fallbacks to template)
   let imPorts = [];
@@ -3991,6 +4093,38 @@ function StationDetailPanel({
       }));
     }
   }
+
+  // A slot "carries functions" (PA-style pluggable function subslots, as opposed to a
+  // fixed port/interface subslot already covered by autoSlotConfig) when the catalogue's
+  // compat table knows of subslot-category children for its order_no. Family-free
+  // replacement for isCfuPaStation-gated PA-device-slot detection: any device family whose
+  // module has compat subslot children behaves the same way here.
+  const isFunctionCarrier = (slot) => {
+    if (!slot || slot.slot === 0) return false;
+    const children = compatChildrenFor(slot.orderNo);
+    return children.length > 0 && children.every(c => {
+      const t = templates.find(tt => tt.order_no === c.subslot_order_no);
+      return !t || t.hw_category === 'subslot';
+    });
+  };
+
+  // "Pot. Group" (potential group) only makes sense for plain backplane I/O slots — not
+  // for a port-only switch station, nor for function-carrier (PA/GSDML-style) slots whose
+  // "subslots" are profile placeholders rather than physically wired modules.
+  const showPotGroupColumn = !isPortOnlyStation &&
+    station.slots.some(sl => sl.slot !== 0 && !sl.isAutocreated && !isFunctionCarrier(sl));
+
+  // Lowest slot number a user may add a module into: one past the highest AUTOCREATED
+  // (fixed) slot already present, derived from real station data rather than a
+  // family-specific "reserved slots ≤ N" rule.
+  const autocreatedSlotNos = station.slots.filter(sl => sl.isAutocreated).map(sl => sl.slot);
+  const minAddableSlot = autocreatedSlotNos.length ? Math.max(...autocreatedSlotNos) + 1 : 1;
+
+  // Add-slot module combobox: modules compatible (per hw_slot_subslot_compat) as
+  // slot-children of this station's head module order_no.
+  const addSlotCompatOrderNos = imTpl
+    ? new Set(compatChildrenFor(imTpl.order_no).map(c => c.subslot_order_no))
+    : new Set();
 
   return (
     <div style={{ flex: 1, minWidth: 0, border: "1px solid #c8d4f0", borderRadius: 8, overflow: "hidden", background: "#f8f9ff" }}>
@@ -4063,8 +4197,8 @@ function StationDetailPanel({
         </div>
       </div>
 
-      {/* Scalance network switch view — ports only, no I/O module slots */}
-      {isScalanceStation && (
+      {/* Port-only station view (network switches etc.) — ports only, no I/O module slots */}
+      {isPortOnlyStation && (
         <div style={{ padding: "12px 16px" }}>
           <table style={{ ...tableStyle, fontSize: 13 }}>
             <thead>
@@ -4129,21 +4263,14 @@ function StationDetailPanel({
                         </div>
                         <div style={{ flex: 1, minWidth: 200 }}>
                           <label style={{ display: "block", fontSize: 11, color: "#667", marginBottom: 2 }}>Module Order No</label>
-                          <select value={newSlot.moduleOrderNo} onChange={e => onModuleSelect(e.target.value)}
-                            style={{ ...inputSx, width: "100%", fontFamily: "monospace", fontSize: 11 }}>
-                            <option value="">— select module —</option>
-                            {templates
-                              .filter(t => {
-                                if (t.order_no.startsWith("V1_1:") || t.order_no.includes("PLACEHOLDER")) return false;
-                                return true;
-                              })
-                              .map(t => (
-                                <option key={t.id} value={t.order_no}>
-                                  {t.order_no} — {t.display_name}
-                                </option>
-                              ))
-                            }
-                          </select>
+                          <ModuleOrderNoSelect
+                            value={newSlot.moduleOrderNo}
+                            onChange={onModuleSelect}
+                            options={templates.filter(t => {
+                              if (t.order_no.startsWith("V1_1:") || t.order_no.includes("PLACEHOLDER")) return false;
+                              return true;
+                            })}
+                          />
                         </div>
                         <div style={{ flex: 1, minWidth: 200 }}>
                           <label style={{ display: "block", fontSize: 11, color: "#667", marginBottom: 2 }}>Module Name</label>
@@ -4168,56 +4295,69 @@ function StationDetailPanel({
         </div>
       )}
 
-      {/* Slot table (ET200 / CFU_PA / GSDML / other) */}
-      {!isScalanceStation && <div style={{ padding: "12px 16px", overflowX: "auto" }}>
+      {/* Slot table */}
+      {!isPortOnlyStation && <div style={{ padding: "12px 16px", overflowX: "auto" }}>
         <table style={{ ...tableStyle, fontSize: 13 }}>
           <thead>
             <tr>
-              {["Slot", "Module Order No", "Module Name", "PIP", ...(isEt200Station ? ["Pot. Group"] : []), "Addr IN", "Addr OUT", "Signals", ""].map(h => (
+              {["Slot", "Module Order No", "Module Name", "PIP", ...(showPotGroupColumn ? ["Pot. Group"] : []), "Addr IN", "Addr OUT", "Signals", ""].map(h => (
                 <th key={h} style={thStyle}>{h}</th>
               ))}
             </tr>
           </thead>
           <tbody>
             {allRows.flatMap((slot, sli) => {
-              // CFU_PA: slots 0, 1, 2 are system-reserved — lock them (no delete, no click for 0/2)
-              const cfuLocked = isCfuPaStation && slot && slot.slot <= 2;
-              const cfuAutocreated = isCfuPaStation && slot && (slot.slot === 0 || slot.slot === 2);
-              const isClickable = slot && slot.slot !== 0 && !(cfuAutocreated);
+              // Fixed/AUTOCREATED nodes are locked (no delete, no order/name edit, not
+              // clickable) — resolved from this exact slot's own isAutocreated flag,
+              // already computed server-side from hw_default_children. Replaces the old
+              // isCfuPaStation && slot<=2 special case (which incorrectly locked CFU's
+              // slot 1/DIQ8 too — a removable default per the catalogue, not AUTOCREATED).
+              const locked = !!(slot && slot.isAutocreated);
 
-              // For CFU_PA PA device slots (≥3), look up signal_type to label subslots correctly
-              const isPaDevSlot = isCfuPaStation && slot && slot.slot >= 3;
+              // A slot "carries functions" (PA-style pluggable subslots) when the compat
+              // table has subslot-category children registered for its order_no.
+              const isPaDevSlot = isFunctionCarrier(slot);
               const paSlotTpl = isPaDevSlot ? templates.find(t => t.order_no === slot.orderNo) : null;
+
+              // A slot whose own catalogue template carries no addressable I/O of its own
+              // (e.g. a PA-profile parent slot — the real channels live on its subslots)
+              // shouldn't open the signal-assignment modal when the slot header itself is
+              // clicked. Templates with real data (even ones with channel_count=0, like a
+              // DI8/DQ8 card) still have nonzero input/output bytes, so gate on bytes rather
+              // than channel_count.
+              const ownSlotTpl = slot ? templates.find(t => t.order_no === slot.orderNo) : null;
+              const ownHasChannels = !ownSlotTpl || (ownSlotTpl.input_bytes || 0) > 0 || (ownSlotTpl.output_bytes || 0) > 0;
+              const isClickable = slot && slot.slot !== 0 && !locked && ownHasChannels;
 
               const mainRow = (
               <tr key={`slot-${slot ? slot.slot : sli}`}
-                onClick={() => onSlotClick(station, slot)}
+                onClick={() => { if (isClickable) onSlotClick(station, slot); }}
                 style={{
                   background: slot && activeSlot &&
                     activeSlot.stationAddr === station.address && activeSlot.slot === slot.slot
                     ? "#EEEDFE"
-                    : cfuAutocreated ? "#f5f7fa"
+                    : locked ? "#f5f7fa"
                     : sli % 2 === 0 ? "#fff" : "#f7f9fc",
                   cursor: isClickable ? "pointer" : "default",
                 }}>
                 {slot === null ? (
-                  <td colSpan={isEt200Station ? 9 : 8} style={{ ...tdStyle, color: "#aaa", fontStyle: "italic" }}>
+                  <td colSpan={showPotGroupColumn ? 9 : 8} style={{ ...tdStyle, color: "#aaa", fontStyle: "italic" }}>
                     No modules yet
                   </td>
                 ) : (
                   <>
                     <td style={{ ...tdStyle, textAlign: "center", color: "#888", fontWeight: 600 }}>
                       {slot.slot}
-                      {cfuLocked && (
+                      {locked && (
                         <span style={{ marginLeft: 4, fontSize: 9, color: "#888", fontWeight: 400,
                                        background: "#eee", borderRadius: 3, padding: "1px 4px",
                                        verticalAlign: "middle" }}>
-                          {cfuAutocreated ? "AUTO" : "DIQ8"}
+                          AUTO
                         </span>
                       )}
                     </td>
                     <td style={{ ...tdStyle, fontFamily: "monospace", fontSize: 11 }}>
-                      {cfuLocked ? (
+                      {locked ? (
                         <span style={{ color: "#667", fontFamily: "monospace", fontSize: 11 }}>{slot.orderNo}</span>
                       ) : (
                         <EditableCell
@@ -4233,7 +4373,7 @@ function StationDetailPanel({
                       )}
                     </td>
                     <td style={tdStyle}>
-                      {cfuLocked ? (
+                      {locked ? (
                         <span style={{ color: "#667" }}>{slot.name}</span>
                       ) : (
                         <EditableCell
@@ -4248,7 +4388,7 @@ function StationDetailPanel({
                       )}
                     </td>
                     <td style={{ ...tdStyle, padding: "3px 8px" }} onClick={e => e.stopPropagation()}>
-                      {slot.slot === 0 || pipMappings.length === 0 || cfuAutocreated ? (
+                      {slot.slot === 0 || pipMappings.length === 0 || locked ? (
                         <span style={{ color: "#bbb", fontSize: 11 }}>—</span>
                       ) : (
                         <select
@@ -4270,7 +4410,7 @@ function StationDetailPanel({
                         </select>
                       )}
                     </td>
-                    {isEt200Station && slot.slot !== 0 && (
+                    {showPotGroupColumn && slot.slot !== 0 && (
                       <td style={{ ...tdStyle, padding: "3px 8px" }} onClick={e => e.stopPropagation()}>
                         <select
                           value={slot.potentialGroup || ""}
@@ -4286,7 +4426,7 @@ function StationDetailPanel({
                         </select>
                       </td>
                     )}
-                    {isEt200Station && slot.slot === 0 && (
+                    {showPotGroupColumn && slot.slot === 0 && (
                       <td style={{ ...tdStyle, textAlign: "center", color: "#bbb", fontSize: 11 }}>—</td>
                     )}
                     {(() => {
@@ -4306,15 +4446,15 @@ function StationDetailPanel({
                       {slot.signalCount > 0 ? slot.signalCount : "—"}
                     </td>
                     <td style={{ ...tdStyle, textAlign: "center" }}>
-                      {slot.slot !== 0 && !cfuLocked && (
+                      {slot.slot !== 0 && !locked && (
                         <button
                           onClick={e => { e.stopPropagation(); onDeleteSlot(station.address, slot.slot); }}
                           title="Remove slot"
                           style={miniBtn("#e44", "#fff")}
                         >✕</button>
                       )}
-                      {cfuLocked && slot.slot !== 0 && (
-                        <span title="System-reserved slot — cannot be removed"
+                      {locked && slot.slot !== 0 && (
+                        <span title="Fixed/AUTOCREATED slot — cannot be removed"
                               style={{ fontSize: 11, color: "#bbb" }}>🔒</span>
                       )}
                     </td>
@@ -4323,23 +4463,37 @@ function StationDetailPanel({
               </tr>
               );
 
-              // Append subslot rows from auto-slot configuration (if any exist for slot 0)
-              if (slot && slot.slot === 0 && imPorts.length > 0) {
+              // Append subslot rows from auto-slot configuration.
+              // Slot 0 (interface module) uses the pre-computed imPorts; any other
+              // slot (e.g. a GSDML IO-Link master's function subslots) is looked up
+              // directly from autoSlotConfig by slot number. CFU_PA PA-device slots
+              // are excluded here — they already get dedicated rows below, sourced
+              // from hw_slot_subslots/paProfile instead of autoSlotConfig.
+              const cfgSlotForRow = slot && slot.slot !== 0 && autoSlotConfig && autoSlotConfig.slots
+                ? autoSlotConfig.slots.find(s => s.slot === slot.slot) : null;
+              const autoPorts = slot && slot.slot === 0
+                ? imPorts
+                : (cfgSlotForRow && Array.isArray(cfgSlotForRow.subslots)
+                    ? cfgSlotForRow.subslots.map(ss => ({
+                        subslot: ss.subslot,
+                        label: ss.port_label || ss.label,
+                        orderNo: ss.order_no,
+                      }))
+                    : []);
+
+              if (slot && !isPaDevSlot && autoPorts.length > 0) {
                 const portSsTdBase = {
                   ...tdStyle, fontSize: 11, color: "#666",
                   paddingTop: 2, paddingBottom: 2,
                   borderTop: "1px dashed #ddd", background: "#f0f6ff",
                 };
-                const portRows = imPorts.map((port, pi) => (
-                  <tr key={`im-port-${port.subslot}`} style={{ background: pi % 2 === 0 ? "#f0f6ff" : "#e8f0ff", cursor: "default" }}>
+                const portRows = autoPorts.map((port, pi) => (
+                  <tr key={`auto-ss-${slot.slot}-${port.subslot}`} style={{ background: pi % 2 === 0 ? "#f0f6ff" : "#e8f0ff", cursor: "default" }}>
                     <td style={{ ...portSsTdBase, textAlign: "center", color: "#2255cc", fontWeight: 600 }}>
-                      <span style={{ paddingLeft: 12 }}>↳ 0.{port.subslot}</span>
+                      <span style={{ paddingLeft: 12 }}>↳ {slot.slot}.{port.subslot}</span>
                     </td>
                     <td style={{ ...portSsTdBase, fontFamily: "monospace" }}>
-                      <span style={{ fontSize: 10, padding: "1px 5px", borderRadius: 3,
-                                     background: "#dbeafe", color: "#1d4ed8", fontWeight: 600 }}>
-                        {port.orderNo ? "SUBSLOT" : "—"}
-                      </span>
+                      <span style={{ color: "#2255cc" }}>{port.orderNo || "—"}</span>
                     </td>
                     <td style={{ ...portSsTdBase }}>
                       {port.label || "—"}
@@ -4347,7 +4501,7 @@ function StationDetailPanel({
                     <td style={{ ...portSsTdBase, color: "#aaa" }}>—</td>
                     <td style={{ ...portSsTdBase, textAlign: "center", color: "#aaa" }}>—</td>
                     <td style={{ ...portSsTdBase, textAlign: "center", color: "#aaa" }}>—</td>
-                    {isEt200Station && <td style={{ ...portSsTdBase, textAlign: "center", color: "#aaa" }}>—</td>}
+                    {showPotGroupColumn && <td style={{ ...portSsTdBase, textAlign: "center", color: "#aaa" }}>—</td>}
                     <td style={{ ...portSsTdBase, textAlign: "center", color: "#aaa" }}>—</td>
                     <td style={{ ...portSsTdBase, textAlign: "center" }}></td>
                   </tr>
@@ -4355,9 +4509,15 @@ function StationDetailPanel({
                 return [mainRow, ...portRows];
               }
 
-              // CFU_PA PA device slots (≥3): append function subslot rows + service row
-              // GSDML devices do NOT have PA function subslots on I/O modules (unlike CFU_PA)
-              if (!isPaDevSlot || slot === null || isGsdmlStation) return [mainRow];
+              // Subslot rows below a slot come from the station's OWN materialized subslot
+              // data (hw_slot_subslots, surfaced as slot.subslots) — the real per-instance
+              // tree, whatever the device family. The catalogue's compat table is consulted
+              // only for which order_nos a position may be *changed to*, never for whether a
+              // row exists. A function-carrier slot with no materialized rows yet still gets
+              // its empty function positions rendered so a profile can be picked.
+              if (slot === null) return [mainRow];
+              const realSubslots = (slot.subslots || []).filter(ss => ss.subslotNo != null);
+              if (!isPaDevSlot && realSubslots.length === 0) return [mainRow];
 
               const ssRowStyle = {
                 background: "#f3f0ff",
@@ -4373,136 +4533,131 @@ function StationDetailPanel({
                 borderTop: "1px dashed #ddd",
               };
 
-              // Number of function subslots: from template channel_count (min 1)
+              // PA subslot profile options — sourced from the slot's own family, so any other
+              // subslot template in the same family (e.g. a longer/shorter AI variant) is
+              // directly selectable from the project station screen with no extra registration step.
+              const paSubslots = templates.filter(t => t.hw_category === 'subslot' && paSlotTpl && t.family === paSlotTpl.family);
+              const subslotLookup = new Map(realSubslots.map(ss => [ss.subslotNo, ss]));
+
+              // Positions to render: every materialized subslot, plus any function position
+              // the catalogue declares (channel_count, min 1) that has no row yet — so an
+              // unpopulated PA slot still offers its selector.
               const funcCount = paSlotTpl && (paSlotTpl.channel_count || 0) > 1
                 ? paSlotTpl.channel_count : 1;
-              const serviceSubslotNo = funcCount + 1;
+              const ssPositions = new Set(realSubslots.map(ss => ss.subslotNo));
+              if (isPaDevSlot) for (let i = 1; i <= funcCount; i++) ssPositions.add(i);
+              const ssNos = [...ssPositions].sort((a, b) => a - b);
 
-              // PA subslot profile options from catalogue
-              const paSubslots = templates.filter(t => t.hw_category === 'subslot' && t.family === stationFamily);
-              // Build per-subslot lookup: subslotNo → { paProfile }
-              const subslotLookup = new Map((slot.subslots || []).map(ss => [ss.subslotNo, ss]));
-
-              // Build function subslot rows — each SS has its own independent profile selector
               const slotAddrs = addrMap && addrMap[`${station.address}:${slot.slot}`];
               const ssAddrList = slotAddrs && slotAddrs.subslotAddrs ? slotAddrs.subslotAddrs : [];
               const ssAddrMap  = new Map(ssAddrList.map(a => [a.subslotNo, a]));
 
-              const funcRows = Array.from({ length: funcCount }, (_, fi) => {
-                const ssNo = fi + 1;
-                const ssData = subslotLookup.get(ssNo);
-                const ssProfile = ssData ? ssData.paProfile : null;
-                const ssLocked = !!ssProfile;
-                const ssProfileTpl = ssProfile ? paSubslots.find(t => t.order_no === ssProfile) : null;
-                const ssAddr = ssAddrMap.get(ssNo);
+              const subRows = ssNos.map(ssNo => {
+                const ssData    = subslotLookup.get(ssNo);
+                const ssOrderNo = ssData ? (ssData.paProfile || ssData.childOrderNo) : null;
+                const ssTpl     = ssOrderNo ? templates.find(t => t.order_no === ssOrderNo) : null;
+                const ssAddr    = ssAddrMap.get(ssNo);
+                // A position is user-editable when it is not a fixed/AUTOCREATED node and the
+                // catalogue offers at least one profile for this slot's family.
+                const ssFixed    = !!(ssData && ssData.isAutocreated);
+                const ssEditable = !ssFixed && paSubslots.length > 0;
+                const ssName = (ssTpl && ssTpl.display_name) || (ssData && ssData.label) || null;
+                // Diagnostic-only subslots (e.g. the trailing Service module, or a PA
+                // param/diag subslot) carry no addressable I/O of their own — gate on
+                // bytes rather than channel_count, same reasoning as the slot-level gate.
+                const ssHasChannels = !ssTpl || (ssTpl.input_bytes || 0) > 0 || (ssTpl.output_bytes || 0) > 0;
+                const ssClickable = !ssFixed && ssOrderNo && ssHasChannels;
                 return (
                   <tr key={`ss${ssNo}-${slot.slot}`}
-                    style={{ ...ssRowStyle, cursor: "pointer" }}
-                    onClick={() => onSlotClick(station, slot)}>
+                    onClick={() => { if (ssClickable) onSlotClick(station, slot, ssNo); }}
+                    style={{ ...ssRowStyle, background: ssEditable ? "#f3f0ff" : "#ede8ff",
+                             cursor: ssClickable ? "pointer" : "default" }}>
                     <td style={{ ...ssTdBase, textAlign: "center", color: "#9979cc", fontWeight: 600 }}>
                       <span style={{ paddingLeft: 12 }}>↳ {slot.slot}.{ssNo}</span>
+                      {ssFixed && (
+                        <span style={{ marginLeft: 4, fontSize: 9, color: "#888", fontWeight: 400,
+                                       background: "#eee", borderRadius: 3, padding: "1px 4px",
+                                       verticalAlign: "middle" }}>AUTO</span>
+                      )}
                     </td>
                     <td style={{ ...ssTdBase, fontFamily: "monospace" }} onClick={e => e.stopPropagation()}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                        <input
-                          type="checkbox"
-                          checked={ssLocked}
-                          onChange={e => {
-                            if (!e.target.checked) onSaveSlotSubslotProfile(station.address, slot.slot, ssNo, null);
+                      {ssEditable ? (
+                        <ModuleOrderNoSelect
+                          value={ssOrderNo || ""}
+                          onChange={v => onSaveSlotSubslotProfile(station.address, slot.slot, ssNo, v || null)}
+                          options={paSubslots}
+                          placeholder="— select —"
+                          title={`Select profile for ${slot.slot}.${ssNo}`}
+                          valueColor="#9979cc"
+                          placeholderColor="#9979cc"
+                          style={{
+                            fontSize: 11, border: "1px solid #c8a8f0", borderRadius: 3,
+                            padding: "2px 4px", background: "#faf8ff", cursor: "pointer",
                           }}
-                          title={ssLocked ? "Uncheck to change profile" : "Select a profile first"}
-                          style={{ cursor: "pointer", accentColor: "#9979cc", margin: 0, flexShrink: 0 }}
                         />
-                        {ssLocked ? (
-                          <span style={{ color: "#9979cc", fontFamily: "monospace", fontSize: 11 }}>{ssProfile}</span>
-                        ) : (
-                          <select
-                            value=""
-                            onChange={e => { if (e.target.value) onSaveSlotSubslotProfile(station.address, slot.slot, ssNo, e.target.value); }}
-                            onClick={e => e.stopPropagation()}
-                            title={`Select PA profile for ${slot.slot}.${ssNo}`}
-                            style={{
-                              fontSize: 11, border: "1px solid #c8a8f0", borderRadius: 3,
-                              padding: "2px 4px", background: "#faf8ff",
-                              color: "#9979cc", cursor: "pointer", fontFamily: "monospace",
-                            }}
-                          >
-                            <option value="">— select —</option>
-                            {paSubslots.map(t => (
-                              <option key={t.order_no} value={t.order_no}>{t.order_no}</option>
-                            ))}
-                          </select>
-                        )}
-                      </div>
+                      ) : (
+                        <span style={{ color: "#7755aa" }}>{ssOrderNo || "—"}</span>
+                      )}
                     </td>
                     <td style={{ ...ssTdBase }}>
-                      {ssProfileTpl
-                        ? <span style={{ color: "#9979cc", fontSize: 11 }}>{ssProfileTpl.display_name}</span>
+                      {ssName
+                        ? <span style={{ color: ssEditable ? "#9979cc" : "#7755aa", fontSize: 11 }}>{ssName}</span>
                         : <span style={{ color: "#ccc", fontSize: 11 }}>—</span>
                       }
                     </td>
-                    <td style={{ ...ssTdBase, color: "#9979cc" }}>Signal data (process image)</td>
+                    <td style={{ ...ssTdBase, textAlign: "center", color: "#ccc" }}>—</td>
+                    {showPotGroupColumn && <td style={{ ...ssTdBase, textAlign: "center", color: "#ccc" }}>—</td>}
                     <td style={{ ...ssTdBase, textAlign: "right", fontFamily: "monospace", paddingRight: 8,
-                        color: ssAddr ? "#1a5c1a" : "#ccc" }}>
-                      {ssAddr ? ssAddr.inputAddr : "—"}
+                        color: ssAddr && ssAddr.inputAddr != null ? "#1a5c1a" : "#ccc" }}>
+                      {ssAddr && ssAddr.inputAddr != null ? ssAddr.inputAddr : "—"}
                     </td>
                     <td style={{ ...ssTdBase, textAlign: "center", color: "#ccc" }}>—</td>
-                    <td style={{ ...ssTdBase, textAlign: "center" }}></td>
+                    <td style={{ ...ssTdBase, textAlign: "center", color: "#ccc" }}>—</td>
+                    <td style={{ ...ssTdBase, textAlign: "center" }}>
+                      {!ssFixed && ssOrderNo && (
+                        <button
+                          onClick={e => { e.stopPropagation(); onSaveSlotSubslotProfile(station.address, slot.slot, ssNo, null); }}
+                          title="Clear subslot profile"
+                          style={miniBtn("#e44", "#fff")}
+                        >✕</button>
+                      )}
+                    </td>
                   </tr>
                 );
               });
 
-              const serviceRow = (
-                <tr key={`ss${serviceSubslotNo}-${slot.slot}`} style={{ ...ssRowStyle, background: "#ede8ff" }}>
-                  <td style={{ ...ssTdBase, textAlign: "center", color: "#7755aa", fontWeight: 600 }}>
-                    <span style={{ paddingLeft: 12 }}>↳ {slot.slot}.{serviceSubslotNo}</span>
-                  </td>
-                  <td style={{ ...ssTdBase, fontFamily: "monospace" }}>
-                    <span style={{ color: "#7755aa" }}>_S7H_NORM_PDM_BUB_MODULE_CT</span>
-                  </td>
-                  <td style={{ ...ssTdBase }}></td>
-                  <td style={{ ...ssTdBase, color: "#7755aa" }}>Service (AUTOCREATED)</td>
-                  <td style={{ ...ssTdBase, textAlign: "center" }}>—</td>
-                  <td style={{ ...ssTdBase, textAlign: "center" }}>—</td>
-                  <td style={{ ...ssTdBase, textAlign: "center" }}></td>
-                </tr>
-              );
-
-              return [mainRow, ...funcRows, serviceRow];
+              return [mainRow, ...subRows];
             })}
 
             {/* Inline add-slot form — render after all existing slots */}
             {addSlotRow && (
               <tr style={{ background: "#f0f6ff" }}>
-                <td colSpan={isEt200Station ? 9 : 8} style={{ ...tdStyle, padding: "12px 16px" }}>
+                <td colSpan={showPotGroupColumn ? 9 : 8} style={{ ...tdStyle, padding: "12px 16px" }}>
                   <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
                     <div style={{ display: "flex", gap: 8, flex: 1, flexWrap: "wrap" }}>
                       <div style={{ minWidth: 60 }}>
                         <label style={{ display: "block", fontSize: 11, color: "#667", marginBottom: 2 }}>Slot</label>
                         <input type="number" value={newSlot.slot}
                           onChange={e => onSetNewSlot(p => ({ ...p, slot: e.target.value }))}
-                          min={isCfuPaStation ? 3 : 1}
+                          min={minAddableSlot}
                           style={{ ...inputSx, width: 54, textAlign: "center" }} placeholder="#" />
                       </div>
                       <div style={{ flex: 1, minWidth: 200 }}>
                         <label style={{ display: "block", fontSize: 11, color: "#667", marginBottom: 2 }}>Module Order No</label>
-                        <select value={newSlot.moduleOrderNo} onChange={e => onModuleSelect(e.target.value)}
-                          style={{ ...inputSx, width: "100%", fontFamily: "monospace", fontSize: 11 }}>
-                          <option value="">— select module —</option>
-                          {templates
-                            .filter(t => {
-                              if (t.order_no.startsWith("V1_1:") || t.order_no.includes("PLACEHOLDER")) return false;
-                              if (isCfuPaStation) return t.family === 'CFU_PA' && t.hw_category === 'slot' &&
-                                (t.signal_type === 'PA' || /^META[/\\]/i.test(t.order_no));
-                              return true;
-                            })
-                            .map(t => (
-                              <option key={t.id} value={t.order_no}>
-                                {t.order_no} — {t.display_name}
-                              </option>
-                            ))
-                          }
-                        </select>
+                        <ModuleOrderNoSelect
+                          value={newSlot.moduleOrderNo}
+                          onChange={onModuleSelect}
+                          options={templates.filter(t => {
+                            if (t.order_no.startsWith("V1_1:") || t.order_no.includes("PLACEHOLDER")) return false;
+                            // Restrict to modules registered as compatible slot-children of
+                            // this station's head module, when compat data exists for it;
+                            // otherwise fall back to allowing any slot-category module.
+                            if (addSlotCompatOrderNos && addSlotCompatOrderNos.size > 0) {
+                              return addSlotCompatOrderNos.has(t.order_no);
+                            }
+                            return t.hw_category === 'slot';
+                          })}
+                        />
                       </div>
                       <div style={{ flex: 1, minWidth: 200 }}>
                         <label style={{ display: "block", fontSize: 11, color: "#667", marginBottom: 2 }}>Module Name</label>
@@ -4659,13 +4814,35 @@ function EditableCell({ value, editing, editVal, onEdit, onChange, onCommit, onC
   );
 }
 
-function UploadCard({ label, ok, okLabel, btnLabel, onBtn, accept, inputRef, onChange, disabled }) {
+function UploadCard({ label, ok, okLabel, btnLabel, onBtn, accept, inputRef, onChange, disabled, extraBtn, extraBtnLabel, onExtraBtn }) {
   return (
     <div style={{ flex: 1, minWidth: 260, background: "#f8f9ff", border: "1px solid #ccd",
                   borderRadius: 8, padding: "14px 16px" }}>
       <label style={{ fontWeight: 700, display: "block", marginBottom: 8, fontSize: 14 }}>{label}</label>
-      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-        <button onClick={onBtn} style={{ ...btnStyle, opacity: disabled ? 0.5 : 1 }}>{btnLabel}</button>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+        <button onClick={onBtn} style={{ ...btnStyle, opacity: disabled ? 0.5 : 1 }} disabled={disabled}>{btnLabel}</button>
+        {extraBtn && (
+          <button
+            onClick={onExtraBtn}
+            style={{
+              padding: "8px 18px",
+              borderRadius: 6,
+              border: "1px solid #4caf50",
+              background: "#e8f5e9",
+              color: "#2e7d32",
+              cursor: disabled ? "not-allowed" : "pointer",
+              fontWeight: 600,
+              fontSize: 14,
+              whiteSpace: "nowrap",
+              opacity: disabled ? 0.5 : 1
+            }}
+            onMouseEnter={(e) => !disabled && (e.target.style.background = "#c8e6c9")}
+            onMouseLeave={(e) => !disabled && (e.target.style.background = "#e8f5e9")}
+            disabled={disabled}
+          >
+            {extraBtnLabel}
+          </button>
+        )}
         {ok && <span style={{ color: "#2a8", fontWeight: 700, fontSize: 13 }}>{okLabel}</span>}
         <input type="file" accept={accept} ref={inputRef} onChange={onChange} style={{ display: "none" }} />
       </div>
@@ -4677,7 +4854,7 @@ function UploadCard({ label, ok, okLabel, btnLabel, onBtn, accept, inputRef, onC
 // Full-screen overlay: left half = StationDetailPanel, right half = SlotSignalPanel.
 // Opens when user clicks "Configure" on a slot row. Closes via the × button.
 function SlotConfigModal({
-  importId, station, templates, addrMap, pipMappings,
+  importId, station, templates, slotCompat, addrMap, pipMappings,
   addingSlot, newSlot, editing, editVal,
   onCopyStation, onDeleteStation,
   onOpenAddSlot, onCancelAddSlot, onModuleSelect, onSetNewSlot, onCommitAddSlot,
@@ -4688,15 +4865,36 @@ function SlotConfigModal({
 }) {
   const [activeSlot, setActiveSlot] = useState(initialSlot || null);
 
-  const handleSlotClick = (st, slot) => {
-    if (!slot || slot.slot === 0) return;
-    const imSlot = st.slots.find(s => s.slot === 0);
-    const imTpl  = imSlot ? templates.find(t => t.order_no === imSlot.orderNo) : null;
-    if (imTpl && imTpl.family === 'CFU_PA' && slot.slot === 2) return;
-    const key     = `${st.address}-${slot.slot}`;
-    const activeKey = activeSlot ? `${activeSlot.stationAddr}-${activeSlot.slot}` : null;
+  // Generic (slot, subslot) keying: subslot === null means "the slot's own identity/
+  // channels"; a non-null subslot targets one of that slot's real subslot rows (PA
+  // function subslot, port, etc.). Locking is resolved from the exact node clicked via
+  // its own isAutocreated flag — no family checks (was: slot===0 special-case + a
+  // hardcoded family==='CFU_PA' && slot===2 gate).
+  const handleSlotClick = (st, slot, subslotNo = null) => {
+    if (!slot) return;
+    const target = subslotNo != null
+      ? (slot.subslots || []).find(ss => ss.subslotNo === subslotNo)
+      : slot;
+    if (!target || target.isAutocreated) return; // fixed/AUTOCREATED node — nothing to configure
+    const key      = `${st.address}-${slot.slot}-${subslotNo ?? ''}`;
+    const activeKey = activeSlot ? `${activeSlot.stationAddr}-${activeSlot.slot}-${activeSlot.subslot ?? ''}` : null;
     if (key === activeKey) { setActiveSlot(null); return; }
-    setActiveSlot({ stationAddr: st.address, slot: slot.slot, orderNo: slot.orderNo, name: slot.name });
+    const targetOrderNo = subslotNo != null ? (target.paProfile || target.childOrderNo) : slot.orderNo;
+    // Prefer the current catalogue template's own display_name over the subslot's stored
+    // `label` — `label` is captured once at import/default-materialization time and goes
+    // stale the moment the user picks a different profile from the dropdown (only
+    // child_order_no/pa_profile get updated), so it can point at a since-replaced profile.
+    const targetTpl = subslotNo != null ? templates.find(t => t.order_no === targetOrderNo) : null;
+    setActiveSlot({
+      stationAddr: st.address,
+      slot: slot.slot,
+      subslot: subslotNo,
+      orderNo: targetOrderNo,
+      name: subslotNo != null
+        ? ((targetTpl && targetTpl.display_name) || target.label || targetOrderNo || `${slot.slot}.${subslotNo}`)
+        : slot.name,
+      subslots: slot.subslots || [],
+    });
   };
 
   return (
@@ -4746,6 +4944,7 @@ function SlotConfigModal({
             <StationDetailPanel
               station={station}
               templates={templates}
+              slotCompat={slotCompat}
               addrMap={addrMap}
               pipMappings={pipMappings}
               addingSlot={addingSlot}
@@ -4778,12 +4977,14 @@ function SlotConfigModal({
           <div style={{ flex: 3, minWidth: 0, overflowY: "auto", background: "#f8f9ff" }}>
             {activeSlot ? (
               <SlotSignalPanel
-                key={`${activeSlot.stationAddr}-${activeSlot.slot}`}
+                key={`${activeSlot.stationAddr}-${activeSlot.slot}-${activeSlot.subslot ?? ''}`}
                 importId={importId}
                 stationAddr={activeSlot.stationAddr}
                 slot={activeSlot.slot}
+                subslot={activeSlot.subslot}
                 slotName={activeSlot.name}
                 orderNo={activeSlot.orderNo}
+                subslots={activeSlot.subslots}
                 templates={templates}
                 onClose={() => setActiveSlot(null)}
               />
@@ -4805,7 +5006,7 @@ function SlotConfigModal({
 }
 
 // ── Slot Signal Panel ─────────────────────────────────────────────────────────
-function SlotSignalPanel({ importId, stationAddr, slot, slotName, orderNo, templates, onClose }) {
+function SlotSignalPanel({ importId, stationAddr, slot, subslot, slotName, orderNo, subslots, templates, onClose }) {
   const [channels, setChannels] = useState([]);
   const [loading,  setLoading]  = useState(true);
   const [saving,   setSaving]   = useState(null); // channel index being saved
@@ -4818,13 +5019,23 @@ function SlotSignalPanel({ importId, stationAddr, slot, slotName, orderNo, templ
   const ioType      = tpl ? tpl.signal_type : null;
   const isPaSlot    = ioType === 'PA';
   const isMixed     = ioType === 'MIXED';
-  // Multi-function PA profiles (Analyzer etc.): channel = 0-based function index, not PA bus address
-  const funcCount   = tpl && (tpl.channel_count || 0) > 1 ? tpl.channel_count : 1;
-  const isPaMulti   = isPaSlot && funcCount > 1;
+  // Multi-function PA profiles (Analyzer etc.): channel = 0-based function index, not PA
+  // bus address. Retired the family-flavoured "isPaMulti from template.channel_count"
+  // check — this node has multiple functions when the REAL tree data (this slot's actual
+  // subslot rows, already loaded on the station) shows children, not from a catalogue count.
+  const hasChildSubslots = subslot == null && Array.isArray(subslots) && subslots.length > 0;
+  const funcCount   = hasChildSubslots ? subslots.length : 1;
+  const isPaMulti   = isPaSlot && hasChildSubslots;
+  // A MIXED signal_type only means "has both input and output bytes" (see deriveSignalType
+  // in cfgCatalogueParser.js) — it doesn't imply digital DI/DO. Only split into DI/DO halves
+  // when the module has no declared datatype (today's DIQ8-style boolean modules); a
+  // byte/word-oriented mixed module (e.g. an IO-Link byte channel) keeps one flat channel
+  // list tagged with its real datatype instead.
+  const isDigitalMixed = isMixed && !(tpl && tpl.default_datatype);
 
   useEffect(() => {
     setLoading(true);
-    getSlotChannels(importId, stationAddr, slot)
+    getSlotChannels(importId, stationAddr, slot, subslot)
       .then(rows => {
         setChannels(rows);
         const d = {};
@@ -4833,7 +5044,7 @@ function SlotSignalPanel({ importId, stationAddr, slot, slotName, orderNo, templ
       })
       .catch(() => {})
       .finally(() => setLoading(false));
-  }, [importId, stationAddr, slot]);
+  }, [importId, stationAddr, slot, subslot]);
 
   // Load module parameters if template has an id
   useEffect(() => {
@@ -4865,10 +5076,10 @@ function SlotSignalPanel({ importId, stationAddr, slot, slotName, orderNo, templ
         tag: d.tag ?? "",
         description: d.description ?? "",
         signal_type: saveType,
-      });
+      }, subslot);
       // If the PA bus address changed (channel key changed), clear the old channel row
       if (isPaSlot && !isPaMulti && newCh !== ch) {
-        await patchSlotChannel(importId, stationAddr, slot, ch, { tag: "", description: "", signal_type: saveType });
+        await patchSlotChannel(importId, stationAddr, slot, ch, { tag: "", description: "", signal_type: saveType }, subslot);
       }
       setChannels(prev => prev.map(r => r.channel === ch
         ? { ...r, channel: newCh, tag: d.tag ?? "", description: d.description ?? "" }
@@ -5075,7 +5286,7 @@ function SlotSignalPanel({ importId, stationAddr, slot, slotName, orderNo, templ
                             style={{ width: 48, textAlign: "center", padding: "2px 4px", fontSize: 12,
                                      border: "1px solid #c0ccf0", borderRadius: 3, fontFamily: "monospace" }}
                           />
-                        ) : (isMixed ? (ch % 8) + 1 : ch + 1)}
+                        ) : (isDigitalMixed ? (ch % 8) + 1 : ch + 1)}
                       </td>
                       <td style={{ padding: "5px 10px", whiteSpace: "nowrap" }}>
                         {displayType ? (
@@ -5127,7 +5338,7 @@ function SlotSignalPanel({ importId, stationAddr, slot, slotName, orderNo, templ
                   );
                 };
 
-                if (isMixed) {
+                if (isDigitalMixed) {
                   const diRows = channels.filter(r => r.signal_type === 'DI');
                   const doRows = channels.filter(r => r.signal_type === 'DO');
                   const sectionHdr = (label, bg) => (
@@ -5167,6 +5378,45 @@ const inputSx = {
   padding: "5px 8px", border: "1px solid #ccd", borderRadius: 4,
   fontSize: 13, fontFamily: "inherit", background: "#fff",
 };
+
+// Module-order-number picker: the open dropdown lists "display name | order number" so it's
+// easy to find the right module, but once collapsed only the order number is shown (the name
+// is already visible elsewhere, e.g. the Module Name column/field). Native <select> always
+// renders the same text for the open list and the closed box, so instead of faking it with
+// `color: transparent` (which some browsers also apply to the popup's option text, making the
+// whole list unreadable), the select itself is made fully invisible (opacity: 0) and an inert
+// overlay div — unaffected by the native popup — draws the closed-state text on top of it.
+function ModuleOrderNoSelect({
+  value, onChange, options, placeholder = "— select module —", style,
+  valueColor = "#222", placeholderColor = "#888", title,
+}) {
+  const boxStyle = { ...inputSx, width: "100%", fontFamily: "monospace", fontSize: 11, ...style };
+  return (
+    <div style={{ position: "relative", width: "100%" }}>
+      <select
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        title={title}
+        style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: 0, cursor: "pointer", margin: 0 }}
+      >
+        <option value="">{placeholder}</option>
+        {options.map(t => (
+          <option key={t.id || t.order_no} value={t.order_no}>
+            {t.display_name} | {t.order_no}
+          </option>
+        ))}
+      </select>
+      <div style={{
+        ...boxStyle, boxSizing: "border-box", display: "flex", alignItems: "center",
+        justifyContent: "space-between", gap: 4, color: value ? valueColor : placeholderColor,
+        overflow: "hidden", whiteSpace: "nowrap", pointerEvents: "none",
+      }}>
+        <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{value || placeholder}</span>
+        <span style={{ opacity: 0.55, flexShrink: 0 }}>▾</span>
+      </div>
+    </div>
+  );
+}
 
 function miniBtn(bg, color) {
   return {

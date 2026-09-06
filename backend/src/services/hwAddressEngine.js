@@ -18,7 +18,18 @@ const DIAG_BASE   = 16000; // addresses >= this are diagnostic, never process im
 /** True when this template's bytes live in the analog (≥ 512) process image. */
 function isAnalog(tpl) {
   const st = (tpl && tpl.signal_type ? String(tpl.signal_type) : '').toUpperCase();
-  return st === 'AI' || st === 'AO' || st === 'PA';
+  if (st === 'AI' || st === 'AO' || st === 'PA') return true;
+  // IB (Input Byte) and QB (Output Byte) are byte-oriented single-direction types
+  // that live in the analog address space, same as AI/AO. They differ only in their
+  // default SYMBOL identifier (IB / QB instead of IW / QW).
+  if (st === 'IB' || st === 'QB') return true;
+  // MIXED only means "has both input and output bytes" (see cfgCatalogueParser's
+  // deriveSignalType) — it covers two unrelated shapes. A card with no declared
+  // datatype is bit-packed digital (DIQ8) and belongs in the digital image; one
+  // that declares a byte/word datatype (e.g. an IO-Link byte port) is word-
+  // oriented and belongs in the analog image alongside AI/AO.
+  if (st === 'MIXED' && tpl && tpl.default_datatype) return true;
+  return false;
 }
 
 /**
@@ -29,6 +40,7 @@ function isAnalog(tpl) {
  *
  *   DI    → I  / —      AI  → IW / —
  *   DO    → — / Q       AO  → — / QW
+ *   IB    → IB / —      QB  → — / QB  (byte-oriented, analog space, no word alignment)
  *   MIXED → I  / Q   (DIQ8: DI channels on input, DO channels on output)
  *   PA    → I  / Q   (CFU_PA transmitter telegrams)
  *   INFRA / unknown → — / —
@@ -40,6 +52,8 @@ function defaultIdentifiers(signalType) {
     case 'DO': return { in: null, out: 'Q'  };
     case 'AI': return { in: 'IW', out: null };
     case 'AO': return { in: null, out: 'QW' };
+    case 'IB': return { in: 'IB', out: null };
+    case 'QB': return { in: null, out: 'QB' };
     case 'MIXED': return { in: 'I', out: 'Q' };
     case 'PA':    return { in: 'I', out: 'Q' };
     default:      return { in: null, out: null };
@@ -89,6 +103,46 @@ const PA_GSD_FALLBACK_BYTES = 5;
  *   slot.inputAddr   {number|null}
  *   slot.outputAddr  {number|null}
  */
+/**
+ * Allocate process image addresses to a slot's subslot children, in ascending
+ * position order, from the same per-controller cursors the slot loop uses.
+ *
+ * Enriches each entry of slot.subslots in-place with inputAddr / outputAddr
+ * (null when that direction carries no bytes). The child's profile — whatever
+ * the station actually has plugged into that position — supplies the byte
+ * counts, so this is family-free: any catalogued subslot with input_bytes /
+ * output_bytes participates, and one with neither is skipped entirely.
+ */
+function allocateSubslotAddresses(slot, templateMap, ptr) {
+  if (!slot.subslots || slot.subslots.length === 0) return;
+  const ordered = [...slot.subslots]
+    .filter(ss => ss && ss.subslotNo != null)
+    .sort((a, b) => a.subslotNo - b.subslotNo);
+
+  for (const ss of ordered) {
+    const profile = ss.paProfile || ss.childOrderNo || null;
+    const tpl = profile ? findTemplate(templateMap, profile) : null;
+    ss.inputAddr = null;
+    ss.outputAddr = null;
+    if (!tpl) continue;
+
+    const analog = isAnalog(tpl);
+    const inBytes  = tpl.input_bytes  || 0;
+    const outBytes = tpl.output_bytes || 0;
+
+    if (inBytes > 0) {
+      const key = analog ? 'anaIn' : 'digIn';
+      ss.inputAddr = ptr[key];
+      ptr[key] += inBytes;
+    }
+    if (outBytes > 0) {
+      const key = analog ? 'anaOut' : 'digOut';
+      ss.outputAddr = ptr[key];
+      ptr[key] += outBytes;
+    }
+  }
+}
+
 function allocateAddresses(stations, templateMap, baseInput, baseOutput, controllerMap) {
   // Group stations by controller. If no station has a controllerId, treat all as one group.
   const stationsByController = new Map();
@@ -201,6 +255,14 @@ function allocateAddresses(stations, templateMap, baseInput, baseOutput, control
           slot.inputAddr  = slot.subslotAddrs.length > 0 ? slot.subslotAddrs[0].inputAddr : null;
           slot.outputAddr = null;
         } else {
+          // A slot whose own module carries no process image (e.g. an IO-Link
+          // master: signal_type INFRA, 0 bytes) can still hold subslot children
+          // that each do. Those children are the addressable units, so allocate
+          // per subslot from the same cursors, in ascending position order —
+          // driven purely by each child profile's own catalogue bytes, no
+          // per-family knowledge. Runs before the slot's own allocation below so
+          // a slot that has both keeps subslots ahead of it, matching print order.
+          allocateSubslotAddresses(slot, templateMap, ptr);
           if (inBytes > 0) {
             const key = analog ? 'anaIn' : 'digIn';
             slot.inputAddr = ptr[key];

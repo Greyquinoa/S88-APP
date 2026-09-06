@@ -662,14 +662,24 @@ export async function addHwSlot(importId, addr, data) {
 export async function deleteHwSlot(importId, addr, slot) {
   return request('DELETE', `/hw-config/imports/${importId}/stations/${addr}/slots/${slot}`);
 }
-export async function getSlotChannels(importId, addr, slot) {
-  return request('GET', `/hw-config/imports/${importId}/stations/${addr}/slots/${slot}/channels`);
+// `subslot` is optional (null/undefined = today's behavior, subslot_no IS NULL on the
+// backend). Pass a subslot number to scope the request to that subslot's own channels
+// instead of the slot's — needed once a slot has multiple subslots (e.g. IO-Link ports,
+// PA function subslots) so channel numbers on different subslots don't collide.
+export async function getSlotChannels(importId, addr, slot, subslot = null) {
+  const path = subslot != null
+    ? `/hw-config/imports/${importId}/stations/${addr}/slots/${slot}/subslots/${subslot}/channels`
+    : `/hw-config/imports/${importId}/stations/${addr}/slots/${slot}/channels`;
+  return request('GET', path);
 }
 export async function getAllSlotChannels(importId) {
   return request('GET', `/hw-config/imports/${importId}/all-slot-channels`);
 }
-export async function patchSlotChannel(importId, addr, slot, ch, data) {
-  return request('PATCH', `/hw-config/imports/${importId}/stations/${addr}/slots/${slot}/channels/${ch}`, data);
+export async function patchSlotChannel(importId, addr, slot, ch, data, subslot = null) {
+  const path = subslot != null
+    ? `/hw-config/imports/${importId}/stations/${addr}/slots/${slot}/subslots/${subslot}/channels/${ch}`
+    : `/hw-config/imports/${importId}/stations/${addr}/slots/${slot}/channels/${ch}`;
+  return request('PATCH', path, data);
 }
 export async function patchSlotPip(importId, addr, slot, pipNo) {
   return request('PATCH', `/hw-config/imports/${importId}/stations/${addr}/slots/${slot}/pip`, { pipNo });
@@ -682,6 +692,38 @@ export async function patchSlotPaProfile(importId, addr, slot, paProfile) {
 }
 export async function patchSlotSubslotProfile(importId, addr, slot, ssNo, paProfile) {
   return request('PATCH', `/hw-config/imports/${importId}/stations/${addr}/slots/${slot}/subslots/${ssNo}/pa-profile`, { paProfile });
+}
+// Generic family-free replacement for patchSlotSubslotProfile: swaps a subslot's plugged-in
+// child order_no, validated server-side against hw_slot_subslot_compat and refused when the
+// current node is is_autocreated (fixed/locked).
+export async function replaceSubslot(importId, addr, slot, subslot, orderNo) {
+  return request('PATCH', `/hw-config/imports/${importId}/stations/${addr}/slots/${slot}/subslots/${subslot}`, { child_order_no: orderNo });
+}
+
+// ── Station Auto-Slot (default-tree) configuration ───────────────────────────
+export async function getStationAutoSlots(orderNo) {
+  return request('GET', `/hw-config/station-auto-slots/${encodeURIComponent(orderNo)}`);
+}
+export async function listStationAutoSlots() {
+  return request('GET', `/hw-config/station-auto-slots`);
+}
+export async function saveStationAutoSlots(orderNo, config) {
+  return request('PUT', `/hw-config/station-auto-slots/${encodeURIComponent(orderNo)}`, config);
+}
+export async function deleteStationAutoSlots(orderNo) {
+  return request('DELETE', `/hw-config/station-auto-slots/${encodeURIComponent(orderNo)}`);
+}
+export async function captureStationAutoSlotsFromCfg(cfgFile) {
+  const fd = new FormData();
+  fd.append('cfg', cfgFile);
+  return request('POST', `/hw-config/station-auto-slots/from-cfg`, fd, true);
+}
+// ── Slot Default Subslots (a slot-category catalogue device's own default subslot tree) ──
+export async function getSlotDefaultSubslots(orderNo) {
+  return request('GET', `/hw-config/slot-default-subslots/${encodeURIComponent(orderNo)}`);
+}
+export async function saveSlotDefaultSubslots(orderNo, subslots) {
+  return request('PUT', `/hw-config/slot-default-subslots/${encodeURIComponent(orderNo)}`, { subslots });
 }
 export async function generateHwCfg(importId, options = {}) {
   return request('POST', `/hw-config/imports/${importId}/generate`, options);
@@ -744,6 +786,35 @@ export async function updateHwFieldbus(id, data) {
 }
 export async function deleteHwFieldbus(id) {
   return request('DELETE', `/hw-fieldbuses/${id}`);
+}
+
+// ── Catalogue Export / Import (Templates + Slot Compat + Signal Types + Parameters) ─────
+// Triggers a browser download of the full catalogue as a JSON file.
+export async function downloadCatalogueExport() {
+  const res = await fetch(`${BASE}/hw-config/catalogue/export`);
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `HTTP ${res.status}`);
+  }
+  const blob = await res.blob();
+  const cd = res.headers.get('Content-Disposition') || '';
+  const fnMatch = cd.match(/filename="?([^"]+)"?/);
+  const filename = fnMatch ? fnMatch[1] : `catalogue-export-${Date.now()}.json`;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
+// Returns { token, templates: {summary, items}, slotCompat: {summary, items}, signalTypes: {summary, items}, meta }
+export async function previewCatalogueImport(file) {
+  const fd = new FormData();
+  fd.append('file', file);
+  return request('POST', '/hw-config/catalogue/import/preview', fd, true);
+}
+
+export async function commitCatalogueImport(token, selectedTemplateIds, selectedSlotCompatIds, selectedSignalTypes) {
+  return request('POST', '/hw-config/catalogue/import/commit', { token, selectedTemplateIds, selectedSlotCompatIds, selectedSignalTypes });
 }
 
 // ── Slot ↔ Subslot Compatibility ─────────────────────────────────────────────

@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import './InstancesGrid.css';
 import './StationAutoSlotsEditor.css';
+import { listStationAutoSlots, getStationAutoSlots, saveStationAutoSlots, captureStationAutoSlotsFromCfg } from './api';
 
 /**
  * Hierarchical editor for configuring auto-slot JSON for stations
@@ -41,9 +42,7 @@ export default function StationAutoSlotsEditor({ station, catalogue: preloadedCa
   async function loadStations() {
     try {
       setLoading(true);
-      const response = await fetch('/api/hw-config/station-auto-slots');
-      if (!response.ok) throw new Error('Failed to load stations');
-      const data = await response.json();
+      const data = await listStationAutoSlots();
       setStations(data);
       setError('');
     } catch (err) {
@@ -56,14 +55,32 @@ export default function StationAutoSlotsEditor({ station, catalogue: preloadedCa
   async function loadConfig(orderNo) {
     try {
       setLoading(true);
-      const response = await fetch(`/api/hw-config/station-auto-slots/${encodeURIComponent(orderNo)}`);
-      if (!response.ok) throw new Error('Failed to load configuration');
-      const data = await response.json();
+      const data = await getStationAutoSlots(orderNo);
       setConfig(data.config || { slots: [], rules: {} });
       setError('');
     } catch (err) {
       setError(`Error loading config: ${err.message}`);
       setConfig({ slots: [], rules: {} });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // "Capture from CFG" — parses an uploaded single-station CFG with the same
+  // generic catalogue parser used for module-templates import, and (re)seeds
+  // hw_station_auto_slots + hw_default_children for every station head found.
+  async function captureFromCfg(file) {
+    if (!file) return;
+    try {
+      setLoading(true);
+      const result = await captureStationAutoSlotsFromCfg(file);
+      setSuccess(`Captured default tree for: ${(result.captured || []).join(', ') || '(none)'}`);
+      setTimeout(() => setSuccess(''), 4000);
+      setError('');
+      await loadStations();
+      if (selectedStation) await loadConfig(selectedStation);
+    } catch (err) {
+      setError(`Error capturing from CFG: ${err.message}`);
     } finally {
       setLoading(false);
     }
@@ -191,16 +208,7 @@ export default function StationAutoSlotsEditor({ station, catalogue: preloadedCa
 
     try {
       setLoading(true);
-      const response = await fetch(
-        `/api/hw-config/station-auto-slots/${encodeURIComponent(selectedStation)}`,
-        {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(config)
-        }
-      );
-
-      if (!response.ok) throw new Error('Failed to save configuration');
+      await saveStationAutoSlots(selectedStation, config);
       setSuccess('Configuration saved successfully!');
       setTimeout(() => setSuccess(''), 3000);
       setError('');
@@ -481,6 +489,20 @@ export default function StationAutoSlotsEditor({ station, catalogue: preloadedCa
               </option>
             ))}
           </select>
+          <label className="btn btn-secondary" style={{ marginTop: 10, display: 'inline-block', cursor: 'pointer' }}>
+            Capture from CFG…
+            <input
+              type="file"
+              accept=".cfg,.txt"
+              style={{ display: 'none' }}
+              disabled={loading}
+              onChange={(e) => {
+                const file = e.target.files && e.target.files[0];
+                e.target.value = '';
+                if (file) captureFromCfg(file);
+              }}
+            />
+          </label>
         </div>
 
         {selectedStation && config && (

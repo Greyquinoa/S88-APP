@@ -55,7 +55,7 @@ const BLANK_MAPPING_ROW = () => ({
 
 // Grid template shared by the mapping table's header and body rows, so the
 // columns cannot drift apart.
-const MAP_COLS = '1fr 180px 110px 80px 40px';
+const MAP_COLS = '1fr 1fr 1fr 1fr 40px';
 
 // Module scope, not component scope: as a component-level object literal this is
 // rebuilt every render, which gives every useCallback that closes over it a new
@@ -881,14 +881,11 @@ export default function StepEphEmImport({ projectId, onComplete }) {
                     No mappings yet — click "Add mapping" to start
                   </EmptyState>
                 ) : (
-                  <div style={{ border: '1px solid rgba(28,27,25,0.08)', borderRadius: '12px',
-                      overflow: 'hidden', background: '#FBFAF7',
-                      boxShadow: '0 1px 0 rgba(0,0,0,0.02), 0 14px 30px -18px rgba(28,27,25,0.18)',
-                      marginBottom: '1rem' }}>
+                  <div style={{ border: '1px solid rgba(28,27,25,0.08)', borderRadius: '12px', overflow: 'hidden', background: '#FBFAF7', boxShadow: '0 1px 0 rgba(0,0,0,0.02), 0 14px 30px -18px rgba(28,27,25,0.18)', marginBottom: '1rem' }}>
                     <div style={{
-                      ...panelHeaderSx,
                       display: 'grid', gridTemplateColumns: MAP_COLS, gap: 12,
-                      padding: '10px 16px',
+                      padding: '10px 16px', background: '#FBF8F0',
+                      borderBottom: '1px solid rgba(28,27,25,0.08)',
                     }}>
                       {['TYPE COLUMN', 'COMPOSITE TYPE', 'MATCH MODE', 'PRIORITY', ''].map((h, i) => (
                         <div key={i} style={{ fontSize: 12, fontWeight: 600, textTransform: 'uppercase',
@@ -901,7 +898,7 @@ export default function StepEphEmImport({ projectId, onComplete }) {
                       <div key={i} style={{ display: 'grid', gridTemplateColumns: MAP_COLS, gap: 12,
                           padding: '10px 16px', alignItems: 'center',
                           borderBottom: '1px solid rgba(28,27,25,0.08)',
-                          background: i % 2 === 0 ? '#FFFFFF' : '#FBF8F0' }}>
+                          background: '#FFFFFF' }}>
                         <div style={{ display: 'flex', borderRight: '1px solid rgba(28,27,25,0.08)', paddingRight: '12px' }}>
                           <input value={m.type_column}
                             onChange={e => updateMappingRow(i, 'type_column', e.target.value.toUpperCase())}

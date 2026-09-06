@@ -21,6 +21,116 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 
 
 function err(res, code, msg, extra) { return res.status(code).json({ error: msg, ...(extra || {}) }); }
 
+// ── Generic default-tree helpers (hw_default_children) ───────────────────────
+// Family-free: driven entirely by parent_order_no/position rows captured from
+// catalogue CFGs (via cfgCatalogueParser + bulk-upsert auto-seed, or the
+// station-auto-slots CRUD below). Same lookup at every depth: station head
+// order_no → slot rows; a slot's own order_no → its subslot rows.
+
+// First slot number a user may add for this station head order_no — one past
+// the highest is_autocreated (fixed/shipped) slot position. Generic replacement
+// for any hardcoded "reserved slots" constant.
+async function firstAddableSlot(db, headOrderNo) {
+  if (!headOrderNo) return 1;
+  const rows = await db.prepare(
+    `SELECT position FROM hw_default_children WHERE parent_order_no=? AND position_kind='slot' AND is_autocreated=TRUE`
+  ).all(headOrderNo);
+  if (!rows.length) return 1;
+  return Math.max(...rows.map(r => r.position)) + 1;
+}
+
+// Materialize a station head's default slot/subslot tree into hw_slot_subslots
+// (subslot_no NULL = the slot's own identity row). Additive/idempotent — safe to
+// call even when the head has no hw_default_children rows (no-op). Does NOT touch
+// hw_signals; slot module assignment for rendering purposes remains as-is.
+async function materializeDefaultTree(db, importId, addr, headOrderNo) {
+  if (!headOrderNo) return;
+  const slotRows = await db.prepare(
+    `SELECT position AS slot, child_order_no, hw_category, label
+     FROM hw_default_children WHERE parent_order_no=? AND position_kind='slot' ORDER BY position`
+  ).all(headOrderNo);
+  for (const s of slotRows) {
+    await db.prepare(
+      `INSERT INTO hw_slot_subslots (hw_import_id, station_address, slot, subslot_no, child_order_no, hw_category, label)
+       VALUES (?,?,?,NULL,?,?,?)
+       ON CONFLICT (hw_import_id, station_address, slot) WHERE subslot_no IS NULL
+       DO UPDATE SET child_order_no=EXCLUDED.child_order_no, hw_category=EXCLUDED.hw_category, label=EXCLUDED.label`
+    ).run(importId, addr, s.slot, s.child_order_no, s.hw_category, s.label);
+
+    await materializeSlotDefaultSubslots(db, importId, addr, s.slot, s.child_order_no);
+  }
+}
+
+// Materialize a single slot's own default subslot tree (hw_default_children keyed by the
+// slot's own order_no as parent_order_no/position_kind='subslot') into hw_slot_subslots for
+// one real station instance. Shared by materializeDefaultTree (station-level, above) and
+// station-creation from an Excel/IO-list import (upload-iolist, below), where slots come
+// from the sheet itself rather than a station-level hw_default_children tree.
+// Non-autocreated children get pa_profile set too, matching onSaveSlotSubslotProfile's own
+// insert shape — this is what makes the project HW Config screen show the default profile as
+// already selected (and still user-replaceable via its existing uncheck/reselect UI), not
+// just "known" to the catalogue. Every default child is written, Service/AUTOCREATED ones
+// included: the HW Config grid renders subslot rows from this table, so a position with no
+// row here is a position the user cannot see.
+async function materializeSlotDefaultSubslots(db, importId, addr, slotNo, slotOrderNo) {
+  if (!slotOrderNo) return;
+  const subRows = await db.prepare(
+    `SELECT position AS subslot_no, child_order_no, hw_category, label, is_autocreated
+     FROM hw_default_children WHERE parent_order_no=? AND position_kind='subslot' ORDER BY position`
+  ).all(slotOrderNo);
+  for (const ss of subRows) {
+    await db.prepare(
+      `INSERT INTO hw_slot_subslots (hw_import_id, station_address, slot, subslot_no, child_order_no, hw_category, label, pa_profile)
+       VALUES (?,?,?,?,?,?,?,?)
+       ON CONFLICT (hw_import_id, station_address, slot, subslot_no) DO UPDATE SET
+         child_order_no=EXCLUDED.child_order_no, hw_category=EXCLUDED.hw_category, label=EXCLUDED.label,
+         pa_profile=EXCLUDED.pa_profile`
+    ).run(importId, addr, slotNo, ss.subslot_no, ss.child_order_no, ss.hw_category, ss.label,
+      ss.is_autocreated ? null : ss.child_order_no);
+  }
+}
+
+// Explode a station-auto-slots JSON config ({slots:[{slot,order_no,label,subslots:[...]}]})
+// into hw_default_children rows for headOrderNo. Family-free — driven purely by the
+// config's own order_no/position fields plus each order_no's catalogue is_autocreated flag.
+async function explodeConfigIntoDefaultChildren(db, headOrderNo, config) {
+  if (!headOrderNo || !config || !Array.isArray(config.slots)) return;
+  const tplRows = await db.prepare('SELECT order_no, is_autocreated FROM hw_module_templates').all();
+  const autoMap = new Map(tplRows.map(t => [t.order_no, !!t.is_autocreated]));
+
+  for (const slot of config.slots) {
+    if (slot.slot == null) continue;
+    const slotOrderNo = slot.order_no || `${headOrderNo}::slot${slot.slot}`;
+    await db.prepare(
+      `INSERT INTO hw_default_children (parent_order_no, position, position_kind, child_order_no, hw_category, is_autocreated, label, sort_order)
+       VALUES (?, ?, 'slot', ?, 'slot', ?, ?, ?)
+       ON CONFLICT (parent_order_no, position_kind, position) DO UPDATE SET
+         child_order_no=EXCLUDED.child_order_no, is_autocreated=EXCLUDED.is_autocreated,
+         label=EXCLUDED.label, sort_order=EXCLUDED.sort_order`
+    ).run(headOrderNo, slot.slot, slotOrderNo, autoMap.get(slot.order_no) || false, slot.label || null, slot.slot);
+
+    const subslots = Array.isArray(slot.subslots) ? slot.subslots : [];
+    await explodeSubslotsIntoDefaultChildren(db, slotOrderNo, subslots, autoMap);
+  }
+}
+
+// Write hw_default_children subslot rows for a single parent (a slot's own order_no).
+// Shared by explodeConfigIntoDefaultChildren (per-slot, station-nested config) and the
+// slot-category auto-seed path in POST /module-templates/bulk-upsert.
+async function explodeSubslotsIntoDefaultChildren(db, parentOrderNo, subslots, autoMap) {
+  if (!parentOrderNo || !Array.isArray(subslots)) return;
+  for (const ss of subslots) {
+    if (ss.subslot == null || !ss.order_no) continue;
+    await db.prepare(
+      `INSERT INTO hw_default_children (parent_order_no, position, position_kind, child_order_no, hw_category, is_autocreated, label, sort_order)
+       VALUES (?, ?, 'subslot', ?, 'subslot', ?, ?, ?)
+       ON CONFLICT (parent_order_no, position_kind, position) DO UPDATE SET
+         child_order_no=EXCLUDED.child_order_no, is_autocreated=EXCLUDED.is_autocreated,
+         label=EXCLUDED.label, sort_order=EXCLUDED.sort_order`
+    ).run(parentOrderNo, ss.subslot, ss.order_no, autoMap.get(ss.order_no) || false, ss.label || ss.port_label || null, ss.subslot);
+  }
+}
+
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
 // GET /utils/hex-to-ip?hex=C0A81B0A
@@ -336,14 +446,14 @@ router.post('/module-templates/bulk-upsert', async (req, res) => {
     const insSql = db.prepare(`INSERT INTO hw_module_templates
       (order_no, display_name, family, signal_type, channel_count, input_bytes, output_bytes,
        in_addr_fmt, out_addr_fmt, param_template, version, gsdml_file, dap_id, hw_category, subslot_defaults, port_config,
-       in_identifier, out_identifier, mlfb)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+       in_identifier, out_identifier, mlfb, is_autocreated, is_removable)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
 
     const updSql = db.prepare(`UPDATE hw_module_templates SET
       display_name=?, family=?, signal_type=?, channel_count=?,
       input_bytes=?, output_bytes=?, in_addr_fmt=?, out_addr_fmt=?,
       param_template=?, version=?, gsdml_file=?, dap_id=?, hw_category=?, subslot_defaults=?, port_config=?,
-      in_identifier=?, out_identifier=?, mlfb=?
+      in_identifier=?, out_identifier=?, mlfb=?, is_autocreated=?, is_removable=?
       WHERE order_no=? AND (hw_category IS NOT DISTINCT FROM ? OR hw_category=?)`);
 
     let paramRows = 0;   // ADDITIVE: count of normalized parameter rows written
@@ -370,6 +480,7 @@ router.post('/module-templates/bulk-upsert', async (req, res) => {
           d.param_template || null, d.version || null, d.gsdml_file || null, d.dap_id || null,
           d.hw_category || null, d.subslot_defaults || null, d.port_config || null,
           inIdent, outIdent, d.mlfb || null,
+          !!d.is_autocreated, d.is_removable === undefined ? true : !!d.is_removable,
         ];
 
         // Resolve the template id (existing on overwrite, or the new insert's rowid)
@@ -405,8 +516,72 @@ router.post('/module-templates/bulk-upsert', async (req, res) => {
     });
 
     await upsert(devices);
-    console.log(`[Catalogue] bulk-upsert: added=${added} overwritten=${overwritten} skipped=${skipped} paramRows=${paramRows}`);
-    res.json({ ok: true, added, overwritten, skipped, paramRows });
+
+    // ── Auto-seed hw_station_auto_slots from the CFG's parsed slot/subslot tree ──
+    // Only seeds stations that don't already have a config, so a user's hand-edited
+    // Auto-Slots Config is never overwritten by a re-import.
+    let autoSlotsSeeded = 0;
+    for (const d of devices) {
+      if (d.action === 'skip' || d.hw_category !== 'station' || !d.auto_slots_seed) continue;
+      try {
+        const existingAutoSlots = await db.prepare('SELECT id FROM hw_station_auto_slots WHERE order_no=?').get(d.order_no);
+        if (existingAutoSlots) continue;
+        const seedConfig = JSON.parse(d.auto_slots_seed);
+        if (!seedConfig.rules) seedConfig.rules = {};
+        await inferAutoSlotTypes(db, seedConfig);
+        await db.prepare('INSERT INTO hw_station_auto_slots (order_no, auto_slots_config) VALUES (?, ?)')
+          .run(d.order_no, JSON.stringify(seedConfig));
+        await explodeConfigIntoDefaultChildren(db, d.order_no, seedConfig);
+        autoSlotsSeeded++;
+      } catch (seedErr) {
+        console.warn(`[Catalogue] Auto-slot seed skipped for ${d.order_no}:`, seedErr.message);
+      }
+    }
+
+    // ── Auto-seed a slot's own default subslot tree (hw_default_children) ───────
+    // Parallel to the station seed above, one level shallower — a slot's function
+    // subslots + trailing Service module. Only seeds slots with no existing subslot
+    // rows, so a user's hand-edited config is never overwritten by a re-import.
+    for (const d of devices) {
+      if (d.action === 'skip' || d.hw_category !== 'slot' || !d.default_subslots_seed) continue;
+      try {
+        const seedConfig = JSON.parse(d.default_subslots_seed);
+        const tplRows = await db.prepare('SELECT order_no, is_autocreated FROM hw_module_templates').all();
+        const autoMap = new Map(tplRows.map(t => [t.order_no, !!t.is_autocreated]));
+
+        const existingSubslots = await db.prepare(
+          `SELECT id FROM hw_default_children WHERE parent_order_no=? AND position_kind='subslot' LIMIT 1`
+        ).get(d.order_no);
+        if (!existingSubslots) {
+          await explodeSubslotsIntoDefaultChildren(db, d.order_no, seedConfig.subslots, autoMap);
+        }
+
+        // Register the non-Service (user-selectable) function subslot(s) as compat options
+        // for this slot, so the project HW Config screen's PA-profile dropdown (sourced from
+        // hw_slot_subslot_compat) has something to offer. Independent of the hw_default_children
+        // guard above (idempotent via ON CONFLICT DO NOTHING) — a slot whose default tree was
+        // captured before this seeding existed must still get its compat rows backfilled on
+        // the next re-import.
+        // The Service module is identified positionally (highest subslot number, same rule
+        // cfgCatalogueParser itself uses to flag it) rather than via hw_module_templates'
+        // is_autocreated — that order_no is shared/reused across many different device
+        // profiles' CFG blocks, and it is not AUTOCREATED at every one of them, so the
+        // catalogue-wide flag isn't a reliable signal for "is this THIS slot's Service row."
+        const subslots = seedConfig.subslots || [];
+        const maxPos = subslots.length > 1 ? Math.max(...subslots.map(s => s.subslot)) : null;
+        for (const ss of subslots) {
+          if (!ss.order_no || ss.subslot === maxPos) continue; // skip trailing Service position
+          await db.prepare(
+            'INSERT INTO hw_slot_subslot_compat (slot_order_no, subslot_order_no, is_default) VALUES (?,?,false) ON CONFLICT (slot_order_no, subslot_order_no) DO NOTHING'
+          ).run(d.order_no, ss.order_no);
+        }
+      } catch (seedErr) {
+        console.warn(`[Catalogue] Default-subslots seed skipped for ${d.order_no}:`, seedErr.message);
+      }
+    }
+
+    console.log(`[Catalogue] bulk-upsert: added=${added} overwritten=${overwritten} skipped=${skipped} paramRows=${paramRows} autoSlotsSeeded=${autoSlotsSeeded}`);
+    res.json({ ok: true, added, overwritten, skipped, paramRows, autoSlotsSeeded });
   } catch (e) { err(res, 500, e.message); }
 });
 
@@ -605,22 +780,40 @@ router.post('/imports/:id/backfill-from-cfg', upload.single('cfg'), async (req, 
     }
 
     // Load template catalogue so we can resolve signal_type from order_no
-    const tplRows = await db.prepare('SELECT order_no, signal_type FROM hw_module_templates').all();
+    const tplRows = await db.prepare(
+      'SELECT order_no, signal_type, input_bytes, output_bytes, channel_count FROM hw_module_templates'
+    ).all();
     const tplMap  = new Map(tplRows.map(t => [t.order_no, t]));
+
+    // SYMBOL lines in a CFG carry the channel's byte offset, not its 0-based index
+    // (e.g. a 4-channel AI module: offsets 0,2,4,6). The renderer's buildSymbolLines
+    // does the opposite conversion (index * bytesPerChannel) when generating, so a
+    // backfilled signal must store the index it expects, or re-generation drifts.
+    function byteOffsetToChannelIndex(tpl, byteOffset) {
+      if (byteOffset == null) return null;
+      const totalBytes = tpl ? (tpl.input_bytes > 0 ? tpl.input_bytes : (tpl.output_bytes || 0)) : 0;
+      const channelCount = tpl ? (tpl.channel_count || 0) : 0;
+      const bytesPerCh = channelCount > 0 ? totalBytes / channelCount : 0;
+      return bytesPerCh >= 1 ? Math.round(byteOffset / bytesPerCh) : byteOffset;
+    }
 
     const insertSignal = db.prepare(`
       INSERT INTO hw_signals
         (hw_import_id, station_address, station_name, ip_address, router_address, as_assignment,
-         subsystem_no, slot, module_order_no, module_name, signal_type,
-         pip_no, potential_group, tag, description, station_mlfb)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+         subsystem_no, slot, subslot_no, module_order_no, module_name, signal_type,
+         pip_no, potential_group, tag, description, station_mlfb, channel)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
 
     const insertSubslot = db.prepare(`
       INSERT INTO hw_slot_subslots
-        (hw_import_id, station_address, slot, subslot_no, pa_profile)
-      VALUES (?,?,?,?,?)
+        (hw_import_id, station_address, slot, subslot_no, pa_profile, child_order_no, label, pip_no, local_address)
+      VALUES (?,?,?,?,?,?,?,?,?)
       ON CONFLICT (hw_import_id, station_address, slot, subslot_no) DO UPDATE SET
-        pa_profile = EXCLUDED.pa_profile`);
+        pa_profile     = EXCLUDED.pa_profile,
+        child_order_no = EXCLUDED.child_order_no,
+        label          = EXCLUDED.label,
+        pip_no         = EXCLUDED.pip_no,
+        local_address  = EXCLUDED.local_address`);
 
     let stationCount = 0;
     let slotCount    = 0;
@@ -634,19 +827,27 @@ router.post('/imports/:id/backfill-from-cfg', upload.single('cfg'), async (req, 
 
         // Slot 0 = IM/interface module — insert a row so the grid can resolve
         // Device Family and Order Number.
+        // Slot 0 can carry its own order_no distinct from the device header's
+        // (e.g. CFU_PA: head "V_2_0_PA:..." vs slot 0 "V_2_0_PA_ETER:...") — prefer
+        // slot 0's own catalogue-valid order_no when it exists, falling back to the
+        // header's for devices where they're identical (ET200SP, IO-Link).
         // For GSDML-based devices the header orderNo is the GSDML filename which
         // won't match the catalogue.  Use mlfbNo (from the SLOT 0 MLFB field)
         // as the effective key instead — it holds the real Siemens order number.
-        const slot0OrderNo = (dev.mlfbNo && !tplMap.has(dev.orderNo))
-          ? dev.mlfbNo
+        const slot0Rec = dev.slots.find(s => s.slot === 0);
+        const slot0CatalogueOrderNo = (slot0Rec && slot0Rec.orderNo && tplMap.has(slot0Rec.orderNo))
+          ? slot0Rec.orderNo
           : dev.orderNo;
+        const slot0OrderNo = (dev.mlfbNo && !tplMap.has(slot0CatalogueOrderNo))
+          ? dev.mlfbNo
+          : slot0CatalogueOrderNo;
         await insertSignal.run(
           importId,
           dev.address, dev.name, dev.ip, dev.routerAddress, dev.asAssignment || null,
-          dev.subsystemNo, 0,
+          dev.subsystemNo, 0, null,
           slot0OrderNo, dev.name,
           null, null, null, null, null,
-          dev.mlfbNo || null,
+          dev.mlfbNo || null, null,
         );
 
         for (const slot of dev.slots) {
@@ -665,26 +866,28 @@ router.post('/imports/:id/backfill-from-cfg', upload.single('cfg'), async (req, 
               await insertSignal.run(
                 importId,
                 dev.address, dev.name, dev.ip, dev.routerAddress, dev.asAssignment || null,
-                dev.subsystemNo, slot.slot,
+                dev.subsystemNo, slot.slot, null,
                 slot.orderNo, slot.name,
                 signalType,
                 slot.pipNo, slot.potentialGroup,
                 null, null,
-                slot.mlfb || null,
+                slot.mlfb || null, null,
               );
               slotCount++;
             } else {
-              // Insert one row per SYMBOL (channel-level tag data)
+              // Insert one row per SYMBOL (channel-level tag data). `channel` is the
+              // symbol's own byte offset from the CFG (SYMBOL I|O, <offset>, tag, desc)
+              // — carrying it through keeps regeneration ordering/addressing lossless.
               for (const sym of slot.symbols) {
                 await insertSignal.run(
                   importId,
                   dev.address, dev.name, dev.ip, dev.routerAddress, dev.asAssignment || null,
-                  dev.subsystemNo, slot.slot,
+                  dev.subsystemNo, slot.slot, null,
                   slot.orderNo, slot.name,
                   signalType,
                   slot.pipNo, slot.potentialGroup,
                   sym.tag || null, sym.description || null,
-                  slot.mlfb || null,
+                  slot.mlfb || null, byteOffsetToChannelIndex(tpl, sym.channel),
                 );
               }
               slotCount++;
@@ -693,7 +896,30 @@ router.post('/imports/:id/backfill-from-cfg', upload.single('cfg'), async (req, 
 
           // Subslots for all slots including slot 0
           for (const ss of slot.subslots) {
-            await insertSubslot.run(importId, dev.address, slot.slot, ss.subslotNo, ss.orderNo || null);
+            await insertSubslot.run(
+              importId, dev.address, slot.slot, ss.subslotNo,
+              ss.orderNo || null, ss.orderNo || null, ss.name || null, ss.pipNo ?? null,
+              ss.localAddress ?? null,
+            );
+
+            // Subslot-level SYMBOL lines (e.g. IO-Link port channels, PA subslot
+            // signals) were previously dropped entirely — emit one hw_signals row
+            // per symbol, tagged with subslot_no so it doesn't collide with the
+            // parent slot's own rows.
+            const ssTpl        = tplMap.get(ss.orderNo);
+            const ssSignalType = ssTpl ? ssTpl.signal_type : null;
+            for (const sym of (ss.symbols || [])) {
+              await insertSignal.run(
+                importId,
+                dev.address, dev.name, dev.ip, dev.routerAddress, dev.asAssignment || null,
+                dev.subsystemNo, slot.slot, ss.subslotNo,
+                ss.orderNo || slot.orderNo, ss.name || slot.name,
+                ssSignalType,
+                ss.pipNo, ss.potentialGroup,
+                sym.tag || null, sym.description || null,
+                slot.mlfb || null, byteOffsetToChannelIndex(ssTpl, sym.channel),
+              );
+            }
           }
         }
       }
@@ -1110,6 +1336,17 @@ router.post('/imports/:id/upload-iolist', upload.single('iolist'), async (req, r
           s.station_mlfb, true, false, s.as_assignment || null
         );
       }
+    }
+
+    // Additive: materialize each newly-created slot's own default subslot tree (a PA-profile
+    // slot's default function profile + Service module) into hw_slot_subslots, generically,
+    // from hw_default_children. No-op for slots with no such catalogue seed captured.
+    const newSlots = await db.prepare(
+      `SELECT DISTINCT station_address, slot, module_order_no FROM hw_signals
+       WHERE hw_import_id=? AND slot >= 1 AND module_order_no IS NOT NULL`
+    ).all(importId);
+    for (const s of newSlots) {
+      await materializeSlotDefaultSubslots(db, importId, s.station_address, s.slot, s.module_order_no);
     }
 
     await db.prepare('UPDATE hw_imports SET excel_name=?, status=? WHERE id=?')
@@ -1779,21 +2016,41 @@ router.get('/imports/:id/stations', async (req, res) => {
 
     // Load per-subslot profiles
     const subslotRows = await db.prepare(
-      `SELECT station_address, slot, subslot_no, pa_profile
+      `SELECT station_address, slot, subslot_no, pa_profile, child_order_no, hw_category, label
        FROM hw_slot_subslots WHERE hw_import_id=? ORDER BY station_address, slot, subslot_no`
     ).all(importId);
 
-    // Build subslot map: Map<"addr:slot", [{subslotNo, paProfile}]>
+    // Resolve orderNo + family per station from slot 0 row
+    const tplRows = await db.prepare('SELECT order_no, family, display_name, hw_category, is_removable FROM hw_module_templates').all();
+    const tplMap  = new Map(tplRows.map(t => [t.order_no, t]));
+
+    // Generic default-tree lookup: is a given (parent_order_no, position_kind, position)
+    // fixed/AUTOCREATED per the catalogue? Family-free — same map serves slot and subslot
+    // depth (ground-truth rule 2/3: the recursive default-tree model).
+    const defaultChildRows = await db.prepare(
+      `SELECT parent_order_no, position_kind, position, is_autocreated FROM hw_default_children`
+    ).all();
+    const defaultChildMap = new Map(
+      defaultChildRows.map(r => [`${r.parent_order_no}::${r.position_kind}::${r.position}`, !!r.is_autocreated])
+    );
+    const isAutocreatedAt = (parentOrderNo, positionKind, position) =>
+      !!parentOrderNo && !!defaultChildMap.get(`${parentOrderNo}::${positionKind}::${position}`);
+
+    // Build subslot map: Map<"addr:slot", [{subslotNo, paProfile, childOrderNo, hwCategory, label, isAutocreated}]>
+    // isAutocreated is resolved once station orderNos are known (needs the slot's own
+    // order_no as the subslot's parent), so fill it in below after stationMap/slots exist.
     const subslotMap = new Map();
     for (const r of subslotRows) {
       const key = `${r.station_address}:${r.slot}`;
       if (!subslotMap.has(key)) subslotMap.set(key, []);
-      subslotMap.get(key).push({ subslotNo: r.subslot_no, paProfile: r.pa_profile || null });
+      subslotMap.get(key).push({
+        subslotNo:   r.subslot_no,
+        paProfile:   r.pa_profile || null,
+        childOrderNo: r.child_order_no || r.pa_profile || null,
+        hwCategory:  r.hw_category || null,
+        label:       r.label || null,
+      });
     }
-
-    // Resolve orderNo + family per station from slot 0 row
-    const tplRows = await db.prepare('SELECT order_no, family, display_name FROM hw_module_templates').all();
-    const tplMap  = new Map(tplRows.map(t => [t.order_no, t]));
 
     const slot0Rows = await db.prepare(
       `SELECT station_address, MIN(module_order_no) AS module_order_no FROM hw_signals
@@ -1826,15 +2083,31 @@ router.get('/imports/:id/stations', async (req, res) => {
     }
     for (const row of signals) {
       const st = stationMap.get(row.station_address);
-      if (st) st.slots.push({
+      if (!st) continue;
+      const tpl = tplMap.get(row.module_order_no);
+      // Subslots of this slot are family-free "children" — resolve each one's
+      // isAutocreated against hw_default_children using THIS slot's own order_no
+      // as the parent (recursive default-tree lookup, ground-truth rule 2/3).
+      const subslots = (subslotMap.get(`${row.station_address}:${row.slot}`) || []).map(ss => ({
+        ...ss,
+        hwCategory:   ss.hwCategory || (tplMap.get(ss.childOrderNo)?.hw_category) || null,
+        isAutocreated: isAutocreatedAt(row.module_order_no, 'subslot', ss.subslotNo),
+      }));
+      st.slots.push({
         slot:           row.slot,
         orderNo:        row.module_order_no,
+        childOrderNo:   row.module_order_no,
         name:           row.module_name,
         signalCount:    row.signal_count,
         pipNo:          row.pip_no != null ? row.pip_no : null,
         potentialGroup: row.potential_group != null ? row.potential_group : null,
         paProfile:      row.pa_profile != null ? row.pa_profile : null,
-        subslots:       subslotMap.get(`${row.station_address}:${row.slot}`) || [],
+        hwCategory:     tpl?.hw_category || null,
+        isRemovable:    tpl ? !!tpl.is_removable : true,
+        // Fixed/AUTOCREATED slot ⇒ locked, never user-addable/removable — resolved
+        // against the station head's own default-tree row for this slot position.
+        isAutocreated:  isAutocreatedAt(st.orderNo, 'slot', row.slot),
+        subslots,
       });
     }
 
@@ -2050,7 +2323,9 @@ router.patch('/imports/:id/stations/:addr/slots/:slot/pip', async (req, res) => 
   } catch (e) { err(res, 500, e.message); }
 });
 
-// PATCH /imports/:id/stations/:addr/slots/:slot/pa-profile — set PA subslot-1 profile for a CFU_PA device slot
+// PATCH /imports/:id/stations/:addr/slots/:slot/pa-profile — set PA subslot-1 profile for a device slot
+// Generic: legal on any node whose module has known hw_slot_subslot_compat children —
+// no family gate.
 router.patch('/imports/:id/stations/:addr/slots/:slot/pa-profile', async (req, res) => {
   try {
     const db       = getDb();
@@ -2059,10 +2334,12 @@ router.patch('/imports/:id/stations/:addr/slots/:slot/pa-profile', async (req, r
     const slot     = parseInt(req.params.slot, 10);
     const { paProfile } = req.body;
 
-    // Validate against catalogue: must be a known subslot template in the same CFU_PA family
-    const known = await db.prepare(
-      "SELECT order_no FROM hw_module_templates WHERE order_no=? AND hw_category='subslot' AND family='CFU_PA'"
-    ).get(paProfile);
+    // Validate against catalogue: must be a known subslot template, generically
+    // (any hw_category='subslot' order_no — the compat table further narrows this
+    // per parent when available; here we accept any catalogued subslot type).
+    const known = paProfile
+      ? await db.prepare("SELECT order_no FROM hw_module_templates WHERE order_no=? AND hw_category='subslot'").get(paProfile)
+      : null;
     const val = (paProfile && known) ? paProfile : null;
     await db.prepare(
       'UPDATE hw_signals SET pa_profile=? WHERE hw_import_id=? AND station_address=? AND slot=?'
@@ -2072,6 +2349,9 @@ router.patch('/imports/:id/stations/:addr/slots/:slot/pa-profile', async (req, r
 });
 
 // PATCH /imports/:id/stations/:addr/slots/:slot/subslots/:ssNo/pa-profile — set per-subslot PA profile
+// Legacy path — kept for existing frontend callers; see the generic
+// /subslots/:subslot route below for the recommended replacement, which also
+// updates hw_slot_subslots.child_order_no and validates against hw_slot_subslot_compat.
 router.patch('/imports/:id/stations/:addr/slots/:slot/subslots/:ssNo/pa-profile', async (req, res) => {
   try {
     const db       = getDb();
@@ -2082,15 +2362,83 @@ router.patch('/imports/:id/stations/:addr/slots/:slot/subslots/:ssNo/pa-profile'
     const { paProfile } = req.body;
 
     const known = paProfile
-      ? await db.prepare("SELECT order_no FROM hw_module_templates WHERE order_no=? AND hw_category='subslot' AND family='CFU_PA'").get(paProfile)
+      ? await db.prepare("SELECT order_no, display_name FROM hw_module_templates WHERE order_no=? AND hw_category='subslot'").get(paProfile)
       : null;
     const val = (paProfile && known) ? paProfile : null;
+    // `label` is denormalized display text; leaving it behind on a profile change
+    // makes the row (and the generated CFG) describe the previous profile.
+    const labelVal = (val && known && known.display_name) ? known.display_name : null;
 
     await db.prepare(
-      `INSERT INTO hw_slot_subslots (hw_import_id, station_address, slot, subslot_no, pa_profile)
-       VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT(hw_import_id, station_address, slot, subslot_no) DO UPDATE SET pa_profile=excluded.pa_profile`
-    ).run(importId, addr, slot, ssNo, val);
+      `INSERT INTO hw_slot_subslots (hw_import_id, station_address, slot, subslot_no, pa_profile, child_order_no, label)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(hw_import_id, station_address, slot, subslot_no) DO UPDATE SET
+         pa_profile=excluded.pa_profile, child_order_no=excluded.child_order_no, label=excluded.label`
+    ).run(importId, addr, slot, ssNo, val, val, labelVal);
+
+    res.json({ ok: true });
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// PATCH /imports/:id/stations/:addr/slots/:slot/subslots/:subslot — generic node replace.
+// Body: { child_order_no }. Validated against hw_slot_subslot_compat for the parent's own
+// order_no (looked up from the slot's own hw_slot_subslots identity row, or its
+// module_order_no when no identity row exists yet); refused when the current node is
+// is_autocreated (fixed/locked). This is the family-free replacement for the PA-profile-only
+// PATCH and any hardcoded per-family subslot-swap paths.
+router.patch('/imports/:id/stations/:addr/slots/:slot/subslots/:subslot', async (req, res) => {
+  try {
+    const db       = getDb();
+    const importId = parseInt(req.params.id,   10);
+    const addr     = parseInt(req.params.addr, 10);
+    const slot     = parseInt(req.params.slot, 10);
+    const subslot  = parseInt(req.params.subslot, 10);
+    const { child_order_no } = req.body;
+    if (!child_order_no) return err(res, 400, 'child_order_no required');
+
+    // Refuse when the current row is is_autocreated (fixed/locked node).
+    const current = await db.prepare(
+      'SELECT child_order_no, hw_category FROM hw_slot_subslots WHERE hw_import_id=? AND station_address=? AND slot=? AND subslot_no=?'
+    ).get(importId, addr, slot, subslot);
+    const currentDefault = current
+      ? await db.prepare(
+          `SELECT is_autocreated FROM hw_default_children
+           WHERE position_kind='subslot' AND position=? AND child_order_no=?`
+        ).get(subslot, current.child_order_no)
+      : null;
+    if (currentDefault && currentDefault.is_autocreated) {
+      return err(res, 400, 'This subslot is a fixed (AUTOCREATED) node and cannot be replaced.');
+    }
+
+    // Resolve the parent's own order_no (the slot's module) to validate compatibility.
+    const slotIdentity = await db.prepare(
+      `SELECT child_order_no FROM hw_slot_subslots WHERE hw_import_id=? AND station_address=? AND slot=? AND subslot_no IS NULL`
+    ).get(importId, addr, slot);
+    const slotSignal = await db.prepare(
+      'SELECT module_order_no FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=? LIMIT 1'
+    ).get(importId, addr, slot);
+    const parentOrderNo = (slotIdentity && slotIdentity.child_order_no) || (slotSignal && slotSignal.module_order_no) || null;
+
+    if (parentOrderNo) {
+      const compat = await db.prepare(
+        'SELECT id FROM hw_slot_subslot_compat WHERE slot_order_no=? AND subslot_order_no=?'
+      ).get(parentOrderNo, child_order_no);
+      if (!compat) {
+        return err(res, 400, `"${child_order_no}" is not a known compatible child for "${parentOrderNo}".`);
+      }
+    }
+
+    // `label` is denormalized display text; leaving it behind on a profile change
+    // makes the row (and the generated CFG) describe the previous profile.
+    const newTpl = await db.prepare(
+      "SELECT display_name FROM hw_module_templates WHERE order_no=? AND hw_category='subslot' LIMIT 1"
+    ).get(child_order_no);
+    await db.prepare(
+      `INSERT INTO hw_slot_subslots (hw_import_id, station_address, slot, subslot_no, child_order_no, pa_profile, label)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (hw_import_id, station_address, slot, subslot_no) DO UPDATE SET
+         child_order_no=EXCLUDED.child_order_no, pa_profile=EXCLUDED.pa_profile, label=EXCLUDED.label`
+    ).run(importId, addr, slot, subslot, child_order_no, child_order_no, (newTpl && newTpl.display_name) || null);
 
     res.json({ ok: true });
   } catch (e) { err(res, 500, e.message); }
@@ -2161,6 +2509,9 @@ router.post('/imports/:id/stations', async (req, res) => {
           );
         }
       }
+      // Additive: also materialize hw_slot_subslots identity/subslot rows from
+      // hw_default_children, generically (no family gate). No-op if none captured yet.
+      await materializeDefaultTree(db, importId, addr, imOrderNo);
     });
     await insertStation();
 
@@ -2220,12 +2571,12 @@ router.post('/imports/:id/stations/:addr/copy', async (req, res) => {
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
 
     const srcSubslots = await db.prepare(
-      'SELECT slot, subslot_no, pa_profile FROM hw_slot_subslots WHERE hw_import_id=? AND station_address=?'
+      'SELECT slot, subslot_no, pa_profile, child_order_no, hw_category, pip_no, label FROM hw_slot_subslots WHERE hw_import_id=? AND station_address=?'
     ).all(importId, srcAddr);
 
     const insSubslot = db.prepare(
-      `INSERT INTO hw_slot_subslots (hw_import_id, station_address, slot, subslot_no, pa_profile)
-       VALUES (?, ?, ?, ?, ?)
+      `INSERT INTO hw_slot_subslots (hw_import_id, station_address, slot, subslot_no, pa_profile, child_order_no, hw_category, pip_no, label)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (hw_import_id, station_address, slot, subslot_no) DO NOTHING`
     );
 
@@ -2238,7 +2589,7 @@ router.post('/imports/:id/stations/:addr/copy', async (req, res) => {
         );
       }
       for (const r of srcSubslots) {
-        await insSubslot.run(importId, newAddr, r.slot, r.subslot_no, r.pa_profile);
+        await insSubslot.run(importId, newAddr, r.slot, r.subslot_no, r.pa_profile, r.child_order_no, r.hw_category, r.pip_no, r.label);
       }
     });
     await copy();
@@ -2285,12 +2636,14 @@ router.post('/imports/:id/stations/:addr/slots', async (req, res) => {
 
     const slotNo = parseInt(slot, 10);
 
-    // CFU_PA: slots 0-2 are reserved system slots — only allow user slots ≥3
+    // Generic reserved-slot gate: derive the first addable slot number from this
+    // station head's hw_default_children (is_autocreated fixed slots), not a
+    // hardcoded family constant.
     const imRow = await db.prepare('SELECT module_order_no FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=0 LIMIT 1').get(importId, addr);
     if (imRow) {
-      const imTpl = await db.prepare('SELECT family FROM hw_module_templates WHERE order_no=?').get(imRow.module_order_no);
-      if (imTpl && imTpl.family === 'CFU_PA' && slotNo < 3) {
-        return err(res, 400, 'CFU_PA: Slots 0, 1, and 2 are reserved system slots. Add from Slot 3 onwards.');
+      const minSlot = await firstAddableSlot(db, imRow.module_order_no);
+      if (slotNo < minSlot) {
+        return err(res, 400, `Slots below ${minSlot} are reserved system slots for this station type. Add from Slot ${minSlot} onwards.`);
       }
     }
 
@@ -2360,15 +2713,13 @@ router.delete('/imports/:id/stations/:addr/slots/:slot', async (req, res) => {
       await db.prepare('DELETE FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=?').run(importId, addr, slot);
       await db.prepare('DELETE FROM hw_slot_subslots WHERE hw_import_id=? AND station_address=? AND slot=?').run(importId, addr, slot);
 
-      // Renumber remaining user slots to be contiguous.
-      // CFU_PA reserves slots 0-2 (head + DIQ8 + PA Master); all others start user slots at 1.
+      // Renumber remaining user slots to be contiguous. First user slot is derived
+      // generically from this station head's hw_default_children (fixed/reserved
+      // slots), not a hardcoded family constant.
       const imRow = await db.prepare(
         'SELECT module_order_no FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=0 LIMIT 1'
       ).get(importId, addr);
-      const imTpl = imRow
-        ? await db.prepare('SELECT family FROM hw_module_templates WHERE order_no=?').get(imRow.module_order_no)
-        : null;
-      const firstUser = (imTpl && imTpl.family === 'CFU_PA') ? 3 : 1;
+      const firstUser = imRow ? await firstAddableSlot(db, imRow.module_order_no) : 1;
 
       // Distinct user slot numbers still present, sorted ascending
       const userSlotRows = await db.prepare(
@@ -2401,51 +2752,73 @@ router.delete('/imports/:id/stations/:addr/slots/:slot', async (req, res) => {
 // ── Per-slot channel signal assignment ───────────────────────────────────────
 
 // GET /imports/:id/stations/:addr/slots/:slot/channels
+// GET /imports/:id/stations/:addr/slots/:slot/subslots/:subslot/channels
 // Returns one row per channel (0-indexed), creating missing rows up to channel_count from template.
-router.get('/imports/:id/stations/:addr/slots/:slot/channels', async (req, res) => {
+// The slot-only route is keyed to subslot_no IS NULL (today's behavior, unchanged); the
+// subslot-scoped variant filters/creates against that specific subslot_no instead, so
+// channels on different subslots of the same slot no longer collide.
+async function handleGetSlotChannels(req, res) {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id,   10);
     const addr     = parseInt(req.params.addr, 10);
     const slot     = parseInt(req.params.slot, 10);
+    const subslot  = req.params.subslot != null ? parseInt(req.params.subslot, 10) : null;
 
     const existing = await db.prepare(
       `SELECT id, channel, tag, description, signal_type
        FROM hw_signals
-       WHERE hw_import_id=? AND station_address=? AND slot=?
+       WHERE hw_import_id=? AND station_address=? AND slot=? AND subslot_no IS NOT DISTINCT FROM ?
        ORDER BY channel`
-    ).all(importId, addr, slot);
+    ).all(importId, addr, slot, subslot);
 
-    // Get channel_count from template for this slot
-    const slotMeta = await db.prepare(
-      `SELECT module_order_no FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=? LIMIT 1`
-    ).get(importId, addr, slot);
+    // Get channel_count from template for this slot/subslot. Prefer a hw_signals row's
+    // module_order_no (today's behavior); when the subslot has no hw_signals row of its
+    // own (e.g. a PA/port subslot whose identity lives only in hw_slot_subslots), fall
+    // back to hw_slot_subslots.child_order_no for that subslot.
+    let slotMeta = await db.prepare(
+      `SELECT module_order_no FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=? AND subslot_no IS NOT DISTINCT FROM ? LIMIT 1`
+    ).get(importId, addr, slot, subslot);
+    if (!slotMeta && subslot != null) {
+      const ss = await db.prepare(
+        `SELECT child_order_no AS module_order_no FROM hw_slot_subslots WHERE hw_import_id=? AND station_address=? AND slot=? AND subslot_no=?`
+      ).get(importId, addr, slot, subslot);
+      if (ss && ss.module_order_no) slotMeta = ss;
+    }
 
     let channelCount = existing.length;
     let slotSignalType = null;
+    let slotDefaultDatatype = null;
     if (slotMeta && slotMeta.module_order_no) {
-      const tpl = await db.prepare('SELECT channel_count, signal_type FROM hw_module_templates WHERE order_no=?').get(slotMeta.module_order_no);
+      const tpl = await db.prepare('SELECT channel_count, signal_type, default_datatype FROM hw_module_templates WHERE order_no=?').get(slotMeta.module_order_no);
       console.log(`[Channels] slot=${slot} order_no="${slotMeta.module_order_no}" found_template=${!!tpl} channel_count=${tpl?.channel_count || 'N/A'}`);
       if (tpl && tpl.channel_count > 0) channelCount = tpl.channel_count;
-      if (tpl) slotSignalType = tpl.signal_type;
+      if (tpl) { slotSignalType = tpl.signal_type; slotDefaultDatatype = tpl.default_datatype; }
     } else {
       console.log(`[Channels] slot=${slot} no slotMeta or module_order_no is null`);
     }
 
     // Build a full channel list: existing rows + empty placeholders for gaps.
-    // MIXED (DIQ8): channels 0..(half-1) are DI, channels half..(count-1) are DO.
+    // MIXED just means "has both input and output bytes" (see deriveSignalType) — it is not
+    // necessarily digital DI/DO. Only split channels 0..(half-1)=DI / half..(count-1)=DO when
+    // the module has no declared datatype (today's DIQ8-style boolean modules); a module with a
+    // real datatype (e.g. an IO-Link byte channel, default_datatype='Byte') keeps one flat
+    // channel list tagged with that datatype instead.
     // PA slots with channel_count > 1: each channel is one PA function subslot.
     const isMixed = slotSignalType === 'MIXED';
-    const halfCount = isMixed ? Math.floor(channelCount / 2) : 0;
+    const isDigitalMixed = isMixed && !slotDefaultDatatype;
+    const halfCount = isDigitalMixed ? Math.floor(channelCount / 2) : 0;
     const byChannel = new Map(existing.map(r => [r.channel, r]));
     const channels = [];
     for (let ch = 0; ch < channelCount; ch++) {
       const row = byChannel.get(ch);
       let defaultType;
-      if (isMixed) {
+      if (isDigitalMixed) {
         defaultType = ch < halfCount ? 'DI' : 'DO';
       } else if (slotSignalType === 'PA' || slotSignalType === 'AI' || slotSignalType === 'AO') {
         defaultType = slotSignalType;
+      } else if (isMixed && slotDefaultDatatype) {
+        defaultType = slotDefaultDatatype.toUpperCase();
       } else {
         defaultType = null;
       }
@@ -2464,7 +2837,9 @@ router.get('/imports/:id/stations/:addr/slots/:slot/channels', async (req, res) 
 
     res.json(channels);
   } catch (e) { err(res, 500, e.message); }
-});
+}
+router.get('/imports/:id/stations/:addr/slots/:slot/channels', handleGetSlotChannels);
+router.get('/imports/:id/stations/:addr/slots/:slot/subslots/:subslot/channels', handleGetSlotChannels);
 
 // ── Batch load all channels for all slots in an import (for Symbol Table) ────
 // Uses symbol_table_flat view for database-side processing instead of JavaScript grouping
@@ -2522,18 +2897,23 @@ router.get('/imports/:id/all-slot-channels', async (req, res) => {
 });
 
 // PATCH /imports/:id/stations/:addr/slots/:slot/channels/:ch
-router.patch('/imports/:id/stations/:addr/slots/:slot/channels/:ch', async (req, res) => {
+// PATCH /imports/:id/stations/:addr/slots/:slot/subslots/:subslot/channels/:ch
+// Slot-only route stays keyed to subslot_no IS NULL (backwards compatible, unchanged
+// behavior); the subslot-scoped variant filters/creates against that subslot_no so a
+// channel number on one subslot never collides with the same channel number on another.
+async function handlePatchSlotChannel(req, res) {
   try {
     const db       = getDb();
     const importId = parseInt(req.params.id,   10);
     const addr     = parseInt(req.params.addr, 10);
     const slot     = parseInt(req.params.slot, 10);
     const ch       = parseInt(req.params.ch,   10);
+    const subslot  = req.params.subslot != null ? parseInt(req.params.subslot, 10) : null;
     const { tag, description, signal_type } = req.body;
 
     const existing = await db.prepare(
-      'SELECT id FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=? AND channel=?'
-    ).get(importId, addr, slot, ch);
+      'SELECT id FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=? AND channel=? AND subslot_no IS NOT DISTINCT FROM ?'
+    ).get(importId, addr, slot, ch, subslot);
 
     if (existing) {
       const sets = [], vals = [];
@@ -2545,27 +2925,44 @@ router.patch('/imports/:id/stations/:addr/slots/:slot/channels/:ch', async (req,
         await db.prepare(`UPDATE hw_signals SET ${sets.join(', ')} WHERE id=?`).run(...vals);
       }
     } else {
-      // Row doesn't exist yet — pull station/slot metadata for required FK fields
+      // Row doesn't exist yet — pull station/slot metadata for required FK fields.
       const head = await db.prepare(
         `SELECT station_name, ip_address, module_order_no, module_name, subsystem_no, router_address
          FROM hw_signals WHERE hw_import_id=? AND station_address=? AND slot=? LIMIT 1`
       ).get(importId, addr, slot);
+      // When scoped to a subslot, prefer that subslot's own child_order_no (from
+      // hw_slot_subslots) for module_order_no/module_name over the slot's own module —
+      // e.g. an IO-Link port or PA function subslot has a different order_no than its
+      // parent slot's module.
+      let moduleOrderNo = head?.module_order_no || null;
+      let moduleName    = head?.module_name || null;
+      if (subslot != null) {
+        const ss = await db.prepare(
+          `SELECT child_order_no FROM hw_slot_subslots WHERE hw_import_id=? AND station_address=? AND slot=? AND subslot_no=?`
+        ).get(importId, addr, slot, subslot);
+        if (ss && ss.child_order_no) {
+          moduleOrderNo = ss.child_order_no;
+          moduleName    = ss.child_order_no;
+        }
+      }
       await db.prepare(`INSERT INTO hw_signals
-        (hw_import_id, station_address, station_name, ip_address, slot, channel,
+        (hw_import_id, station_address, station_name, ip_address, slot, subslot_no, channel,
          module_order_no, module_name, subsystem_no, router_address, tag, description, signal_type)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
       ).run(
         importId, addr,
         head?.station_name || null, head?.ip_address || null,
-        slot, ch,
-        head?.module_order_no || null, head?.module_name || null,
+        slot, subslot, ch,
+        moduleOrderNo, moduleName,
         head?.subsystem_no ?? 100, head?.router_address || null,
         tag ?? null, description ?? null, signal_type ?? null
       );
     }
     res.json({ ok: true });
   } catch (e) { err(res, 500, e.message); }
-});
+}
+router.patch('/imports/:id/stations/:addr/slots/:slot/channels/:ch', handlePatchSlotChannel);
+router.patch('/imports/:id/stations/:addr/slots/:slot/subslots/:subslot/channels/:ch', handlePatchSlotChannel);
 
 // ── Generate CFG ──────────────────────────────────────────────────────────────
 
@@ -2605,13 +3002,13 @@ router.post('/imports/:id/generate', async (req, res) => {
 
     // Load per-subslot profiles for all stations in this import
     const subslotRows = await db.prepare(
-      'SELECT station_address, slot, subslot_no, pa_profile FROM hw_slot_subslots WHERE hw_import_id=? ORDER BY station_address, slot, subslot_no'
+      'SELECT station_address, slot, subslot_no, pa_profile, label, local_address FROM hw_slot_subslots WHERE hw_import_id=? ORDER BY station_address, slot, subslot_no'
     ).all(importId);
     const subslotMap = new Map();
     for (const r of subslotRows) {
       const key = `${r.station_address}:${r.slot}`;
       if (!subslotMap.has(key)) subslotMap.set(key, []);
-      subslotMap.get(key).push({ subslotNo: r.subslot_no, paProfile: r.pa_profile || null });
+      subslotMap.get(key).push({ subslotNo: r.subslot_no, paProfile: r.pa_profile || null, label: r.label || null, localAddress: r.local_address != null ? r.local_address : null, symbols: [] });
     }
 
     const controllerId = hwImport.hw_controller_id || null;
@@ -2636,20 +3033,44 @@ router.post('/imports/:id/generate', async (req, res) => {
       if (!station.slots.has(sig.slot)) {
         station.slots.set(sig.slot, {
           slot:           sig.slot,
-          orderNo:        sig.module_order_no,
-          name:           sig.module_name,
-          pipNo:          sig.pip_no != null ? sig.pip_no : null,
-          potentialGroup: sig.potential_group != null ? sig.potential_group : null,
-          paProfile:      sig.pa_profile || null,
-          mlfb:           sig.station_mlfb || null,
+          orderNo:        null,
+          name:           null,
+          pipNo:          null,
+          potentialGroup: null,
+          paProfile:      null,
+          mlfb:           null,
           subslots:       subslotMap.get(`${addr}:${sig.slot}`) || [],
           channels:       [],
         });
       }
-      if (sig.tag || sig.channel != null) {
-        station.slots.get(sig.slot).channels.push({
+      const slotObj = station.slots.get(sig.slot);
+      // The slot's own identity must come only from its own header row
+      // (subslot_no IS NULL) — a subslot's symbol rows share the same `slot`
+      // value but carry the SUBSLOT's order_no/name, which must never
+      // overwrite the slot's own identity (row ordering could otherwise let a
+      // subslot-symbol row be processed before the slot-header row).
+      if (sig.subslot_no == null) {
+        slotObj.orderNo        = sig.module_order_no;
+        slotObj.name           = sig.module_name;
+        slotObj.pipNo          = sig.pip_no != null ? sig.pip_no : null;
+        slotObj.potentialGroup = sig.potential_group != null ? sig.potential_group : null;
+        slotObj.paProfile      = sig.pa_profile || null;
+        slotObj.mlfb           = sig.station_mlfb || null;
+      }
+      if (sig.subslot_no == null && (sig.tag || sig.channel != null)) {
+        slotObj.channels.push({
           channel: sig.channel, tag: sig.tag, desc: sig.description, signalType: sig.signal_type,
         });
+      }
+      // A subslot's own SYMBOL rows (real per-instance data, e.g. IO-Link port
+      // tags) share the same `slot` value but carry their own subslot_no —
+      // attach them to that specific subslot entry (already present in
+      // slotObj.subslots from hw_slot_subslots) rather than the slot's channels.
+      if (sig.subslot_no != null && (sig.tag || sig.channel != null)) {
+        const ss = slotObj.subslots.find(s => s.subslotNo === sig.subslot_no);
+        if (ss) {
+          ss.symbols.push({ channel: sig.channel, tag: sig.tag, desc: sig.description, signalType: sig.signal_type });
+        }
       }
     }
 
@@ -2744,6 +3165,363 @@ router.delete('/slot-compat', async (req, res) => {
     await db.prepare('DELETE FROM hw_slot_subslot_compat WHERE slot_order_no=? AND subslot_order_no=?')
       .run(slot_order_no, subslot_order_no);
     res.json({ ok: true });
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// ── Catalogue Export / Import ──────────────────────────────────────────────────
+// Mirrors the Library export/import feature: export the full hardware catalogue
+// (module templates + parameters, slot/subslot compatibility, signal types) as a
+// single JSON file, then preview a diff against the current DB before a selective,
+// checkbox-driven commit.
+
+const _catalogueImportCache = new Map(); // token -> { fileTemplates, fileSlotCompat, fileSignalTypes, timerId }
+
+function catalogueCacheSet(token, data) {
+  for (const [, v] of _catalogueImportCache) clearTimeout(v.timerId);
+  _catalogueImportCache.clear();
+  const timerId = setTimeout(() => _catalogueImportCache.delete(token), 15 * 60 * 1000);
+  _catalogueImportCache.set(token, { ...data, timerId });
+}
+
+function catalogueTemplateKey(order_no, hw_category) {
+  return `${order_no}::${hw_category || ''}`;
+}
+
+const CATALOGUE_TEMPLATE_FIELDS = [
+  'display_name', 'family', 'signal_type', 'channel_count', 'input_bytes', 'output_bytes',
+  'in_addr_fmt', 'out_addr_fmt', 'param_template', 'version', 'gsdml_file', 'dap_id',
+  'subslot_defaults', 'port_config', 'in_identifier', 'out_identifier', 'default_datatype', 'mlfb',
+];
+
+function catalogueTemplateDiffers(existingRow, fileTpl) {
+  for (const f of CATALOGUE_TEMPLATE_FIELDS) {
+    const a = existingRow[f] ?? null;
+    const b = fileTpl[f] ?? null;
+    if (a !== b) return true;
+  }
+  return false;
+}
+
+function catalogueParamsDiffer(existingParams, fileParams) {
+  const norm = (p) => [
+    p.parameter_name, p.parameter_value ?? '', p.spare_value ?? '', !!p.is_dynamic,
+    p.channel_type ?? '', p.channel_no ?? '', p.parameter_type || 'module',
+    p.is_visible === undefined ? true : !!p.is_visible,
+  ].join('|');
+  const a = (existingParams || []).map(norm).sort();
+  const b = (fileParams || []).map(norm).sort();
+  if (a.length !== b.length) return true;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return true;
+  return false;
+}
+
+async function catalogueInsertParameters(db, templateId, parameters) {
+  if (!Array.isArray(parameters) || !parameters.length) return 0;
+  const insert = db.prepare(`
+    INSERT INTO hw_module_parameters
+      (template_id, parameter_name, parameter_value, spare_value, is_dynamic, channel_type, channel_no, parameter_type, is_visible, sort_order)
+    VALUES (?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT (template_id, parameter_name, channel_no) DO UPDATE SET
+      parameter_value = EXCLUDED.parameter_value,
+      spare_value     = EXCLUDED.spare_value,
+      is_dynamic      = EXCLUDED.is_dynamic,
+      channel_type    = EXCLUDED.channel_type,
+      parameter_type  = EXCLUDED.parameter_type,
+      is_visible      = EXCLUDED.is_visible,
+      sort_order      = EXCLUDED.sort_order
+  `);
+  let count = 0;
+  for (const p of parameters) {
+    await insert.run(
+      templateId, p.parameter_name, p.parameter_value ?? null, p.spare_value ?? null,
+      !!p.is_dynamic, p.channel_type ?? null, p.channel_no ?? null,
+      p.parameter_type || 'module', p.is_visible === undefined ? true : !!p.is_visible,
+      p.sort_order ?? 0,
+    );
+    count++;
+  }
+  return count;
+}
+
+// GET /catalogue/export
+router.get('/catalogue/export', async (req, res) => {
+  try {
+    const db = getDb();
+    const templateRows = await db.prepare('SELECT * FROM hw_module_templates ORDER BY family, display_name').all();
+
+    const templates = [];
+    for (const t of templateRows) {
+      const paramRows = await ModuleParameterDb.getParametersByTemplate(t.id);
+      templates.push({
+        order_no: t.order_no,
+        display_name: t.display_name,
+        family: t.family,
+        hw_category: t.hw_category,
+        signal_type: t.signal_type,
+        channel_count: t.channel_count,
+        input_bytes: t.input_bytes,
+        output_bytes: t.output_bytes,
+        in_addr_fmt: t.in_addr_fmt,
+        out_addr_fmt: t.out_addr_fmt,
+        param_template: t.param_template,
+        version: t.version,
+        gsdml_file: t.gsdml_file,
+        dap_id: t.dap_id,
+        subslot_defaults: t.subslot_defaults,
+        port_config: t.port_config,
+        in_identifier: t.in_identifier,
+        out_identifier: t.out_identifier,
+        default_datatype: t.default_datatype,
+        mlfb: t.mlfb,
+        parameters: paramRows.map((p) => ({
+          parameter_name: p.parameter_name,
+          parameter_value: p.parameter_value,
+          spare_value: p.spare_value,
+          is_dynamic: !!p.is_dynamic,
+          channel_type: p.channel_type,
+          channel_no: p.channel_no,
+          parameter_type: p.parameter_type,
+          is_visible: !!p.is_visible,
+          sort_order: p.sort_order,
+        })),
+      });
+    }
+
+    const slotCompat = await db.prepare(
+      'SELECT slot_order_no, subslot_order_no, is_default FROM hw_slot_subslot_compat ORDER BY slot_order_no, subslot_order_no'
+    ).all();
+    const signalTypes = await db.prepare('SELECT name FROM hw_signal_types ORDER BY sort_order, name').all();
+
+    const payload = {
+      meta: {
+        exportedAt: new Date().toISOString(),
+        sourceStats: {
+          templateCount: templates.length,
+          slotCompatCount: slotCompat.length,
+          signalTypeCount: signalTypes.length,
+        },
+      },
+      templates,
+      slotCompat,
+      signalTypes,
+    };
+
+    res.setHeader('Content-Disposition', `attachment; filename="catalogue-export-${Date.now()}.json"`);
+    res.setHeader('Content-Type', 'application/json');
+    res.json(payload);
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// POST /catalogue/import/preview
+router.post('/catalogue/import/preview', upload.single('file'), async (req, res) => {
+  if (!req.file) return err(res, 400, 'No file uploaded');
+  try {
+    let parsed;
+    try {
+      parsed = JSON.parse(req.file.buffer.toString('utf-8'));
+    } catch (e) {
+      return err(res, 400, 'Invalid catalogue export file (not valid JSON)');
+    }
+    if (!parsed || typeof parsed !== 'object') return err(res, 400, 'Invalid catalogue export file');
+
+    const fileTemplates = Array.isArray(parsed.templates) ? parsed.templates : [];
+    const fileSlotCompat = Array.isArray(parsed.slotCompat) ? parsed.slotCompat : [];
+    const fileSignalTypes = Array.isArray(parsed.signalTypes) ? parsed.signalTypes : [];
+
+    const db = getDb();
+
+    // ── Module templates diff, keyed by (order_no, hw_category) ──
+    const dbTplRows = await db.prepare('SELECT * FROM hw_module_templates').all();
+    const dbTplMap = new Map(dbTplRows.map((t) => [catalogueTemplateKey(t.order_no, t.hw_category), t]));
+    const fileTplKeys = new Set();
+
+    const templateItems = [];
+    let tplNew = 0, tplUpdated = 0, tplUnchanged = 0, tplRemoved = 0;
+
+    for (const ft of fileTemplates) {
+      const key = catalogueTemplateKey(ft.order_no, ft.hw_category);
+      fileTplKeys.add(key);
+      const existing = dbTplMap.get(key);
+      const base = { id: key, order_no: ft.order_no, display_name: ft.display_name, hw_category: ft.hw_category, family: ft.family };
+      if (!existing) {
+        templateItems.push({ ...base, status: 'NEW' });
+        tplNew++;
+      } else {
+        const existingParams = await ModuleParameterDb.getParametersByTemplate(existing.id);
+        const differs = catalogueTemplateDiffers(existing, ft) || catalogueParamsDiffer(existingParams, ft.parameters);
+        if (differs) { templateItems.push({ ...base, status: 'UPDATED' }); tplUpdated++; }
+        else { templateItems.push({ ...base, status: 'UNCHANGED' }); tplUnchanged++; }
+      }
+    }
+    for (const [key, t] of dbTplMap) {
+      if (!fileTplKeys.has(key)) {
+        templateItems.push({ id: key, order_no: t.order_no, display_name: t.display_name, hw_category: t.hw_category, family: t.family, status: 'REMOVED_FROM_FILE' });
+        tplRemoved++;
+      }
+    }
+
+    // ── Slot/subslot compatibility diff, keyed by (slot_order_no, subslot_order_no) ──
+    const dbCompatRows = await db.prepare('SELECT * FROM hw_slot_subslot_compat').all();
+    const dbCompatMap = new Map(dbCompatRows.map((c) => [`${c.slot_order_no}::${c.subslot_order_no}`, c]));
+    const fileCompatKeys = new Set();
+    const tplNameByOrderNo = new Map(dbTplRows.map((t) => [t.order_no, t.display_name]));
+
+    const compatItems = [];
+    let compNew = 0, compUpdated = 0, compUnchanged = 0, compRemoved = 0;
+    for (const fc of fileSlotCompat) {
+      const key = `${fc.slot_order_no}::${fc.subslot_order_no}`;
+      fileCompatKeys.add(key);
+      const existing = dbCompatMap.get(key);
+      const item = {
+        id: key,
+        slot_order_no: fc.slot_order_no,
+        subslot_order_no: fc.subslot_order_no,
+        slot_name: tplNameByOrderNo.get(fc.slot_order_no) || null,
+        subslot_name: tplNameByOrderNo.get(fc.subslot_order_no) || null,
+      };
+      if (!existing) { item.status = 'NEW'; compNew++; }
+      else if (!!existing.is_default !== !!fc.is_default) { item.status = 'UPDATED'; compUpdated++; }
+      else { item.status = 'UNCHANGED'; compUnchanged++; }
+      compatItems.push(item);
+    }
+    for (const [key, c] of dbCompatMap) {
+      if (!fileCompatKeys.has(key)) {
+        compatItems.push({
+          id: key, slot_order_no: c.slot_order_no, subslot_order_no: c.subslot_order_no,
+          slot_name: tplNameByOrderNo.get(c.slot_order_no) || null,
+          subslot_name: tplNameByOrderNo.get(c.subslot_order_no) || null,
+          status: 'REMOVED_FROM_FILE',
+        });
+        compRemoved++;
+      }
+    }
+
+    // ── Signal types diff, keyed by name ──
+    const dbSigRows = await db.prepare('SELECT name FROM hw_signal_types').all();
+    const dbSigSet = new Set(dbSigRows.map((r) => r.name));
+    const fileSigNames = new Set();
+    const sigItems = [];
+    let sigNew = 0, sigUnchanged = 0, sigRemoved = 0;
+    for (const fs of fileSignalTypes) {
+      const name = ((fs && fs.name) || fs || '').toString();
+      if (!name) continue;
+      fileSigNames.add(name);
+      if (dbSigSet.has(name)) { sigItems.push({ id: name, name, status: 'UNCHANGED' }); sigUnchanged++; }
+      else { sigItems.push({ id: name, name, status: 'NEW' }); sigNew++; }
+    }
+    for (const name of dbSigSet) {
+      if (!fileSigNames.has(name)) { sigItems.push({ id: name, name, status: 'REMOVED_FROM_FILE' }); sigRemoved++; }
+    }
+
+    const token = Date.now().toString(36);
+    catalogueCacheSet(token, { fileTemplates, fileSlotCompat, fileSignalTypes });
+
+    res.json({
+      token,
+      meta: parsed.meta || null,
+      templates: { summary: { new: tplNew, updated: tplUpdated, unchanged: tplUnchanged, removed: tplRemoved }, items: templateItems },
+      slotCompat: { summary: { new: compNew, updated: compUpdated, unchanged: compUnchanged, removed: compRemoved }, items: compatItems },
+      signalTypes: { summary: { new: sigNew, updated: 0, unchanged: sigUnchanged, removed: sigRemoved }, items: sigItems },
+    });
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// POST /catalogue/import/commit
+router.post('/catalogue/import/commit', async (req, res) => {
+  const { token, selectedTemplateIds = [], selectedSlotCompatIds = [], selectedSignalTypes = [] } = req.body || {};
+  if (!token) return err(res, 400, 'token is required');
+  const cached = _catalogueImportCache.get(token);
+  if (!cached) return err(res, 404, 'Upload token expired or not found — please re-upload the file');
+
+  const selTpl = new Set(selectedTemplateIds);
+  const selCompat = new Set(selectedSlotCompatIds);
+  const selSig = new Set(selectedSignalTypes);
+
+  try {
+    const db = getDb();
+    let templatesNew = 0, templatesUpdated = 0, templatesSkipped = 0;
+    let slotCompatNew = 0, slotCompatSkipped = 0;
+    let signalTypesNew = 0, signalTypesSkipped = 0;
+
+    const doCommit = db.transaction(async () => {
+      // ── Templates ──
+      for (const ft of cached.fileTemplates) {
+        const key = catalogueTemplateKey(ft.order_no, ft.hw_category);
+        if (!selTpl.has(key)) { templatesSkipped++; continue; }
+
+        const existing = await db.prepare(
+          'SELECT id FROM hw_module_templates WHERE order_no=? AND (hw_category IS NOT DISTINCT FROM ? OR hw_category=?)'
+        ).get(ft.order_no, ft.hw_category || null, ft.hw_category || null);
+
+        const vals = [
+          ft.display_name, ft.family, ft.signal_type || null, ft.channel_count || 0,
+          ft.input_bytes || 0, ft.output_bytes || 0, ft.in_addr_fmt || null, ft.out_addr_fmt || null,
+          ft.param_template || null, ft.version || null, ft.gsdml_file || null, ft.dap_id || null,
+          ft.hw_category || null, ft.subslot_defaults || null, ft.port_config || null,
+          ft.in_identifier || null, ft.out_identifier || null, ft.default_datatype || null, ft.mlfb || null,
+        ];
+
+        let templateId;
+        if (existing) {
+          await db.prepare(`UPDATE hw_module_templates SET
+            display_name=?, family=?, signal_type=?, channel_count=?, input_bytes=?, output_bytes=?,
+            in_addr_fmt=?, out_addr_fmt=?, param_template=?, version=?, gsdml_file=?, dap_id=?, hw_category=?,
+            subslot_defaults=?, port_config=?, in_identifier=?, out_identifier=?, default_datatype=?, mlfb=?
+            WHERE id=?`).run(...vals, existing.id);
+          templateId = existing.id;
+          templatesUpdated++;
+        } else {
+          const r = await db.prepare(`INSERT INTO hw_module_templates
+            (display_name, family, signal_type, channel_count, input_bytes, output_bytes,
+             in_addr_fmt, out_addr_fmt, param_template, version, gsdml_file, dap_id, hw_category,
+             subslot_defaults, port_config, in_identifier, out_identifier, default_datatype, mlfb, order_no)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(...vals, ft.order_no);
+          templateId = r.lastInsertRowid;
+          templatesNew++;
+        }
+
+        if (templateId) {
+          await ModuleParameterDb.deleteParametersForTemplate(templateId);
+          await catalogueInsertParameters(db, templateId, ft.parameters);
+        }
+      }
+
+      // ── Slot/subslot compatibility ──
+      for (const fc of cached.fileSlotCompat) {
+        const key = `${fc.slot_order_no}::${fc.subslot_order_no}`;
+        if (!selCompat.has(key)) { slotCompatSkipped++; continue; }
+        const existing = await db.prepare(
+          'SELECT id FROM hw_slot_subslot_compat WHERE slot_order_no=? AND subslot_order_no=?'
+        ).get(fc.slot_order_no, fc.subslot_order_no);
+        if (existing) {
+          await db.prepare('UPDATE hw_slot_subslot_compat SET is_default=? WHERE id=?').run(!!fc.is_default, existing.id);
+        } else {
+          await db.prepare('INSERT INTO hw_slot_subslot_compat (slot_order_no, subslot_order_no, is_default) VALUES (?,?,?)')
+            .run(fc.slot_order_no, fc.subslot_order_no, !!fc.is_default);
+          slotCompatNew++;
+        }
+      }
+
+      // ── Signal types ──
+      for (const fs of cached.fileSignalTypes) {
+        const name = ((fs && fs.name) || fs || '').toString();
+        if (!name) continue;
+        if (!selSig.has(name)) { signalTypesSkipped++; continue; }
+        const r = await db.prepare('INSERT INTO hw_signal_types (name) VALUES (?) ON CONFLICT (name) DO NOTHING').run(name);
+        if (r.rowCount > 0 || r.changes > 0) signalTypesNew++;
+      }
+    });
+
+    await doCommit();
+    clearTimeout(cached.timerId);
+    _catalogueImportCache.delete(token);
+
+    res.json({
+      success: true,
+      templatesNew, templatesUpdated, templatesSkipped,
+      slotCompatNew, slotCompatSkipped,
+      signalTypesNew, signalTypesSkipped,
+    });
   } catch (e) { err(res, 500, e.message); }
 });
 
@@ -2871,6 +3649,13 @@ router.post('/station-auto-slots', async (req, res) => {
 
     const existing = await db.prepare('SELECT id FROM hw_station_auto_slots WHERE order_no=?').get(order_no.trim());
 
+    // Dual-write: hw_station_auto_slots stays the live source the renderer/Add-Station
+    // read (via autoSlotResolver.loadStationAutoSlotConfig), unchanged; hw_default_children
+    // is kept in sync from the same save so the generic slot/subslot-derivation helpers
+    // (firstAddableSlot, materializeDefaultTree, the compat-validated subslot PATCH) work
+    // for hand-edited stations too, not just CFG-captured ones.
+    await explodeConfigIntoDefaultChildren(db, order_no.trim(), config);
+
     if (existing) {
       await db.prepare(
         'UPDATE hw_station_auto_slots SET auto_slots_config=?, updated_at=NOW() WHERE order_no=?'
@@ -2913,6 +3698,9 @@ router.put('/station-auto-slots/:orderNo', async (req, res) => {
 
     const existing = await db.prepare('SELECT id FROM hw_station_auto_slots WHERE order_no=?').get(orderNo);
 
+    // Dual-write into hw_default_children — see POST /station-auto-slots comment.
+    await explodeConfigIntoDefaultChildren(db, orderNo, config);
+
     if (existing) {
       // Update existing config
       await db.prepare(
@@ -2945,7 +3733,97 @@ router.delete('/station-auto-slots/:orderNo', async (req, res) => {
 
     await db.prepare('DELETE FROM hw_station_auto_slots WHERE order_no=?').run(orderNo);
 
+    // Clean up the mirrored hw_default_children rows (slot rows for this head, plus
+    // the subslot rows owned by each of those slots' own order_no).
+    const slotOrderNos = await db.prepare(
+      `SELECT child_order_no FROM hw_default_children WHERE parent_order_no=? AND position_kind='slot'`
+    ).all(orderNo);
+    await db.prepare(`DELETE FROM hw_default_children WHERE parent_order_no=?`).run(orderNo);
+    for (const s of slotOrderNos) {
+      await db.prepare(`DELETE FROM hw_default_children WHERE parent_order_no=?`).run(s.child_order_no);
+    }
+
     res.json({ ok: true, deleted: orderNo });
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// POST /station-auto-slots/from-cfg — "Capture from CFG" action. Upload a single-station
+// CFG file; parses it with the same catalogue parser used for module-templates import,
+// and (re)seeds hw_station_auto_slots + hw_default_children for every station head found,
+// overwriting any existing config for that order_no (this is an explicit user action,
+// unlike the passive auto-seed in /module-templates/bulk-upsert which never overwrites).
+router.post('/station-auto-slots/from-cfg', upload.single('cfg'), async (req, res) => {
+  try {
+    if (!req.file) return err(res, 400, 'No CFG file uploaded');
+    const db = getDb();
+    const text = req.file.buffer.toString('utf8');
+    const { error, candidates } = parseCfgForCatalogue(text);
+    if (error && candidates.length === 0) return err(res, 422, error);
+
+    const stationCandidates = candidates.filter(c => !c.parseError && c.hw_category === 'station' && c.auto_slots_seed);
+    if (!stationCandidates.length) return err(res, 400, 'No station head with a slot/subslot tree found in this CFG');
+
+    const captured = [];
+    for (const d of stationCandidates) {
+      const seedConfig = JSON.parse(d.auto_slots_seed);
+      if (!seedConfig.rules) seedConfig.rules = {};
+      await inferAutoSlotTypes(db, seedConfig);
+      const configJson = JSON.stringify(seedConfig);
+      const existing = await db.prepare('SELECT id FROM hw_station_auto_slots WHERE order_no=?').get(d.order_no);
+      if (existing) {
+        await db.prepare('UPDATE hw_station_auto_slots SET auto_slots_config=?, updated_at=NOW() WHERE order_no=?')
+          .run(configJson, d.order_no);
+      } else {
+        await db.prepare('INSERT INTO hw_station_auto_slots (order_no, auto_slots_config) VALUES (?, ?)')
+          .run(d.order_no, configJson);
+      }
+      await explodeConfigIntoDefaultChildren(db, d.order_no, seedConfig);
+      captured.push(d.order_no);
+    }
+
+    res.json({ ok: true, captured });
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// GET /slot-default-subslots/:orderNo — Get a slot-category catalogue device's own
+// default subslot tree (hw_default_children rows keyed by this slot's order_no as parent).
+router.get('/slot-default-subslots/:orderNo', async (req, res) => {
+  try {
+    const db = getDb();
+    const orderNo = (req.params.orderNo || '').trim();
+    if (!orderNo) return err(res, 400, 'orderNo parameter required');
+
+    const rows = await db.prepare(
+      `SELECT position, child_order_no, hw_category, label, is_autocreated
+       FROM hw_default_children WHERE parent_order_no=? AND position_kind='subslot' ORDER BY position`
+    ).all(orderNo);
+
+    res.json({ order_no: orderNo, subslots: rows });
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// PUT /slot-default-subslots/:orderNo — Full replace of a slot's default subslot tree.
+// Body: { subslots: [{position, child_order_no, label, is_autocreated}, ...] }
+router.put('/slot-default-subslots/:orderNo', async (req, res) => {
+  try {
+    const db = getDb();
+    const orderNo = (req.params.orderNo || '').trim();
+    const { subslots } = req.body;
+    if (!orderNo) return err(res, 400, 'orderNo parameter required');
+    if (!Array.isArray(subslots)) return err(res, 400, 'subslots array required');
+
+    await db.transaction(async () => {
+      await db.prepare(`DELETE FROM hw_default_children WHERE parent_order_no=? AND position_kind='subslot'`).run(orderNo);
+      for (const ss of subslots) {
+        if (ss.position == null || !ss.child_order_no) continue;
+        await db.prepare(
+          `INSERT INTO hw_default_children (parent_order_no, position, position_kind, child_order_no, hw_category, is_autocreated, label, sort_order)
+           VALUES (?, ?, 'subslot', ?, 'subslot', ?, ?, ?)`
+        ).run(orderNo, ss.position, ss.child_order_no, !!ss.is_autocreated, ss.label || null, ss.position);
+      }
+    })();
+
+    res.json({ ok: true, order_no: orderNo });
   } catch (e) { err(res, 500, e.message); }
 });
 
@@ -2955,28 +3833,38 @@ router.get('/imports/:id/export', async (req, res) => {
     const db = getDb();
     const importId = parseInt(req.params.id, 10);
 
-    // One row per station+slot (GROUP BY deduplicates channels)
+    // One row per station+slot+subslot (GROUP BY deduplicates channels). subslot_no is
+    // grouped in explicitly so slot-level and subslot-level rows stay distinct; PA
+    // Profile is sourced from hw_slot_subslots.child_order_no (the generic per-node
+    // "what's plugged in here" column) with a COALESCE fallback to the legacy
+    // hw_signals.pa_profile for rows captured before child_order_no was populated.
     const rows = await db.prepare(`
       SELECT
-        hw_import_id,
-        station_address,
-        MIN(station_name)   AS station_name,
-        MIN(ip_address)     AS ip_address,
-        MIN(subsystem_no)   AS subsystem_no,
-        MIN(router_address) AS router_address,
-        MIN(as_assignment)  AS as_assignment,
-        slot,
-        module_order_no,
-        MIN(module_name)    AS module_name,
-        MIN(signal_type)    AS signal_type,
-        MIN(pip_no)         AS pip_no,
-        MIN(potential_group) AS potential_group,
-        MIN(pa_profile)     AS pa_profile,
-        COUNT(*)            AS channel_count
-      FROM hw_signals
-      WHERE hw_import_id = ? AND module_order_no != 'PLACEHOLDER'
-      GROUP BY hw_import_id, station_address, slot, module_order_no
-      ORDER BY station_address, slot
+        s.hw_import_id,
+        s.station_address,
+        MIN(s.station_name)   AS station_name,
+        MIN(s.ip_address)     AS ip_address,
+        MIN(s.subsystem_no)   AS subsystem_no,
+        MIN(s.router_address) AS router_address,
+        MIN(s.as_assignment)  AS as_assignment,
+        s.slot,
+        s.subslot_no,
+        s.module_order_no,
+        MIN(s.module_name)    AS module_name,
+        MIN(s.signal_type)    AS signal_type,
+        MIN(s.pip_no)         AS pip_no,
+        MIN(s.potential_group) AS potential_group,
+        COALESCE(MIN(ss.child_order_no), MIN(s.pa_profile)) AS pa_profile,
+        COUNT(*)              AS channel_count
+      FROM hw_signals s
+      LEFT JOIN hw_slot_subslots ss
+        ON ss.hw_import_id    = s.hw_import_id
+       AND ss.station_address = s.station_address
+       AND ss.slot            = s.slot
+       AND ss.subslot_no IS NOT DISTINCT FROM s.subslot_no
+      WHERE s.hw_import_id = ? AND s.module_order_no != 'PLACEHOLDER'
+      GROUP BY s.hw_import_id, s.station_address, s.slot, s.subslot_no, s.module_order_no
+      ORDER BY s.station_address, s.slot, s.subslot_no
     `).all(importId);
 
     if (rows.length === 0) {
@@ -3023,6 +3911,7 @@ router.get('/imports/:id/export', async (req, res) => {
       { header: 'Station Address', key: 'station_address', width: 14 },
       { header: 'Station Name', key: 'station_name', width: 18 },
       { header: 'Slot', key: 'slot', width: 8 },
+      { header: 'Subslot', key: 'subslot_no', width: 10 },
       { header: 'Order No', key: 'module_order_no', width: 22 },
       { header: 'Module Name', key: 'module_name', width: 20 },
       { header: 'Signal Type', key: 'signal_type', width: 14 },
@@ -3144,19 +4033,35 @@ router.post('/imports/:id/import', upload.single('file'), async (req, res) => {
         }
       }
 
+      // 'Subslot' is a newer column — absent in older exported files being re-imported.
+      // Missing/empty ⇒ null, matching today's behavior (slot-level row, no subslot).
+      let subslotNo = null;
+      if (data['Subslot'] != null && data['Subslot'] !== '') {
+        subslotNo = parseInt(data['Subslot'], 10);
+        if (isNaN(subslotNo) || subslotNo < 0) {
+          validationErrors.push({
+            row: rowNum,
+            field: 'Subslot',
+            message: 'Subslot must be a non-negative integer or empty',
+          });
+        }
+      }
+
       // Skip further checks if basic address/slot failed
       if (validationErrors.length > 0) continue;
 
-      // Check that station + slot exists in database
+      // Check that station + slot (+ subslot) exists in database
       const existing = await db.prepare(
-        'SELECT id FROM hw_signals WHERE hw_import_id = ? AND station_address = ? AND slot = ?'
-      ).get(importId, stationAddr, slotNum);
+        'SELECT id FROM hw_signals WHERE hw_import_id = ? AND station_address = ? AND slot = ? AND subslot_no IS NOT DISTINCT FROM ?'
+      ).get(importId, stationAddr, slotNum, subslotNo);
 
       if (!existing) {
         validationErrors.push({
           row: rowNum,
           field: 'Station Address / Slot',
-          message: `Station ${stationAddr}, Slot ${slotNum} does not exist in this import`,
+          message: subslotNo != null
+            ? `Station ${stationAddr}, Slot ${slotNum}, Subslot ${subslotNo} does not exist in this import`
+            : `Station ${stationAddr}, Slot ${slotNum} does not exist in this import`,
         });
       }
 
@@ -3166,6 +4071,7 @@ router.post('/imports/:id/import', upload.single('file'), async (req, res) => {
           rowNum,
           stationAddr,
           slotNum,
+          subslotNo,
           ipAddress: stationData.ipAddress,
           routerAddress: stationData.routerAddress,
           moduleName: data['Module Name'] || null,
@@ -3183,22 +4089,27 @@ router.post('/imports/:id/import', upload.single('file'), async (req, res) => {
 
     // ── Snapshot current values so we can compute a diff ──
     const currentRows = await db.prepare(`
-      SELECT station_address, slot, module_order_no,
-             MIN(station_name) AS station_name,
-             MIN(ip_address) AS ip_address,
-             MIN(router_address) AS router_address,
-             MIN(module_name) AS module_name,
-             MIN(pip_no) AS pip_no,
-             MIN(potential_group) AS potential_group,
-             MIN(pa_profile) AS pa_profile
-      FROM hw_signals
-      WHERE hw_import_id = ?
-      GROUP BY station_address, slot, module_order_no
+      SELECT s.station_address, s.slot, s.subslot_no, s.module_order_no,
+             MIN(s.station_name) AS station_name,
+             MIN(s.ip_address) AS ip_address,
+             MIN(s.router_address) AS router_address,
+             MIN(s.module_name) AS module_name,
+             MIN(s.pip_no) AS pip_no,
+             MIN(s.potential_group) AS potential_group,
+             COALESCE(MIN(ss.child_order_no), MIN(s.pa_profile)) AS pa_profile
+      FROM hw_signals s
+      LEFT JOIN hw_slot_subslots ss
+        ON ss.hw_import_id    = s.hw_import_id
+       AND ss.station_address = s.station_address
+       AND ss.slot            = s.slot
+       AND ss.subslot_no IS NOT DISTINCT FROM s.subslot_no
+      WHERE s.hw_import_id = ?
+      GROUP BY s.station_address, s.slot, s.subslot_no, s.module_order_no
     `).all(importId);
 
     const currentMap = new Map();
     for (const r of currentRows) {
-      currentMap.set(`${r.station_address}:${r.slot}`, r);
+      currentMap.set(`${r.station_address}:${r.slot}:${r.subslot_no ?? 'null'}`, r);
     }
 
     // ── Update Phase (strict validation passed) ──
@@ -3214,7 +4125,7 @@ router.post('/imports/:id/import', upload.single('file'), async (req, res) => {
 
     await db.transaction(async () => {
       for (const row of slotRows) {
-        const cur = currentMap.get(`${row.stationAddr}:${row.slotNum}`);
+        const cur = currentMap.get(`${row.stationAddr}:${row.slotNum}:${row.subslotNo ?? 'null'}`);
         const newVals = {
           ip_address:      row.ipAddress      ?? null,
           router_address:  row.routerAddress  ?? null,
@@ -3236,6 +4147,7 @@ router.post('/imports/:id/import', upload.single('file'), async (req, res) => {
                 station: cur.station_name || `Station ${row.stationAddr}`,
                 stationAddr: row.stationAddr,
                 slot: row.slotNum,
+                subslot: row.subslotNo,
                 orderNo: cur.module_order_no,
                 field: label,
                 from: oldStr,
@@ -3248,7 +4160,7 @@ router.post('/imports/:id/import', upload.single('file'), async (req, res) => {
         await db.prepare(`
           UPDATE hw_signals
           SET ip_address = ?, router_address = ?, module_name = ?, pip_no = ?, potential_group = ?, pa_profile = ?
-          WHERE hw_import_id = ? AND station_address = ? AND slot = ?
+          WHERE hw_import_id = ? AND station_address = ? AND slot = ? AND subslot_no IS NOT DISTINCT FROM ?
         `).run(
           newVals.ip_address,
           newVals.router_address,
@@ -3258,13 +4170,129 @@ router.post('/imports/:id/import', upload.single('file'), async (req, res) => {
           newVals.pa_profile,
           importId,
           row.stationAddr,
-          row.slotNum
+          row.slotNum,
+          row.subslotNo
         );
+
+        // Mirror PA Profile into hw_slot_subslots.child_order_no (the generic
+        // per-node "what's plugged in here" source the views now read from), same
+        // as the dedicated PA-profile PATCH routes do. Only when a Subslot was given
+        // — a slot-level row (no subslot) has no hw_slot_subslots identity to target.
+        if (row.subslotNo != null && row.paProfile !== undefined) {
+          await db.prepare(`
+            INSERT INTO hw_slot_subslots (hw_import_id, station_address, slot, subslot_no, child_order_no, pa_profile)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (hw_import_id, station_address, slot, subslot_no) DO UPDATE SET
+              child_order_no = EXCLUDED.child_order_no, pa_profile = EXCLUDED.pa_profile
+          `).run(importId, row.stationAddr, row.slotNum, row.subslotNo, newVals.pa_profile, newVals.pa_profile);
+        }
+
         updated++;
       }
     })();
 
     res.json({ updated, changes, errors: [] });
+  } catch (e) { err(res, 500, e.message); }
+});
+
+// GET /hw-config/templates/io-list-excel — Download Excel template with AS01 current configuration
+router.get('/templates/io-list-excel', async (req, res) => {
+  try {
+    const db = getDb();
+
+    // Get AS01 hardware configuration (all slots from all stations matching 'AS01')
+    const hwData = await db.prepare(`
+      SELECT DISTINCT
+        s.station_address,
+        s.station_name,
+        s.slot,
+        s.module_order_no,
+        s.module_name,
+        s.signal_type,
+        s.subsystem_no
+      FROM hw_signals s
+      WHERE s.station_name LIKE '%AS01%'
+        AND s.slot > 0
+      ORDER BY s.station_address, s.slot
+    `).all();
+
+    // Get station reference info
+    const stationRef = await db.prepare(`
+      SELECT DISTINCT station_address, station_name
+      FROM hw_signals
+      WHERE station_name LIKE '%AS01%'
+      LIMIT 1
+    `).get();
+
+    const stationName = stationRef?.station_name || 'AS01';
+    const ctrlAddr = stationRef?.station_address || 4;
+
+    // Create workbook
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet('HW IO List');
+
+    // Define headers
+    const headers = [
+      'Station Name',
+      'Controller Address',
+      'Unit Name',
+      'Unit Type',
+      'Slot',
+      'Module Type (Order No)',
+      'Module Name',
+      'Signal Type'
+    ];
+
+    // Add header row with styling
+    const headerRow = worksheet.addRow(headers);
+    headerRow.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF366092' } };
+
+    // Set column widths
+    worksheet.columns = [
+      { width: 12 },
+      { width: 18 },
+      { width: 20 },
+      { width: 20 },
+      { width: 6 },
+      { width: 35 },
+      { width: 28 },
+      { width: 15 }
+    ];
+
+    // Freeze header row
+    worksheet.views = [{ state: 'frozen', ySplit: 1 }];
+
+    // Add AS01 data rows from current configuration
+    const addedSlots = new Set();
+    for (const hw of hwData) {
+      const slotKey = `${hw.station_address}:${hw.slot}`;
+      if (addedSlots.has(slotKey)) continue;
+      addedSlots.add(slotKey);
+
+      worksheet.addRow([
+        stationName,                    // Station Name
+        ctrlAddr,                       // Controller Address
+        '',                             // Unit Name (user fills)
+        '',                             // Unit Type (user fills)
+        hw.slot,                        // Slot
+        hw.module_order_no || '',       // Module Type (Order No)
+        hw.module_name || '',           // Module Name
+        hw.signal_type || ''            // Signal Type
+      ]);
+    }
+
+    // Add 5 blank rows for user to fill
+    for (let i = 0; i < 5; i++) {
+      worksheet.addRow([stationName, ctrlAddr, '', '', '', '', '', '']);
+    }
+
+    // Stream as download
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="HW_IO_List_AS01_$(date).xlsx"`);
+
+    await workbook.xlsx.write(res);
+    res.end();
   } catch (e) { err(res, 500, e.message); }
 });
 

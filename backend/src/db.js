@@ -1506,6 +1506,124 @@ async function ensureSchema() {
   await rawRun(`CREATE INDEX IF NOT EXISTS idx_compat_slot    ON hw_slot_subslot_compat(slot_order_no)`);
   await rawRun(`CREATE INDEX IF NOT EXISTS idx_compat_subslot ON hw_slot_subslot_compat(subslot_order_no)`);
 
+  // ── Generic hardware default-tree model (station→slot→subslot, family-free) ──
+  // Replaces hw_station_auto_slots' one-JSON-blob-per-station with real rows that
+  // recurse to any depth: parent_order_no is a station head order_no for slot rows,
+  // or a slot's/subslot's own order_no for subslot rows. No family/type vocabulary.
+  await rawRun(`CREATE TABLE IF NOT EXISTS hw_default_children (
+    id              SERIAL PRIMARY KEY,
+    parent_order_no TEXT NOT NULL,
+    position        INTEGER NOT NULL,
+    position_kind   TEXT NOT NULL CHECK (position_kind IN ('slot','subslot')),
+    child_order_no  TEXT NOT NULL,
+    hw_category     TEXT,
+    is_autocreated  BOOLEAN NOT NULL DEFAULT FALSE,
+    label           TEXT,
+    sort_order      INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(parent_order_no, position_kind, position)
+  )`);
+  await rawRun(`CREATE INDEX IF NOT EXISTS idx_hwdc_parent ON hw_default_children(parent_order_no)`);
+
+  // Parent-scoped body override — only needed when the same child order_no renders
+  // different body bytes under different parents (e.g. a PA "Analog Input (AI)"
+  // profile whose SLAVE_CFG_DATA differs by parent GSD device).
+  await rawRun(`CREATE TABLE IF NOT EXISTS hw_node_body_overrides (
+    id              SERIAL PRIMARY KEY,
+    parent_order_no TEXT NOT NULL,
+    order_no        TEXT NOT NULL,
+    hw_category     TEXT NOT NULL,
+    body_template   TEXT NOT NULL,
+    UNIQUE(parent_order_no, order_no, hw_category)
+  )`);
+
+  // hw_module_templates: fixed/removable + generic captured body text
+  await addColumnIfMissing('hw_module_templates', 'is_autocreated', 'is_autocreated BOOLEAN NOT NULL DEFAULT FALSE');
+  await addColumnIfMissing('hw_module_templates', 'is_removable', 'is_removable BOOLEAN NOT NULL DEFAULT TRUE');
+  await addColumnIfMissing('hw_module_templates', 'body_template', 'body_template TEXT');
+
+  // hw_slot_subslots: generalize into a per-node instance table. subslot_no IS NULL
+  // represents the slot's own identity/pip (needed for nodes with no owning hw_signals
+  // row, e.g. an interface or PA master). child_order_no replaces pa_profile's role
+  // (pa_profile already stored the plugged-in order_no for every family, not just PA).
+  await addColumnIfMissing('hw_slot_subslots', 'child_order_no', 'child_order_no TEXT');
+  await addColumnIfMissing('hw_slot_subslots', 'hw_category', 'hw_category TEXT');
+  await addColumnIfMissing('hw_slot_subslots', 'label', 'label TEXT');
+  await addColumnIfMissing('hw_slot_subslots', 'pip_no', 'pip_no INTEGER');
+  // The subslot's own process-image address (1st field of its ADDRESS line) —
+  // real per-instance data needed when several subslots on the same slot share
+  // one catalogue order_no (and thus one static body_template) but each still
+  // occupies a distinct process-image byte.
+  await addColumnIfMissing('hw_slot_subslots', 'local_address', 'local_address INTEGER');
+  await rawRun(`UPDATE hw_slot_subslots SET child_order_no = pa_profile WHERE child_order_no IS NULL AND pa_profile IS NOT NULL`);
+  {
+    const ssCols = await tableColumns('hw_slot_subslots');
+    if (ssCols.includes('subslot_no')) {
+      try { await rawRun(`ALTER TABLE hw_slot_subslots ALTER COLUMN subslot_no DROP NOT NULL`); } catch (e) { /* already nullable */ }
+    }
+  }
+  await rawRun(`CREATE UNIQUE INDEX IF NOT EXISTS idx_hwss_node_null
+    ON hw_slot_subslots(hw_import_id, station_address, slot) WHERE subslot_no IS NULL`);
+
+  // hw_signals: per-signal subslot dimension (full Excel/Symbol-Table scope)
+  await addColumnIfMissing('hw_signals', 'subslot_no', 'subslot_no INTEGER');
+
+  // Sync hw_station_auto_slots' JSON blobs into hw_default_children rows. The live
+  // table is left fully intact — still read/written by name in the existing
+  // station-auto-slots routes — so this stays additive/no behavior-change; the
+  // rename/retirement to `_legacy` happens in Phase 4 once those routes are
+  // repointed at hw_default_children.
+  // Both seed blobs (ET200SP interface, CFU interface+PA-master) contain only the
+  // always-present fixed structure, so every synced row is_autocreated = true;
+  // user-added removable defaults (e.g. CFU slot 1 DIQ8) were never in the blob and
+  // are (re)captured going forward via the CFG-capture path, not this sync.
+  // Runs as an upsert (not a one-time INSERT ... DO NOTHING) so hw_default_children
+  // stays a live-synced derived cache of the JSON blob — still the source of truth
+  // until Phase 4 — instead of a stale snapshot of whatever the blob looked like
+  // the first time this ran.
+  {
+    const hasOld = (await rawAll(
+      `SELECT table_name FROM information_schema.tables WHERE table_name = 'hw_station_auto_slots'`
+    )).length > 0;
+    if (hasOld) {
+      const blobs = await rawAll('SELECT order_no, auto_slots_config FROM hw_station_auto_slots');
+      let skippedNoOrderNo = 0;
+      for (const row of blobs) {
+        let config;
+        try { config = JSON.parse(row.auto_slots_config); } catch { continue; }
+        const slots = Array.isArray(config.slots) ? config.slots : [];
+        for (const slot of slots) {
+          const slotOrderNo = slot.order_no || `${row.order_no}::slot${slot.slot}`;
+          await rawRun(
+            `INSERT INTO hw_default_children
+               (parent_order_no, position, position_kind, child_order_no, hw_category, is_autocreated, label, sort_order)
+             VALUES (?, ?, 'slot', ?, 'slot', TRUE, ?, ?)
+             ON CONFLICT (parent_order_no, position_kind, position) DO UPDATE SET
+               child_order_no = EXCLUDED.child_order_no,
+               label          = EXCLUDED.label,
+               sort_order     = EXCLUDED.sort_order`,
+            [row.order_no, slot.slot, slotOrderNo, slot.label || null, slot.slot]
+          );
+          const subslots = Array.isArray(slot.subslots) ? slot.subslots : [];
+          for (const ss of subslots) {
+            if (!ss.order_no) { skippedNoOrderNo++; continue; }
+            await rawRun(
+              `INSERT INTO hw_default_children
+                 (parent_order_no, position, position_kind, child_order_no, hw_category, is_autocreated, label, sort_order)
+               VALUES (?, ?, 'subslot', ?, 'subslot', TRUE, ?, ?)
+               ON CONFLICT (parent_order_no, position_kind, position) DO UPDATE SET
+                 child_order_no = EXCLUDED.child_order_no,
+                 label          = EXCLUDED.label,
+                 sort_order     = EXCLUDED.sort_order`,
+              [slotOrderNo, ss.subslot, ss.order_no, ss.label || ss.port_label || null, ss.subslot]
+            );
+          }
+        }
+      }
+      console.log(`[DB] Synced ${blobs.length} auto-slot config(s) into hw_default_children` +
+        (skippedNoOrderNo ? ` (${skippedNoOrderNo} subslot(s) had no order_no — needs CFG-capture, e.g. CFU PA-master subslots)` : ''));
+    }
+  }
+
   // ── MRP Configuration Module ─────────────────────────────────────────────────
   await rawRun(`CREATE TABLE IF NOT EXISTS mrp_configs (
     id              SERIAL PRIMARY KEY,
@@ -2225,15 +2343,24 @@ async function createHwConfigFlatView() {
         s.router_address,
         s.as_assignment,
         s.slot,
+        s.subslot_no,
         s.module_order_no,
         s.module_name,
         s.signal_type,
         s.pip_no,
         s.potential_group,
-        s.pa_profile
+        -- PA-Profile now sourced from hw_slot_subslots.child_order_no (the generic
+        -- per-node "what's plugged in here" column); pa_profile kept as a COALESCE
+        -- fallback for rows captured before child_order_no was populated.
+        COALESCE(ss.child_order_no, s.pa_profile) AS pa_profile
       FROM hw_signals s
+      LEFT JOIN hw_slot_subslots ss
+        ON ss.hw_import_id    = s.hw_import_id
+       AND ss.station_address = s.station_address
+       AND ss.slot            = s.slot
+       AND ss.subslot_no IS NOT DISTINCT FROM s.subslot_no
       WHERE s.module_order_no != 'PLACEHOLDER'
-      ORDER BY s.station_address, s.slot;
+      ORDER BY s.station_address, s.slot, s.subslot_no;
     `);
   } catch (e) {
     console.error('[DB] Failed to create hw_config_flat view:', e.message);
@@ -2251,13 +2378,14 @@ async function createSymbolTableView() {
         station_address,
         station_name,
         slot,
+        subslot_no,
         channel,
         tag,
         description,
         signal_type
       FROM hw_signals
       WHERE tag IS NOT NULL
-      ORDER BY station_address, slot, channel;
+      ORDER BY station_address, slot, subslot_no, channel;
     `);
   } catch (e) {
     console.error('[DB] Failed to create symbol_table_flat view:', e.message);

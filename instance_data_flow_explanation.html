@@ -1,0 +1,369 @@
+<title>Instance Data Flow Explanation</title>
+<style>
+:root {
+  --primary: #3b82f6;
+  --secondary: #10b981;
+  --warning: #f59e0b;
+  --bg-light: #f3f4f6;
+  --border: #e5e7eb;
+  --text: #1f2937;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg-light: #1f2937;
+    --border: #374151;
+    --text: #f3f4f6;
+  }
+}
+
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  line-height: 1.6;
+  color: var(--text);
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
+h1, h2 {
+  color: var(--primary);
+  margin-top: 30px;
+}
+
+.box {
+  background: var(--bg-light);
+  border-left: 4px solid var(--primary);
+  padding: 15px;
+  margin: 15px 0;
+  border-radius: 4px;
+}
+
+.example {
+  background: var(--bg-light);
+  border-left: 4px solid var(--secondary);
+  padding: 15px;
+  margin: 15px 0;
+  border-radius: 4px;
+  font-family: 'Courier New', monospace;
+  font-size: 13px;
+}
+
+.flow-step {
+  margin: 20px 0;
+  padding: 15px;
+  background: var(--bg-light);
+  border-radius: 8px;
+  border-left: 4px solid var(--primary);
+}
+
+.step-number {
+  display: inline-block;
+  background: var(--primary);
+  color: white;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  text-align: center;
+  line-height: 30px;
+  margin-right: 10px;
+  font-weight: bold;
+}
+
+.arrow {
+  text-align: center;
+  font-size: 24px;
+  color: var(--primary);
+  margin: 10px 0;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 15px 0;
+}
+
+th, td {
+  border: 1px solid var(--border);
+  padding: 10px;
+  text-align: left;
+}
+
+th {
+  background: var(--primary);
+  color: white;
+}
+
+code {
+  background: var(--bg-light);
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-family: 'Courier New', monospace;
+}
+
+.database {
+  color: var(--secondary);
+  font-weight: bold;
+}
+
+.file {
+  color: var(--warning);
+  font-weight: bold;
+}
+</style>
+
+<h1>📊 How Instance Data Flows During XML Generation</h1>
+
+<p>This explanation is written for beginners. Think of it like a recipe: ingredients (data) come from a storage place (database), get processed (XML generation), and become a final dish (XML file).</p>
+
+<h2>🎯 The Big Picture</h2>
+
+<div class="box">
+  <strong>Instance Data Journey:</strong>
+  <br><br>
+  Database <span class="arrow">→</span> Backend reads it <span class="arrow">→</span> Process it <span class="arrow">→</span> Create XML <span class="arrow">→</span> Return XML
+</div>
+
+<h2>📍 Step-by-Step Breakdown</h2>
+
+<div class="flow-step">
+  <span class="step-number">1</span>
+  <strong>User Clicks "Generate XML"</strong>
+  <p>Frontend sends a request to the backend saying "Generate XML for these instances"</p>
+  <p><span class="file">File:</span> generate.js (lines 612-624)</p>
+  <div class="example">
+POST /api/generate
+Body: {
+  projectName: "AS01",
+  instances: [
+    { cmType: "CM_AO", instanceName: "CM_A01", samplingTime: "1000" }
+  ]
+}
+  </div>
+</div>
+
+<div class="flow-step">
+  <span class="step-number">2</span>
+  <strong>Backend Receives Request</strong>
+  <p>The <code>generate.js</code> file receives the request in the <code>runGeneration</code> function.</p>
+  <p><span class="file">Function:</span> <code>runGeneration(db, body, onProgress)</code> (line 27)</p>
+  <div class="box">
+    <strong>What happens:</strong>
+    <ul>
+      <li>Extract project name and list of instances</li>
+      <li>Look up the project in the database</li>
+      <li>Get instance-specific data from the database</li>
+    </ul>
+  </div>
+</div>
+
+<div class="flow-step">
+  <span class="step-number">3</span>
+  <strong>Reading Instance Data from Database</strong>
+  <p>The backend queries a <span class="database">database table</span> called <code>project_instances</code> to get all the saved data about each instance.</p>
+
+  <table>
+    <tr>
+      <th>Database Table</th>
+      <th>What It Stores</th>
+    </tr>
+    <tr>
+      <td><code>project_instances</code></td>
+      <td>
+        • instance name<br>
+        • CM type<br>
+        • sampling time<br>
+        • enabled blocks<br>
+        • connections<br>
+        • role assignments<br>
+        • folder location
+      </td>
+    </tr>
+    <tr>
+      <td><code>instance_matrix_overrides</code></td>
+      <td>Custom values for matrix instances (user overrides)</td>
+    </tr>
+    <tr>
+      <td><code>lib_cm_types</code></td>
+      <td>The "template" for each CM type (blocks, variables, messages)</td>
+    </tr>
+  </table>
+
+  <p><span class="file">File:</span> generate.js (lines 40-165)</p>
+</div>
+
+<div class="flow-step">
+  <span class="step-number">4</span>
+  <strong>Resolve Each Instance</strong>
+  <p>For each instance, the backend calls <code>resolveInstance()</code> function to:</p>
+  <ul>
+    <li>Load the CM type template (like a blueprint)</li>
+    <li>Get all the blocks and variables for that CM type</li>
+    <li>Combine template data with instance-specific customizations</li>
+  </ul>
+
+  <p><span class="file">Function:</span> <code>resolveInstance(inst)</code> (lines 322-413)</p>
+
+  <div class="example">
+// Instance data being resolved:
+{
+  instanceName: "CM_A01",
+  cmTypeName: "CM_AO",
+  samplingTime: "1000",
+  enabledBlocks: ["AIF_FRONT", "CSF"],
+  roleAssignments: { ... }
+}
+  </div>
+</div>
+
+<div class="flow-step">
+  <span class="step-number">5</span>
+  <strong>Load CM Type Template</strong>
+  <p>The backend queries the library to get the CM type's structure (what blocks and variables it has):</p>
+
+  <div class="example">
+SELECT * FROM lib_cm_types WHERE name = ?
+  // Gets the CM_AO template structure
+
+SELECT * FROM lib_blocks WHERE cm_type_id = ?
+  // Gets all blocks in CM_AO (like "AIF_FRONT", "CSF", etc.)
+
+SELECT * FROM lib_variables WHERE block_id = ?
+  // Gets variables for each block
+  </div>
+
+  <p><span class="file">Queries:</span> lines 262-283</p>
+</div>
+
+<div class="flow-step">
+  <span class="step-number">6</span>
+  <strong>Combine Data: Template + Instance Customization</strong>
+  <p>Now the backend has:</p>
+  <ul>
+    <li><strong>Template:</strong> What a CM_AO should look like (from library)</li>
+    <li><strong>Instance Data:</strong> How THIS specific instance is customized</li>
+  </ul>
+
+  <p>Example combinations:</p>
+  <table>
+    <tr>
+      <th>Data Type</th>
+      <th>From Template</th>
+      <th>From Instance</th>
+      <th>Final Result</th>
+    </tr>
+    <tr>
+      <td>Sampling Time</td>
+      <td>"1000"</td>
+      <td>"500"</td>
+      <td>"500" (instance wins)</td>
+    </tr>
+    <tr>
+      <td>Blocks</td>
+      <td>10 blocks</td>
+      <td>User selected 5</td>
+      <td>Only 5 blocks</td>
+    </tr>
+    <tr>
+      <td>Role Assignments</td>
+      <td>Generic</td>
+      <td>Custom roles</td>
+      <td>Custom roles</td>
+    </tr>
+  </table>
+</div>
+
+<div class="flow-step">
+  <span class="step-number">7</span>
+  <strong>Generate XML</strong>
+  <p>Now the backend calls <code>generateXML()</code> with all the resolved instance data.</p>
+
+  <p><span class="file">File:</span> xmlGenerator.js (line 563)</p>
+
+  <div class="box">
+    <strong>The XML generator creates:</strong>
+    <ul>
+      <li>&lt;ControlModule&gt; - one per instance</li>
+      <li>&lt;Block&gt; - one per enabled block</li>
+      <li>&lt;Variable&gt; - one per variable in each block</li>
+      <li>&lt;Message&gt; - alerts/warnings for the instance</li>
+      <li>&lt;IOTag&gt; - hardware connections</li>
+    </ul>
+  </div>
+</div>
+
+<div class="flow-step">
+  <span class="step-number">8</span>
+  <strong>Return XML to User</strong>
+  <p>The XML is sent back to the frontend and the user can download it.</p>
+</div>
+
+<h2>💾 Database Tables Used During Generation</h2>
+
+<table>
+  <tr>
+    <th>Table Name</th>
+    <th>Purpose</th>
+    <th>Instance-Specific?</th>
+  </tr>
+  <tr>
+    <td><code>project_instances</code></td>
+    <td>Stores each instance's settings (name, CM type, sampling time, etc.)</td>
+    <td>✅ YES</td>
+  </tr>
+  <tr>
+    <td><code>lib_cm_types</code></td>
+    <td>Template/blueprint for CM types</td>
+    <td>❌ NO (shared template)</td>
+  </tr>
+  <tr>
+    <td><code>lib_blocks</code></td>
+    <td>Available blocks in each CM type</td>
+    <td>❌ NO (shared template)</td>
+  </tr>
+  <tr>
+    <td><code>lib_variables</code></td>
+    <td>Variables in each block</td>
+    <td>❌ NO (shared template)</td>
+  </tr>
+  <tr>
+    <td><code>instance_matrix_overrides</code></td>
+    <td>Custom values user set for matrix instances</td>
+    <td>✅ YES</td>
+  </tr>
+  <tr>
+    <td><code>instance_derived_values</code></td>
+    <td>Calculated/special values for instances</td>
+    <td>✅ YES</td>
+  </tr>
+</table>
+
+<h2>🔄 Simple Analogy</h2>
+
+<div class="box">
+  <strong>Think of it like ordering a pizza:</strong>
+  <ul>
+    <li><strong>Template (CM Type):</strong> The basic pizza recipe (crust, sauce, cheese)</li>
+    <li><strong>Instance Data (project_instances table):</strong> Your specific order - "add pepperoni, no onions, extra cheese on the left side"</li>
+    <li><strong>Customizations (matrix overrides, role assignments):</strong> Special requests - "make it spicy, cut into 8 slices"</li>
+    <li><strong>XML Generation:</strong> The pizza maker combines the recipe with your customizations and makes your pizza</li>
+    <li><strong>Result (XML):</strong> Your customized pizza delivered to you</li>
+  </ul>
+</div>
+
+<h2>📝 Key Takeaways</h2>
+
+<div class="box">
+  <ul>
+    <li><strong>Data Storage:</strong> Instance-specific data lives in the database, in the <code>project_instances</code> table</li>
+    <li><strong>Data Retrieval:</strong> When generating XML, the backend queries the database using SQL to get instance data</li>
+    <li><strong>Data Combination:</strong> The backend combines the template (CM type) with instance-specific customizations</li>
+    <li><strong>XML Creation:</strong> The xmlGenerator uses this combined data to create XML elements</li>
+    <li><strong>Main Files:</strong>
+      <ul>
+        <li><code>generate.js</code> - handles the request and loads data from database</li>
+        <li><code>xmlGenerator.js</code> - creates the actual XML using that data</li>
+      </ul>
+    </li>
+  </ul>
+</div>

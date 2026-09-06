@@ -6,6 +6,7 @@ import {
   themeQuartz,
 } from "ag-grid-community";
 import StationAutoSlotsEditor from "./StationAutoSlotsEditor.jsx";
+import SlotDefaultSubslotsEditor from "./SlotDefaultSubslotsEditor.jsx";
 import { getModuleParametersGrouped, updateModuleChannelParameter, updateModuleLevelParameter, updateModuleParameterVisibility } from "./api.js";
 import "./InstancesGrid.css";
 
@@ -35,6 +36,7 @@ function sigBadge(type) {
   const colors = {
     DI: ["#e8f5e9", "#2e7d32"], DO: ["#fff3e0", "#e65100"],
     AI: ["#e3f2fd", "#1565c0"], AO: ["#fce4ec", "#880e4f"],
+    IB: ["#e0f7fa", "#006064"], QB: ["#fdf3e0", "#bf360c"],
     PA: ["#f3e5f5", "#6a1b9a"], INFRA: ["#f5f5f5", "#616161"],
     MIXED: ["#fffde7", "#f57f17"],
   };
@@ -42,7 +44,7 @@ function sigBadge(type) {
   return { background: bg, color: fg, borderRadius: 4, padding: "1px 6px", fontSize: 11, fontWeight: 700 };
 }
 
-const SIG_TYPES = ['DI', 'DO', 'AI', 'AO', 'PA', 'INFRA', 'MIXED'];
+const SIG_TYPES = ['DI', 'DO', 'AI', 'AO', 'IB', 'QB', 'PA', 'INFRA', 'MIXED'];
 
 // Postgres returns is_visible as a boolean (true/false); older SQLite data used
 // integers (1/0). A parameter is hidden only when the value is explicitly falsy
@@ -479,6 +481,36 @@ export default function CatalogueGrid({
       ),
     },
     {
+      headerName: "Fixed",
+      field: "is_autocreated",
+      filter: "agTextColumnFilter",
+      floatingFilter: false,
+      minWidth: 90,
+      maxWidth: 100,
+      sortable: true,
+      cellStyle: { display: "flex", alignItems: "center", justifyContent: "center" },
+      cellRenderer: (p) => (
+        <span title={p.data.is_autocreated ? 'AUTOCREATED — always present, not user-removable' : (p.data.is_removable === false ? 'Not removable' : 'Removable')}>
+          {p.data.is_autocreated ? '🔒 fixed' : (p.data.is_removable === false ? '🔒' : '—')}
+        </span>
+      ),
+    },
+    {
+      headerName: "Body",
+      field: "body_template",
+      filter: false,
+      floatingFilter: false,
+      minWidth: 70,
+      maxWidth: 80,
+      sortable: false,
+      cellStyle: { display: "flex", alignItems: "center", justifyContent: "center" },
+      cellRenderer: (p) => (
+        <span title={p.value ? 'Captured body template available' : 'No captured body template'}>
+          {p.value ? '✓' : '—'}
+        </span>
+      ),
+    },
+    {
       headerName: "",
       colId: "configure",
       sortable: false,
@@ -688,10 +720,12 @@ function ConfigureModal({ data, templates, compatBySlot, compatBySubslot, onAssi
   const isSlot = data.hw_category === 'slot';
   const isSubslot = data.hw_category === 'subslot';
   const isIOCard = ['DI', 'DO', 'AI', 'AO'].includes(data.signal_type);
+  const hasParametersAvailable = params?.moduleLevel?.length > 0 || params?.channelLevel?.length > 0;
 
   // Load parameters when modal opens or data changes
+  // Try to load for all modules, not just IO cards (GSDML modules may have parameters too)
   React.useEffect(() => {
-    if (!data.id || !isIOCard) {
+    if (!data.id) {
       setParams(null);
       return;
     }
@@ -700,7 +734,7 @@ function ConfigureModal({ data, templates, compatBySlot, compatBySubslot, onAssi
       .then(p => setParams(p))
       .catch(e => { console.warn("Failed to load parameters:", e); setParams(null); })
       .finally(() => setParamsLoading(false));
-  }, [data.id, isIOCard]);
+  }, [data.id]);
 
   // Handle field changes and save to database
   const handleFieldChange = (field, value) => {
@@ -763,7 +797,7 @@ function ConfigureModal({ data, templates, compatBySlot, compatBySubslot, onAssi
         </div>
 
         {/* Tabs */}
-        {(isStation || isIOCard) && (
+        {(isStation || isIOCard || !paramsLoading) && (
           <div style={{
             display: 'flex',
             gap: 0,
@@ -786,7 +820,7 @@ function ConfigureModal({ data, templates, compatBySlot, compatBySubslot, onAssi
             >
               Overview
             </button>
-            {isIOCard && (
+            {(isIOCard || hasParametersAvailable) && (
               <button
                 onClick={() => setActiveTab('parameters')}
                 style={{
@@ -803,7 +837,7 @@ function ConfigureModal({ data, templates, compatBySlot, compatBySubslot, onAssi
                 Parameters
               </button>
             )}
-            {isStation && (
+            {(isStation || isSlot) && (
               <button
                 onClick={() => setActiveTab('autoSlot')}
                 style={{
@@ -1014,7 +1048,7 @@ function ConfigureModal({ data, templates, compatBySlot, compatBySubslot, onAssi
             </>
           )}
 
-          {activeTab === 'autoSlot' && (
+          {activeTab === 'autoSlot' && isStation && (
             <StationAutoSlotsEditor
               station={{ orderNo: data.order_no }}
               catalogue={templates}
@@ -1023,7 +1057,14 @@ function ConfigureModal({ data, templates, compatBySlot, compatBySubslot, onAssi
             />
           )}
 
-          {activeTab === 'parameters' && isIOCard && (
+          {activeTab === 'autoSlot' && isSlot && (
+            <SlotDefaultSubslotsEditor
+              orderNo={data.order_no}
+              inlineMode={true}
+            />
+          )}
+
+          {activeTab === 'parameters' && (isIOCard || hasParametersAvailable) && (
             <div>
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', margin: '0 0 16px 0' }}>
                 <h3 style={{ margin: 0, fontSize: '14px', fontWeight: 600, color: '#111' }}>
@@ -1696,6 +1737,36 @@ function FamilyView({ templates, quickFilter, onConfigure, onAutoSlotConfig, onA
           onPatchTemplate={onPatchTemplate}
           onAddSigType={onAddSigType}
         />
+      ),
+    },
+    {
+      headerName: "Fixed",
+      field: "is_autocreated",
+      filter: "agTextColumnFilter",
+      floatingFilter: false,
+      minWidth: 90,
+      maxWidth: 100,
+      sortable: true,
+      cellStyle: { display: "flex", alignItems: "center", justifyContent: "center" },
+      cellRenderer: (p) => (
+        <span title={p.data.is_autocreated ? 'AUTOCREATED — always present, not user-removable' : (p.data.is_removable === false ? 'Not removable' : 'Removable')}>
+          {p.data.is_autocreated ? '🔒 fixed' : (p.data.is_removable === false ? '🔒' : '—')}
+        </span>
+      ),
+    },
+    {
+      headerName: "Body",
+      field: "body_template",
+      filter: false,
+      floatingFilter: false,
+      minWidth: 70,
+      maxWidth: 80,
+      sortable: false,
+      cellStyle: { display: "flex", alignItems: "center", justifyContent: "center" },
+      cellRenderer: (p) => (
+        <span title={p.value ? 'Captured body template available' : 'No captured body template'}>
+          {p.value ? '✓' : '—'}
+        </span>
       ),
     },
     {

@@ -4,6 +4,91 @@ const { findTemplate, isGsdPaPath, defaultIdentifiers } = require('./hwAddressEn
 const { loadStationAutoSlotConfig, buildSlotMap, buildSubslotMap, isSlotAutocreated, isSubslotAutocreated, resolveSlotOrderNo, resolveSubslotOrderNo } = require('./autoSlotResolver');
 const blocks = require('./cfgBlocks');
 
+// `templateMap` is a flat Map<order_no, row> and can collide across hw_category
+// values for the same order_no (e.g. a GSDML device's own order_no is reused for
+// its 'station' head row AND its 'slot' SLOT-0 row). Resolve SLOT 0's own
+// identity via a direct, category-filtered query instead, mirroring the pattern
+// already used for CFU_PA's head/slot0 resolution.
+async function findSlotZeroTemplate(db, orderNo) {
+  if (!db || !orderNo) return null;
+  return db.prepare(
+    `SELECT * FROM hw_module_templates WHERE order_no = ? AND hw_category = 'slot' LIMIT 1`
+  ).get(orderNo);
+}
+
+// Same collision as findSlotZeroTemplate, for the device-header ('station') row.
+// Falls back to the ambiguous templateMap lookup only when no 'station'-category
+// row exists at all for this order_no (defensive — every seen catalogue so far
+// has one for any order_no used as a device head).
+async function findStationTemplate(db, orderNo, templateMap) {
+  if (!orderNo) return null;
+  if (db) {
+    const row = await db.prepare(
+      `SELECT * FROM hw_module_templates WHERE order_no = ? AND hw_category = 'station' LIMIT 1`
+    ).get(orderNo);
+    if (row) return row;
+  }
+  return findTemplate(templateMap, orderNo);
+}
+
+// The generic (non-ET200SP/CFU/Scalance) fallback's SLOT 0 SUBSLOT 1 (PN-IO
+// interface) has no per-device HSP name — PCS7 uses one shared, family-agnostic
+// order_no for it regardless of which device is plugged. Not device-specific:
+// every device on this fallback path (Festo, GSDML, ~100 future devices) uses
+// the exact same catalogue row.
+const GENERIC_IFACE_ORDER_NO = '_S7H_IO_NORM_INTERFACE_CT';
+async function findGenericIfaceTemplate(db) {
+  if (!db) return null;
+  return db.prepare(
+    `SELECT * FROM hw_module_templates WHERE order_no = ? AND hw_category = 'subslot' LIMIT 1`
+  ).get(GENERIC_IFACE_ORDER_NO);
+}
+
+// Generic SLOT 0 port lookup (ground-truth rule 6's "both ports" case): unlike
+// the interface subslot, a port's identity is the device's OWN order_no, not a
+// shared literal — so this is keyed per-device, same shape as findSlotZeroTemplate.
+async function findSubslotTemplate(db, orderNo) {
+  if (!db || !orderNo) return null;
+  return db.prepare(
+    `SELECT * FROM hw_module_templates WHERE order_no = ? AND hw_category = 'subslot' LIMIT 1`
+  ).get(orderNo);
+}
+
+/**
+ * Resolve the display label for a slot's subslot position.
+ *
+ * `hw_slot_subslots.label` is denormalized display text captured once — at CFG
+ * parse time, or when the position's default was materialized. Changing a
+ * position's profile updates its order_no but can leave that cached label
+ * describing the *previous* profile, which would then be emitted alongside the
+ * new order_no. Detect that generically: a stored label that is some other
+ * catalogue subslot's display_name (not this order_no's own) is stale, so the
+ * current profile's display_name is used instead. A label PCS7 itself wrote
+ * (often truncated, e.g. "IO-Link I/O 1/1 Byte, P~") matches no display_name at
+ * all and is therefore preserved verbatim, keeping CFG round-trips lossless.
+ */
+async function resolveSubslotLabel(db, real, dflt, ssTpl, subslotOrder) {
+  const stored = real && real.label ? real.label : null;
+  if (stored) {
+    if (ssTpl && ssTpl.display_name === stored) return stored;
+    const owner = db ? await db.prepare(
+      `SELECT order_no FROM hw_module_templates WHERE hw_category='subslot' AND display_name=? LIMIT 1`
+    ).get(stored) : null;
+    if (!owner || owner.order_no === subslotOrder) return stored;
+  }
+  if (ssTpl && ssTpl.display_name) return ssTpl.display_name;
+  if (dflt) return dflt.port_label || dflt.label || '';
+  return stored || '';
+}
+
+// A slot ≥1 module's own header, keyed the same way (per-device, hw_category='slot').
+async function findSlotModuleTemplate(db, orderNo) {
+  if (!db || !orderNo) return null;
+  return db.prepare(
+    `SELECT * FROM hw_module_templates WHERE order_no = ? AND hw_category = 'slot' LIMIT 1`
+  ).get(orderNo);
+}
+
 // I/O modules that PCS7 does NOT wrap in a REDUNDANCY block even on an H-station.
 const NON_REDUNDANT_ORDERS = new Set([
   '6ES7 135-6TD00-0CA1', // ET200SP AQ4 x I HART
@@ -129,6 +214,18 @@ function buildAddressLines(tpl, slot, warnings, ctx) {
   const channels = slot.channels ? [...slot.channels.values()] : [];
   const pipNo = slot.pipNo != null ? slot.pipNo : null;
   const isMixed = tpl && tpl.signal_type === 'MIXED';
+  // MIXED covers two unrelated shapes (see isAnalog / deriveSignalType). Only the
+  // bit-packed digital kind — no declared datatype, e.g. DIQ8 — splits its
+  // channels by DI/DO signal type onto the two directions. A byte/word-oriented
+  // MIXED card (an IO-Link port, default_datatype "Byte") has one flat run of
+  // typed channels instead, laid out sequentially across the input byte block
+  // and then the output one, exactly like every other card in this model.
+  const isDigitalMixed = isMixed && !(tpl && tpl.default_datatype);
+  const chCount = (tpl && tpl.channel_count) || 0;
+  const totalBytes = tpl ? ((tpl.input_bytes || 0) + (tpl.output_bytes || 0)) : 0;
+  const bytesPerCh = (isMixed && !isDigitalMixed && chCount > 0) ? totalBytes / chCount : 0;
+  // How many of the flat channel run belong to the input block; the rest are output.
+  const inChCount = bytesPerCh > 0 ? Math.round((tpl.input_bytes || 0) / bytesPerCh) : 0;
 
   const addrLines = [];
   const symbolLines = [];
@@ -136,16 +233,31 @@ function buildAddressLines(tpl, slot, warnings, ctx) {
   if (tpl && tpl.input_bytes > 0 && slot.inputAddr != null && tpl.in_addr_fmt) {
     const fields = patchPip(fillAddrFmt(tpl.in_addr_fmt, slot.inputAddr), pipNo);
     addrLines.push('LOCAL_IN_ADDRESSES', `  ADDRESS  ${fields}`);
-    // MIXED (DIQ8): only DI channels → input uses "I"; pass totalBytes=0 so byteOfs=0 for all (bit-packed)
-    const inChannels = isMixed ? channels.filter(c => c.signalType === 'DI') : channels;
-    symbolLines.push(...buildSymbolLines('I', inChannels, isMixed ? 0 : tpl.input_bytes, isMixed ? 1 : (tpl.channel_count || 0)));
+    if (isDigitalMixed) {
+      // Only DI channels → input uses "I"; totalBytes=0 makes byteOfs the bit index.
+      symbolLines.push(...buildSymbolLines('I', channels.filter(c => c.signalType === 'DI'), 0, 1));
+    } else if (isMixed) {
+      const inChannels = channels.filter(c => (Number(c.channel) || 0) < inChCount);
+      symbolLines.push(...buildSymbolLines('I', inChannels, tpl.input_bytes, inChCount));
+    } else {
+      symbolLines.push(...buildSymbolLines('I', channels, tpl.input_bytes, chCount));
+    }
   }
   if (tpl && tpl.output_bytes > 0 && slot.outputAddr != null && tpl.out_addr_fmt) {
     const fields = patchPip(fillAddrFmt(tpl.out_addr_fmt, slot.outputAddr), pipNo);
     addrLines.push('LOCAL_OUT_ADDRESSES', `  ADDRESS  ${fields}`);
-    // MIXED (DIQ8): only DO channels → output always uses "O"
-    const outChannels = isMixed ? channels.filter(c => c.signalType === 'DO') : channels;
-    symbolLines.push(...buildSymbolLines('O', outChannels, isMixed ? 0 : tpl.output_bytes, isMixed ? 1 : (tpl.channel_count || 0)));
+    if (isDigitalMixed) {
+      // Only DO channels → output always uses "O".
+      symbolLines.push(...buildSymbolLines('O', channels.filter(c => c.signalType === 'DO'), 0, 1));
+    } else if (isMixed) {
+      // Output offsets are relative to the output block, so rebase past the inputs.
+      const outChannels = channels
+        .filter(c => (Number(c.channel) || 0) >= inChCount)
+        .map(c => ({ ...c, channel: (Number(c.channel) || 0) - inChCount }));
+      symbolLines.push(...buildSymbolLines('O', outChannels, tpl.output_bytes, chCount - inChCount));
+    } else {
+      symbolLines.push(...buildSymbolLines('O', channels, tpl.output_bytes, chCount));
+    }
   }
 
   // All address blocks first, then all SYMBOL lines — PCS7 requires this order
@@ -165,7 +277,7 @@ async function buildParamLines(tpl, potentialGroup, db, assignedChannels = null)
   let lines = [];
 
   // Try to fetch normalized parameters from DB by exact order_no match
-  if (db && tpl && tpl.order_no && tpl.signal_type && ['DI', 'DO', 'AI', 'AO'].includes(tpl.signal_type)) {
+  if (db && tpl && tpl.order_no && tpl.signal_type && ['DI', 'DO', 'AI', 'AO', 'IB', 'QB'].includes(tpl.signal_type)) {
     try {
       const params = await db.prepare(`
         SELECT p.id, p.parameter_name, p.channel_type, p.channel_no, p.parameter_type,
@@ -241,22 +353,39 @@ async function renderEt200sp(station, templateMap, ioNo, diag, warnings, autoSlo
   const hexRouter = station.routerAddress ? ipToHex(station.routerAddress) : null;
 
   const headSlot = station.slots.get(0);
-  const headTpl  = headSlot ? findTemplate(templateMap, headSlot.orderNo) : null;
+  const headTpl  = headSlot ? await findStationTemplate(db, headSlot.orderNo, templateMap) : null;
   const imOrder  = headSlot ? headSlot.orderNo : '6ES7 155-6AU00-0CN0';
   const imVer    = headTpl && headTpl.version ? headTpl.version : 'V4.2';
   const ifaceOrder = blocks.ifaceOrderString(imOrder, imVer);
+  // PN_DEVICE_SCF_L and PN_DEVICE_UPD_TIME both reflect configuration
+  // complexity: "0" on a bare default station, "32"/"2" respectively once any
+  // additional module is plugged (confirmed against all three ET200SP
+  // fixtures — a station-shape fact, not a per-order_no constant).
+  const stationHasCards = [...station.slots.keys()].some(s => s !== 0);
+  const scfL = stationHasCards ? '32' : '0';
+  const updTime = stationHasCards ? '2' : '0';
 
-  // Device header + SLOT 0 + interface + auto-created subslots from config
-  out.push(blocks.deviceHeaderBlock({ ioNo, addr, imOrder, imVersion: imVer, name, posX: station.posX, posY: station.posY }));
-  out.push(blocks.slot0Block({ ioNo, addr, imOrder, name, hexIp, hexRouter, diag: diag.ptr-- }));
+  // Device header + SLOT 0 + interface + auto-created subslots from config.
+  // Header body text is per (order_no, role) (ground-truth rule 6) — when a real
+  // captured body_template exists for this order_no's own device-header row, use
+  // it verbatim (placeholder-filled) instead of the generic hardcoded field list.
+  out.push(headTpl && headTpl.body_template
+    ? blocks.deviceHeaderBlockFromTemplate({ ioNo, addr, imOrder, imVersion: imVer, name, bodyTemplate: headTpl.body_template, posX: station.posX, posY: station.posY })
+    : blocks.deviceHeaderBlock({ ioNo, addr, imOrder, imVersion: imVer, name, posX: station.posX, posY: station.posY, scfL, updTime }));
+  const slot0Tpl = await findSlotZeroTemplate(db, imOrder);
+  out.push(slot0Tpl && slot0Tpl.body_template
+    ? blocks.slot0BlockFromTemplate({ ioNo, addr, imOrder, name, bodyTemplate: slot0Tpl.body_template, hexIp, hexRouter, diag: diag.ptr-- })
+    : blocks.slot0Block({ ioNo, addr, imOrder, name, hexIp, hexRouter, diag: diag.ptr-- }));
   out.push(blocks.ifaceBlock({ ioNo, addr, ifaceOrder, diag: diag.ptr-- }));
 
-  // Auto-create subslots (ports) from config
+  // Auto-create subslots (ports) from config. Subslot 1 (type 'subslot', the
+  // PN-IO interface) is already emitted above via ifaceBlock — only emit
+  // entries whose type is 'port' here, or the interface subslot renders twice.
   if (autoSlotConfig && autoSlotConfig.slots) {
     const slot0Config = autoSlotConfig.slots.find(s => s.slot === 0);
     if (slot0Config && slot0Config.subslots) {
       for (const subslot of slot0Config.subslots) {
-        if (subslot.order_no) {
+        if (subslot.order_no && subslot.type === 'port') {
           out.push(blocks.portBlock({
             ioNo, addr, subslot: subslot.subslot,
             portLabel: subslot.port_label || subslot.label,
@@ -336,13 +465,40 @@ async function renderCfuPa(station, templateMap, ioNo, diag, warnings, autoSlotC
   const hexIp     = ipToHex(station.ip);
   const hexRouter = station.routerAddress ? ipToHex(station.routerAddress) : null;
 
+  // Head and slot 0 can be separate catalogue records with different order_no/
+  // version (e.g. CFU_PA: head "V_2_0_PA:..." vs slot 0 "V_2_0_PA_ETER:...").
+  // `templateMap` is keyed only by order_no and can collide across hw_category
+  // values for the same order_no, so resolve identity via direct, category-
+  // filtered DB queries instead: slot 0's own 'slot' row, then the family's
+  // single 'station' row for the device header. Falls back to slot 0's own
+  // identity when no distinct 'station' row exists (ET200SP, IO-Link).
   const headSlot = station.slots.get(0);
-  const headTpl  = headSlot ? findTemplate(templateMap, headSlot.orderNo) : null;
-  const imOrder  = headSlot ? headSlot.orderNo : 'V_2_0_PA:6ES7 655-5PX11-0XX0';
-  const imVer    = headTpl && headTpl.version ? headTpl.version : 'V2.0';
+  let imOrder = headSlot ? headSlot.orderNo : 'V_2_0_PA:6ES7 655-5PX11-0XX0';
+  let imVer = 'V2.0';
+  let slot0Version = 'V2.0';
 
-  // Resolve slot 0 order from config (explicit order_no from DB)
-  let slot0Order = imOrder;
+  if (headSlot && headSlot.orderNo && db) {
+    const slot0Row = await db.prepare(
+      `SELECT * FROM hw_module_templates WHERE order_no = ? AND hw_category = 'slot' LIMIT 1`
+    ).get(headSlot.orderNo);
+    if (slot0Row) {
+      slot0Version = slot0Row.version || slot0Version;
+      imVer = slot0Version;
+      if (slot0Row.family) {
+        const stationRow = await db.prepare(
+          `SELECT * FROM hw_module_templates WHERE hw_category = 'station' AND family = ? LIMIT 1`
+        ).get(slot0Row.family);
+        if (stationRow) {
+          imOrder = stationRow.order_no;
+          imVer = stationRow.version || slot0Version;
+        }
+      }
+    }
+  }
+
+  // Resolve slot 0 order from config (explicit order_no from DB), else keep
+  // slot 0's own identity (may differ from the device header's).
+  let slot0Order = headSlot ? headSlot.orderNo : imOrder;
   if (autoSlotConfig && autoSlotConfig.slots) {
     const slot0Config = autoSlotConfig.slots.find(s => s.slot === 0);
     if (slot0Config && slot0Config.order_no) {
@@ -352,20 +508,23 @@ async function renderCfuPa(station, templateMap, ioNo, diag, warnings, autoSlotC
 
   // Device header + Slot 0 + IFACE + auto-created subslots from config
   out.push(blocks.cfuPaDeviceHeaderBlock({ ioNo, addr, imOrder, imVersion: imVer, name, posX: station.posX, posY: station.posY }));
-  out.push(blocks.cfuPaSlot0Block({ ioNo, addr, slot0Order, name, hexIp, hexRouter, diag: diag.ptr-- }));
-  out.push(blocks.cfuPaIfaceBlock({ ioNo, addr, diag: diag.ptr-- }));
+  out.push(blocks.cfuPaSlot0Block({ ioNo, addr, slot0Order, version: slot0Version, name, hexIp, hexRouter, diag: diag.ptr-- }));
+  out.push(blocks.cfuPaIfaceBlock({ ioNo, addr, name, diag: diag.ptr-- }));
 
-  // Auto-create subslots (ports) from config
+  // Auto-create subslots (ports) from config. Subslot 1 (type 'subslot', the
+  // PN-IO interface) is already emitted above via cfuPaIfaceBlock — only emit
+  // entries whose type is 'port' here, or the interface subslot renders twice.
   if (autoSlotConfig && autoSlotConfig.slots) {
     const slot0Config = autoSlotConfig.slots.find(s => s.slot === 0);
     if (slot0Config && slot0Config.subslots) {
       for (const subslot of slot0Config.subslots) {
-        if (subslot.order_no) {
+        if (subslot.order_no && subslot.type === 'port') {
           out.push(blocks.portBlock({
             ioNo, addr, subslot: subslot.subslot,
             portLabel: subslot.port_label || subslot.label,
             portOrder: subslot.order_no,
-            diag: diag.ptr--
+            diag: diag.ptr--,
+            includePrivate6: true,
           }));
         }
       }
@@ -589,7 +748,7 @@ function renderScalance(station, templateMap, ioNo, diag, db) {
 async function renderStation(station, templateMap, ioNo, diag, warnings, db) {
   const headSlot = station.slots.get(0) ||
     station.slots.get([...station.slots.keys()].sort((a, b) => a - b)[0]);
-  const headTpl  = headSlot ? findTemplate(templateMap, headSlot.orderNo) : null;
+  const headTpl  = headSlot ? await findStationTemplate(db, headSlot.orderNo, templateMap) : null;
   const family   = headTpl ? headTpl.family : 'ET200SP';
 
   // Load auto-slot config from database using station (slot 0) order_no
@@ -618,15 +777,43 @@ async function renderStation(station, templateMap, ioNo, diag, warnings, db) {
   const imVer = headTpl && headTpl.version ? headTpl.version : '';
   // Prefer MLFB from slot (extracted from baseline CFG) over template; fallback to template's mlfb
   const mlfb = (headSlot && headSlot.mlfb) ? headSlot.mlfb : (headTpl && headTpl.mlfb ? headTpl.mlfb : null);
+  const stationHasCards = [...station.slots.keys()].some(s => s !== 0);
+  const scfL = stationHasCards ? '32' : '0';
+  const updTime = stationHasCards ? '2' : '0';
   const out = [];
-  out.push(blocks.deviceHeaderBlock({ ioNo, addr, imOrder, imVersion: imVer, name, posX: station.posX, posY: station.posY }));
-  out.push(blocks.slot0Block({ ioNo, addr, imOrder, name, hexIp, hexRouter, diag: diag.ptr--, mlfb }));
+  // Header body text is per (order_no, role) (ground-truth rule 6) — when a real
+  // captured body_template exists for this order_no's own device-header row, use
+  // it verbatim (placeholder-filled) instead of the generic hardcoded field list.
+  out.push(headTpl && headTpl.body_template
+    ? blocks.deviceHeaderBlockFromTemplate({ ioNo, addr, imOrder, imVersion: imVer, name, bodyTemplate: headTpl.body_template, posX: station.posX, posY: station.posY })
+    : blocks.deviceHeaderBlock({ ioNo, addr, imOrder, imVersion: imVer, name, posX: station.posX, posY: station.posY, scfL, updTime }));
+  const slot0Tpl = await findSlotZeroTemplate(db, imOrder);
+  out.push(slot0Tpl && slot0Tpl.body_template
+    ? blocks.slot0BlockFromTemplate({ ioNo, addr, imOrder, name, bodyTemplate: slot0Tpl.body_template, hexIp, hexRouter, diag: diag.ptr--, mlfb })
+    : blocks.slot0Block({ ioNo, addr, imOrder, name, hexIp, hexRouter, diag: diag.ptr--, mlfb }));
 
-  // Auto-create Slot 0 subslots (e.g. PN-IO interface, ports) from config
+  // SLOT 0 SUBSLOT 1 (PN-IO interface): on this fallback path PCS7 always uses
+  // the one shared, family-agnostic order_no captured in GENERIC_IFACE_ORDER_NO
+  // (ground-truth rule 6 covers identity here too, not just body text). Emit it
+  // whenever a body_template has been captured for that catalogue row; auto-slot
+  // 'subslot' entries below are then filtered to 'port' only, mirroring
+  // renderEt200sp/renderCfuPa, so the interface subslot never renders twice.
+  const genericIfaceTpl = await findGenericIfaceTemplate(db);
+  if (genericIfaceTpl && genericIfaceTpl.body_template) {
+    out.push(blocks.ifaceBlockFromTemplate({
+      ioNo, addr, ifaceOrder: GENERIC_IFACE_ORDER_NO, bodyTemplate: genericIfaceTpl.body_template, diag: diag.ptr--,
+    }));
+  }
+
+  // Auto-create remaining Slot 0 subslots (ports) from config. When the interface
+  // subslot was just emitted above from its own template, skip any auto-slot
+  // entry for subslot 1 so it isn't duplicated.
+  const emittedSubslots = new Set([1]);
   if (autoSlotConfig && autoSlotConfig.slots) {
     const slot0Config = autoSlotConfig.slots.find(s => s.slot === 0);
     if (slot0Config && slot0Config.subslots) {
       for (const subslot of slot0Config.subslots) {
+        if (genericIfaceTpl && genericIfaceTpl.body_template && subslot.subslot === 1) continue;
         if (subslot.order_no) {
           out.push(blocks.portBlock({
             ioNo, addr, subslot: subslot.subslot,
@@ -634,8 +821,33 @@ async function renderStation(station, templateMap, ioNo, diag, warnings, db) {
             portOrder: subslot.order_no,
             diag: diag.ptr--
           }));
+          emittedSubslots.add(subslot.subslot);
         }
       }
+    }
+  }
+
+  // Ports not covered by autoSlotConfig (which is only manually populated for
+  // ET200SP/CFU): fall back to the REAL, parsed subslot data on the head slot
+  // (hw_slot_subslots, sourced purely from CFG parsing — no manual per-device
+  // authoring). Ground-truth rule 6: each such port reuses the device's own
+  // order_no as its header order_no, so its captured body_template is looked
+  // up under that same order_no (hw_category='subslot').
+  if (headSlot && headSlot.subslots) {
+    for (const ss of headSlot.subslots) {
+      if (emittedSubslots.has(ss.subslotNo)) continue;
+      const portOrder = ss.paProfile;
+      if (!portOrder) continue;
+      const portTpl = await findSubslotTemplate(db, portOrder);
+      if (!portTpl || !portTpl.body_template) continue;
+      out.push(blocks.portBlockFromTemplate({
+        ioNo, addr, subslot: ss.subslotNo,
+        portLabel: ss.label || '',
+        portOrder,
+        bodyTemplate: portTpl.body_template,
+        diag: diag.ptr--,
+      }));
+      emittedSubslots.add(ss.subslotNo);
     }
   }
 
@@ -651,31 +863,112 @@ async function renderStation(station, templateMap, ioNo, diag, warnings, db) {
         if (ch.tag) slotAssignedChannels.add(Number(ch.channel));
       });
     }
-    out.push(blocks.ioModuleBlock({
-      ioNo, addr, slot: slotNo,
-      order: slot.orderNo,
-      version: tpl && tpl.version ? tpl.version : '',
-      name: slot.name,
-      redundant: false,
-      addressLines: buildAddressLines(tpl, slot, warnings, { addr, slot: slotNo, order: slot.orderNo }),
-      paramLines: await buildParamLines(tpl, null, db, slotAssignedChannels),
-      mlfb: tpl ? tpl.mlfb : null,
-    }));
+    // Ground-truth rule 6: a slot's own header body is per (order_no, role) too —
+    // when a real captured body_template exists for this order_no's own 'slot'
+    // catalogue row, use it verbatim (its shape can differ entirely from the
+    // generic ET200SP-style CPU_NO/ALARM_OB_NO body, e.g. GSDML PN_TI/PN_TO
+    // fields), instead of the generic hardcoded field list.
+    const slotModuleTpl = await findSlotModuleTemplate(db, slot.orderNo);
+    if (slotModuleTpl && slotModuleTpl.body_template) {
+      out.push(blocks.ioModuleBlockFromTemplate({
+        ioNo, addr, slot: slotNo,
+        order: slot.orderNo,
+        version: tpl && tpl.version ? tpl.version : '',
+        name: slot.name,
+        bodyTemplate: slotModuleTpl.body_template,
+        isAutocreated: /OBJECT_REMOVEABLE\s+"0"/.test(slotModuleTpl.body_template),
+      }));
+    } else {
+      out.push(blocks.ioModuleBlock({
+        ioNo, addr, slot: slotNo,
+        order: slot.orderNo,
+        version: tpl && tpl.version ? tpl.version : '',
+        name: slot.name,
+        redundant: false,
+        addressLines: buildAddressLines(tpl, slot, warnings, { addr, slot: slotNo, order: slot.orderNo }),
+        paramLines: await buildParamLines(tpl, null, db, slotAssignedChannels),
+        mlfb: tpl ? tpl.mlfb : null,
+      }));
+    }
 
-    // Auto-create subslots for this slot from config (if defined)
+    // Subslots on this slot. Two sources describe the same set of positions:
+    //   - the family's generic default list (autoSlotConfig) — what a freshly
+    //     plugged module looks like, and
+    //   - this station's own real rows (hw_slot_subslots) — what the user
+    //     actually selected for each position in the project's Configure screen.
+    // The real row is authoritative for WHICH profile occupies a position and
+    // must win, *including* when the catalogue has no captured body_template for
+    // the selected profile (most GSDML subslot profiles have none). Resolving
+    // the two per position — rather than emitting each source's list in turn —
+    // is what keeps a user's selection from being shadowed by the default.
+    const defaultSubslots = new Map();
     if (autoSlotConfig && autoSlotConfig.slots) {
       const slotConfig = autoSlotConfig.slots.find(s => s.slot === slotNo);
       if (slotConfig && slotConfig.subslots) {
-        for (const subslot of slotConfig.subslots) {
-          if (subslot.order_no) {
-            out.push(blocks.portBlock({
-              ioNo, addr, subslot: subslot.subslot,
-              portLabel: subslot.port_label || subslot.label,
-              portOrder: subslot.order_no,
-              diag: diag.ptr--
-            }));
-          }
-        }
+        for (const s of slotConfig.subslots) defaultSubslots.set(s.subslot, s);
+      }
+    }
+    const realSubslots = new Map();
+    for (const ss of (slot.subslots || [])) {
+      if (ss.subslotNo != null) realSubslots.set(ss.subslotNo, ss);
+    }
+    const ssPositions = [...new Set([...defaultSubslots.keys(), ...realSubslots.keys()])]
+      .sort((a, b) => a - b);
+
+    for (const ssNo of ssPositions) {
+      const real = realSubslots.get(ssNo) || null;
+      const dflt = defaultSubslots.get(ssNo) || null;
+      const subslotOrder = (real && real.paProfile) || (dflt && dflt.order_no) || null;
+      if (!subslotOrder) continue;
+      const ssTpl = await findSubslotTemplate(db, subslotOrder);
+      const label = await resolveSubslotLabel(db, real, dflt, ssTpl, subslotOrder);
+
+      if (ssTpl && ssTpl.body_template) {
+        // A subslot's own real per-instance data (e.g. IO-Link ports sharing one
+        // shared order_no but each with a different process-image address and
+        // optional tagged SYMBOL line(s)) is filled into the captured body
+        // template's placeholders here, same mechanism as every other
+        // body_template fill — never hardcoded per order_no.
+        //
+        // SYMBOL identifiers are always "I" (input) or "O" (output) regardless
+        // of catalogue signal-type metadata (see buildAddressLines' own note
+        // above) — a subslot's tagged channels here are always input ("I") in
+        // every fixture observed. Offsets are stored as the raw value parsed
+        // from the fixture (no catalogue byte-width metadata exists for these
+        // order_nos) — pass totalBytes===channelCount so buildSymbolLines'
+        // byte-offset math (channel × bytesPerCh) is an identity pass-through.
+        const symbolLines = buildSymbolLines('I', (real && real.symbols) || [], 1, 1);
+        out.push(blocks.subslotBlockFromTemplate({
+          ioNo, addr, slot: slotNo, subslot: ssNo,
+          label,
+          order: subslotOrder,
+          bodyTemplate: ssTpl.body_template,
+          symbolLines,
+          localAddress: (real && real.localAddress != null) ? real.localAddress : null,
+        }));
+      } else {
+        // No captured body for this profile — emit the generic submodule body,
+        // still carrying the resolved (possibly user-selected) order_no and
+        // label rather than the family default's. A subslot that carries real
+        // process-image bytes gets its own LOCAL_IN/OUT_ADDRESSES block and the
+        // SYMBOL lines for whatever channels the user tagged on it, built the
+        // same way a slot-level module's are; only a position with no bytes at
+        // all falls back to the placeholder diagnostic address.
+        const ssAddressLines = real
+          ? buildAddressLines(
+              ssTpl,
+              { channels: real.symbols || [], inputAddr: real.inputAddr, outputAddr: real.outputAddr, pipNo: real.pipNo },
+              warnings,
+              { addr, slot: slotNo, order: subslotOrder },
+            )
+          : [];
+        out.push(blocks.portBlock({
+          ioNo, addr, slot: slotNo, subslot: ssNo,
+          portLabel: label,
+          portOrder: subslotOrder,
+          diag: ssAddressLines.length ? null : diag.ptr--,
+          addressLines: ssAddressLines,
+        }));
       }
     }
   }

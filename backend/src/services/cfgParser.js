@@ -335,15 +335,15 @@ function collectBlock(lines, startLine) {
 //         pipNo:          number|null,   // 5th field of ADDRESS line (0 = unassigned)
 //         potentialGroup: string|null,   // POTENTIAL_GROUP value
 //         symbols: [{ channel: number, tag: string, description: string }],
-//         subslots: [{ subslotNo: number, orderNo: string, name: string }],
+//         subslots: [{
+//           subslotNo: number, orderNo: string, name: string,
+//           pipNo: number|null, potentialGroup: string|null,
+//           symbols: [{ channel: number, tag: string, description: string }],
+//         }],
 //       }
 //     ]
 //   }
 // ]
-//
-// Slots 0 (IM interface) and its auto-created sub-slots (port/iface) are skipped
-// because they are not stored as hw_signals rows — only functional module slots
-// (slot ≥ 1) are included.
 // ─────────────────────────────────────────────────────────────────────────────
 function parseCfgDevices(text) {
   const lines = text.split(/\r?\n/);
@@ -356,10 +356,6 @@ function parseCfgDevices(text) {
   const devRe    = /^IOSUBSYSTEM\s+(\d+),\s*IOADDRESS\s+(\d+),\s*"([^"]+)"(?:\s+"[^"]*")?,\s*"([^"]+)"/;
   const slotRe   = /^IOSUBSYSTEM\s+(\d+),\s*IOADDRESS\s+(\d+),\s*SLOT\s+(\d+),\s*"([^"]+)"(?:\s+"[^"]*")?,\s*"([^"]+)"/;
   const subslotRe= /^IOSUBSYSTEM\s+(\d+),\s*IOADDRESS\s+(\d+),\s*SLOT\s+(\d+),\s*SUBSLOT\s+(\d+),\s*"([^"]+)"(?:\s+"[^"]*")?,\s*"([^"]+)"/;
-
-  // Strip version prefix from order number: "V1_1:6ES7 193-6PA00-0AA0" → "6ES7 193-6PA00-0AA0"
-  // Also handle "DEFAULT:..." form used for port/iface subslots
-  const stripVersion = (raw) => raw.replace(/^[A-Za-z0-9_]+:/, '');
 
   let i = 0;
 
@@ -380,19 +376,55 @@ function parseCfgDevices(text) {
       const addrN   = parseInt(addr, 10);
       const slotN   = parseInt(slotNo, 10);
       const subN    = parseInt(subslotNo, 10);
-      const orderNo = stripVersion(rawOrder);
+      // Do NOT strip the version prefix — for CFU_PA/GSDML devices the prefix
+      // (e.g. "V_2_0_PORT_1:") is part of the catalogue order_no key.
+      const orderNo = rawOrder;
+      // Collect the block first so subslot-level PIP/POTENTIAL_GROUP/SYMBOL data
+      // (previously silently dropped) is captured the same way slot-level data is.
+      const block = collectBlock(lines, i);
+
+      let ssPipNo = null;
+      const ssAddrLineM = block.text.match(/\bADDRESS\s+\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*(\d+)/);
+      if (ssAddrLineM) {
+        const p = parseInt(ssAddrLineM[1], 10);
+        if (p > 0) ssPipNo = p;
+      }
+
+      // The subslot's own process-image address (1st field of its ADDRESS line
+      // under LOCAL_IN_ADDRESSES) — genuinely per-instance data (e.g. multiple
+      // subslots sharing one catalogue order_no each occupy a different process-
+      // image byte), so it must be captured from the instance, not derived.
+      let ssLocalAddress = null;
+      const ssLocalAddrM = block.text.match(/\bADDRESS\s+(\d+)\s*,/);
+      if (ssLocalAddrM) ssLocalAddress = parseInt(ssLocalAddrM[1], 10);
+
+      let ssPotentialGroup = null;
+      const ssPgM = block.text.match(/\bPOTENTIAL_GROUP\s*,\s*"([^"]*)"/);
+      if (ssPgM && ssPgM[1]) ssPotentialGroup = ssPgM[1];
+
+      const ssSymbols = [];
+      const ssSymRe = /^SYMBOL\s+\S+\s*,\s*(\d+)\s*,\s*"([^"]*)"\s*,\s*"([^"]*)"/gm;
+      for (const sm2 of block.text.matchAll(ssSymRe)) {
+        ssSymbols.push({
+          channel:     parseInt(sm2[1], 10),
+          tag:         sm2[2],
+          description: sm2[3],
+        });
+      }
+
       const st   = stations.get(addrN);
       const slot = st && st.slots.find(s => s.slot === slotN);
       if (slot) {
-        slot.subslots.push({ subslotNo: subN, orderNo, name });
+        slot.subslots.push({
+          subslotNo: subN, orderNo, name,
+          pipNo: ssPipNo, potentialGroup: ssPotentialGroup, symbols: ssSymbols,
+          localAddress: ssLocalAddress,
+        });
       }
-      // Collect the block to extract IP from slot 0 subslot 0/1
-      const block = collectBlock(lines, i);
       // Extract IP from slot 0 IPADDRESS field (hex string)
       if (slotN === 0) {
         const ipM = block.text.match(/\bIPADDRESS\s+"([0-9A-Fa-f]{8})"/);
         const rtM = block.text.match(/\bROUTERADDRESS\s+"([0-9A-Fa-f]{8})"/);
-        const st  = stations.get(addrN);
         if (st) {
           if (ipM && !st.ip) {
             st.ip = hexToIp(ipM[1]);
@@ -412,7 +444,9 @@ function parseCfgDevices(text) {
       const [, , addr, slotNo, rawOrder, name] = sm;
       const addrN   = parseInt(addr, 10);
       const slotN   = parseInt(slotNo, 10);
-      const orderNo = stripVersion(rawOrder);
+      // Do NOT strip the version prefix — for CFU_PA/GSDML devices the prefix
+      // (e.g. "V_2_0_PA_ETER:") is part of the catalogue order_no key.
+      const orderNo = rawOrder;
 
       // Collect the block to extract pip, potentialGroup, symbols
       const block = collectBlock(lines, i);
@@ -511,66 +545,4 @@ function hexToIp(hex) {
   return [0, 2, 4, 6].map(i => parseInt(hex.slice(i, i + 2), 16)).join('.');
 }
 
-/**
- * Extract AUTOCREATED metadata from a baseline .cfg file.
- * Returns an array of {order_no, slot, subslot} for all AUTOCREATED slots/subslots.
- * @param {string} text - Raw CFG file content
- * @returns {Array<{order_no, slot, subslot}>} List of autocreated slots/subslots
- */
-function extractAutoCreatedMetadata(text) {
-  const lines = text.split(/\r?\n/);
-  const autocreatedList = [];
-  const currentDevice = {};  // {order_no, slot, subslot}
-
-  for (let i = 0; i < lines.length; i++) {
-    const l = lines[i].trim();
-
-    // Device header: IOSUBSYSTEM subsysNo, IOADDRESS ioAddr, SLOT slotNo, "orderNo" "version", "name"
-    // Example: IOSUBSYSTEM 101, IOADDRESS 2, SLOT 0, "V_2_0_PA_ETER:6ES7 655-5PX11-0XX0" "V2.0", "cfu-pa"
-    const deviceMatch = l.match(/^IOSUBSYSTEM\s+\d+,\s+IOADDRESS\s+\d+,\s+(?:SLOT\s+(\d+),\s+)?"([^"]+)"/);
-    if (deviceMatch) {
-      const slotNum = deviceMatch[1] ? parseInt(deviceMatch[1], 10) : null;
-      const orderNo = deviceMatch[2];
-      currentDevice.order_no = orderNo;
-      currentDevice.slot = slotNum;
-      currentDevice.subslot = null;
-
-      // Check if this line has AUTOCREATED keyword
-      if (l.includes('AUTOCREATED')) {
-        autocreatedList.push({
-          order_no: orderNo,
-          slot: slotNum,
-          subslot: null,
-        });
-      }
-      continue;
-    }
-
-    // Subslot header: IOSUBSYSTEM subsysNo, IOADDRESS ioAddr, SLOT slotNo, SUBSLOT subslotNo, "orderNo", "name"
-    // Example: IOSUBSYSTEM 101, IOADDRESS 2, SLOT 0, SUBSLOT 1, "_S7H_HSP_CFU_PA_V2_0_IFACE_CT", "cfu-pa"
-    const subslotMatch = l.match(/^IOSUBSYSTEM\s+\d+,\s+IOADDRESS\s+\d+,\s+SLOT\s+(\d+),\s+SUBSLOT\s+(\d+),\s+"([^"]+)"/);
-    if (subslotMatch) {
-      const slotNum = parseInt(subslotMatch[1], 10);
-      const subslotNum = parseInt(subslotMatch[2], 10);
-      const subslotOrderNo = subslotMatch[3];
-
-      // Check if this line has AUTOCREATED keyword
-      if (l.includes('AUTOCREATED')) {
-        // Try to get the parent station's order_no (slot 0 order_no)
-        // For now, we'll track it from the context if we have it
-        if (currentDevice.order_no) {
-          autocreatedList.push({
-            order_no: currentDevice.order_no,
-            slot: slotNum,
-            subslot: subslotNum,
-          });
-        }
-      }
-      continue;
-    }
-  }
-
-  return autocreatedList;
-}
-
-module.exports = { parseCfg, parseCfgDevices, extractAutoCreatedMetadata };
+module.exports = { parseCfg, parseCfgDevices };
